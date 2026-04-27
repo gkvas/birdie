@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "birdie"
+version = "0.1.0"
+description = "Dynamic skill-based LangGraph agent"
+requires-python = ">=3.10"
+dependencies = [
+    "langchain-core>=0.2",
+    "langchain-openai>=0.1",
+    "langgraph>=0.1",
+    "pydantic>=2.0",
+    "requests",
+    "pyyaml",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+mistral = ["mistralai>=1.0"]
+anthropic = ["anthropic>=0.25"]
+gemini = []
+
+[project.scripts]
+birdie = "birdie.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["birdie*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

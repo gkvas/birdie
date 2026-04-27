@@ -1,0 +1,47 @@
+"""
+Core data models for the dynamic skill system.
+"""
+
+import warnings
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
+
+# Pydantic v2 reserves `model_` prefixed names; `schema` shadows the legacy
+# .schema() class-method.  We silence the warning because the SKILL.MD spec
+# mandates this field name and all callers access it as an instance attribute.
+warnings.filterwarnings(
+    "ignore",
+    message="Field name \"schema\" in \"SkillTool\" shadows",
+    category=UserWarning,
+)
+
+
+class SkillTool(BaseModel):
+    """
+    A single tool within a skill that can be executed.
+    """
+    name: str
+    description: str
+    entrypoint: str
+    schema: Dict[str, Any]
+    tags: List[str] = []
+    
+
+class Skill(BaseModel):
+    """
+    A self-contained capability bundle.
+
+    Structured skills define explicit tools (entrypoint + schema).
+    Freetext skills carry instructional prose in `body` that is injected into
+    the system prompt when the skill is triggered; their `tools` list is empty.
+    """
+    name: str
+    version: str
+    description: str
+    tools: List[SkillTool] = []
+    tags: List[str] = []
+    triggers: List[str] = []
+    enabled_by_default: bool = True
+    always_inject: bool = False   # inject body into system prompt every turn
+    permissions: List[str] = []
+    body: Optional[str] = None  # prose body injected into system prompt

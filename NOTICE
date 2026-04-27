@@ -1,0 +1,14 @@
+Birdie
+Copyright 2026 Gernot Kvas
+
+This product includes software developed by third parties.
+
+---
+
+The SSH skill (birdie/skills/ssh/SKILL.MD) is adapted from the OpenHands
+Extensions project:
+
+  https://github.com/OpenHands/extensions/tree/main/skills/ssh
+
+Original work Copyright (c) OpenHands contributors.
+Licensed under the Apache License, Version 2.0.
