@@ -7,9 +7,18 @@ produces a message with no tool calls.
 
 Node functions are closures over the shared ``provider``, ``registry``, and
 ``policy`` objects so the graph stays stateless and testable.
+
+Per-invocation context (session identity, long-term memory) is passed via
+``config["configurable"]`` rather than stored in AgentState:
+
+* ``config["configurable"]["thread_id"]``  — session ID, used as policy key
+* ``config["configurable"]["long_term_memory"]``  — list of LTM strings
+
+This keeps AgentState minimal (just ``messages``) so LangGraph's checkpointer
+owns and reconstructs it without any application-level serialization.
 """
 
-from typing import TypedDict, List, Optional, Annotated, Sequence, Tuple
+from typing import TypedDict, List, Annotated, Sequence, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -22,12 +31,13 @@ from ..core.adapter import skilltool_to_langchain_tool
 from ..core.policy import UserSkillPolicy
 from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def
 
+# Maximum number of messages forwarded to the LLM per turn.
+# The full history is stored by the checkpointer; this window controls cost.
+MAX_CONTEXT_MESSAGES = 20
+
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    user_id: Optional[str]
-    session_id: Optional[str]
-    active_skill_names: Optional[List[str]]
 
 
 def create_agent_graph(
@@ -39,23 +49,23 @@ def create_agent_graph(
     Build a LangGraph workflow that routes through the LLMProvider.
 
     On every agent-node invocation:
-      1. The currently-allowed SkillTools are fetched from the registry.
-      2. They are converted to NormalizedToolDef dicts and forwarded to
-         provider.achat() — the provider handles all vendor-specific formatting.
-      3. The response (an AIMessage) is appended to state.
+      1. The full message history is trimmed to MAX_CONTEXT_MESSAGES.
+      2. Any dangling tool calls (interrupted prior turn) are repaired.
+      3. The currently-allowed SkillTools are fetched from the registry.
+      4. provider.achat() is called with the clean context window.
+      5. The response (an AIMessage) is appended to state.
 
     On every tool-node invocation:
-      1. A fresh ToolNode is created with LangChain-executable tools so that
-         the entrypoint resolvers (bash, http, python…) are wired up.
+      1. A fresh ToolNode is created with LangChain-executable tools.
       2. Tool results are appended to state and the loop continues.
     """
 
-    def _get_allowed(state: AgentState) -> set:
-        """Resolve the allowed skill name set for the current user/session."""
-        return policy.get_allowed_skills(
-            user_id=state.get("user_id"),
-            session_id=state.get("session_id"),
-        )
+    def _session_id(config: RunnableConfig) -> str:
+        return config.get("configurable", {}).get("thread_id", "") or ""
+
+    def _get_allowed(config: RunnableConfig) -> set:
+        """Resolve the allowed skill name set for the current session."""
+        return policy.get_allowed_skills(user_id=_session_id(config))
 
     def _last_user_text(state: AgentState) -> str:
         """Return the content of the most recent HumanMessage in state."""
@@ -68,23 +78,23 @@ def create_agent_graph(
         """Return freetext skills whose triggers appear in the latest user message."""
         return registry.find_skills_by_trigger(_last_user_text(state), allowed)
 
-    def _get_skill_tools(state: AgentState) -> list:
+    def _get_skill_tools(config: RunnableConfig) -> list:
         """Return the callable SkillTools for all allowed skills this turn."""
-        return list(registry.list_tools(skill_names=list(_get_allowed(state))))
+        return list(registry.list_tools(skill_names=list(_get_allowed(config))))
 
-    def _build_system_prompt(state: AgentState) -> str | None:
+    def _build_system_prompt(state: AgentState, config: RunnableConfig) -> str | None:
         """Assemble the system prompt for this turn from in-memory skill objects.
 
-        Two tiers:
+        Three tiers:
 
         - **Tier 1** — compact bullet list of all allowed skills (always sent).
         - **Tier 2a** — full prose body for ``always_inject`` skills (always sent).
-        - **Tier 2b** — full prose body for freetext skills whose triggers fired
-          this turn.
+        - **Tier 2b** — full prose body for freetext skills whose triggers fired.
+        - **Tier 3** — long-term memory strings from the user's memory store.
 
-        Returns ``None`` when no skills are allowed for the user/session.
+        Returns ``None`` when no skills are allowed for the session.
         """
-        allowed = _get_allowed(state)
+        allowed = _get_allowed(config)
         all_skills = [s for s in registry.list_skills() if s.name in allowed]
         if not all_skills:
             return None
@@ -108,17 +118,28 @@ def create_agent_graph(
             if skill.body:
                 system += f"\n\n--- {skill.name} skill context ---\n{skill.body}"
 
+        # Tier 3 — user long-term memory injected via config
+        ltm = config.get("configurable", {}).get("long_term_memory") or []
+        if ltm:
+            system += "\n\n--- Long-term memory ---\n"
+            system += "\n".join(f"- {entry}" for entry in ltm)
+
         return system
 
     def _repair_dangling_tool_calls(
         messages: List[BaseMessage],
     ) -> Tuple[List[ToolMessage], List[BaseMessage]]:
         """
-        Scan the message list for AIMessages whose tool_calls have no matching
-        ToolMessage and inject placeholder ToolMessages for each missing one.
+        Scan for AIMessages whose tool_calls have no matching ToolMessage and
+        inject placeholder ToolMessages for each orphan.
 
-        Returns (repair_msgs, patched_messages) so callers can both persist the
-        repairs to state and send the clean history to the provider.
+        This handles the case where the process was interrupted between the LLM
+        response (checkpointed) and the tool execution, leaving the checkpoint
+        in a state that most providers reject as a protocol violation.
+
+        Returns (repair_msgs, patched_messages).  ``repair_msgs`` is included
+        in the node's return value so it is written back to the checkpoint,
+        healing the state permanently.
         """
         tool_call_ids_answered: set[str] = set()
         for msg in messages:
@@ -153,12 +174,21 @@ def create_agent_graph(
         return repair_msgs, patched
 
     async def call_model(state: AgentState, config: RunnableConfig) -> dict:
-        # Repair any broken history caused by interrupted tool executions.
-        # Repairs are included in the return value so they are persisted to the
-        # checkpoint — the state heals permanently on the next save.
-        repair_msgs, clean_messages = _repair_dangling_tool_calls(list(state["messages"]))
+        all_messages = list(state["messages"])
 
-        skill_tools = _get_skill_tools(state)
+        # Apply rolling context window: send only the last N messages to the LLM.
+        # The checkpointer retains the full history for time-travel and repair.
+        context_msgs = (
+            all_messages[-MAX_CONTEXT_MESSAGES:]
+            if len(all_messages) > MAX_CONTEXT_MESSAGES
+            else all_messages
+        )
+
+        # Repair any dangling tool calls within the context window.
+        # Repairs are returned to state so the checkpoint heals permanently.
+        repair_msgs, clean_messages = _repair_dangling_tool_calls(context_msgs)
+
+        skill_tools = _get_skill_tools(config)
 
         normalized_tools = (
             [skilltool_to_normalized_def(t) for t in skill_tools]
@@ -166,7 +196,7 @@ def create_agent_graph(
             else None
         )
 
-        system_prompt = _build_system_prompt(state)
+        system_prompt = _build_system_prompt(state, config)
 
         response = await provider.achat(
             messages=clean_messages,
@@ -175,16 +205,16 @@ def create_agent_graph(
         )
         return {"messages": repair_msgs + [response]}
 
-    async def execute_tools(state: AgentState) -> dict:
-        skill_tools = _get_skill_tools(state)
+    async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:
+        skill_tools = _get_skill_tools(config)
         langchain_tools = [skilltool_to_langchain_tool(t) for t in skill_tools]
         tool_node = ToolNode(langchain_tools)
         try:
             return await tool_node.ainvoke(state)
         except Exception as exc:
-            # If the ToolNode itself raises (e.g. the entrypoint throws before
-            # producing output), create error ToolMessages for every pending call
-            # so the state stays balanced and the LLM can respond to the failure.
+            # If the ToolNode itself raises before producing output, synthesize
+            # error ToolMessages so the state stays balanced and the LLM can
+            # respond to the failure.
             last = state["messages"][-1]
             return {"messages": [
                 ToolMessage(

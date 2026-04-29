@@ -392,6 +392,23 @@ class TestGetLLMProvider:
         get_llm_provider({"vendor": "gemini", "model": "gemini-2.0-flash", "api_key": "AIza_test"})
         mock_init.assert_called_once_with(model="gemini-2.0-flash", api_key="AIza_test", temperature=0.0)
 
+    @patch("birdie.core.llm_provider.AzureOpenAIProvider.__init__", return_value=None)
+    def test_azure_vendor(self, mock_init):
+        get_llm_provider({
+            "vendor": "azure",
+            "model": "my-gpt4o-deployment",
+            "api_key": "azure-key",
+            "base_url": "https://my-resource.openai.azure.com/",
+            "api_version": "2024-02-01",
+        })
+        mock_init.assert_called_once_with(
+            model="my-gpt4o-deployment",
+            api_key="azure-key",
+            base_url="https://my-resource.openai.azure.com/",
+            temperature=0.0,
+            api_version="2024-02-01",
+        )
+
     # -- JSON input forms ---------------------------------------------------
 
     @patch("birdie.core.llm_provider.OpenAIProvider.__init__", return_value=None)

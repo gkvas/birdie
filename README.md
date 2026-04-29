@@ -55,6 +55,7 @@ birdie/
 │   ├── loader.py     # SKILL.MD parser
 │   ├── registry.py   # In-memory skill/tool index
 │   ├── policy.py     # Per-user/session access control
+│   ├── session.py    # Session persistence (history, LTM, skill grants)
 │   ├── adapter.py    # SkillTool → LangChain StructuredTool
 │   ├── entrypoints.py# bash / http / python / mcp / grpc resolvers
 │   └── llm_provider.py # Vendor-agnostic LLM abstraction
@@ -162,8 +163,6 @@ Tags declared on the skill (`tags: [shell, local, system]`) propagate to every t
 
 Knowledge skills carry no tools of their own. Their SKILL.MD contains only frontmatter and free-form Markdown prose. The prose is injected into the system prompt when a trigger keyword appears in the user's message — it is never sent otherwise.
 
-Execution capability is borrowed from a tool skill via `requires_tags`. When the knowledge skill fires, the framework resolves all tools whose tags match `requires_tags` through the tag index and injects them into the tool list for that turn. No tool or skill names are hardcoded anywhere.
-
 ```markdown
 ---
 name: ssh
@@ -185,7 +184,7 @@ triggers:
 
 When the user says anything containing "ssh" or "remote server", the full Markdown body is appended to the system prompt. The LLM then uses whatever tool skills the user has enabled — typically the Shell skill's `run_bash` — to construct and execute the SSH command. No wiring between skills is needed; the LLM connects the knowledge to the available tools itself.
 
-> **Note:** Ensure the Shell skill is enabled when using SSH or similar knowledge skills that require command execution.
+> **Note:** Ensure the Shell skill (or another skill that provides execution tools) is enabled when using knowledge skills that require command execution.
 
 **Frontmatter fields**
 
@@ -271,14 +270,11 @@ The loop continues until the model returns a message with no `tool_calls`. There
 ```python
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    user_id:  Optional[str]
-    session_id: Optional[str]
-    active_skill_names: Optional[List[str]]  # reserved for future use
 ```
 
-`messages` uses the `add_messages` reducer, which appends new messages and can update existing ones by ID. This means the full conversation history accumulates in state across turns.
+`messages` uses the `add_messages` reducer, which appends new messages and deduplicates by message ID. The state is intentionally minimal: the session ID, long-term memory, and policy key all flow through `config["configurable"]` rather than being stored in the graph state.
 
-With `use_memory=True` (default), the graph is compiled with a `MemorySaver` checkpointer. Each call to `astream` or `invoke` must pass a `thread_id` in `configurable`. The checkpointer loads the previous state for that thread, the new `HumanMessage` is appended via the reducer, and the updated state is saved after each node completes.
+History persistence is handled by LangGraph's `SqliteSaver` checkpointer keyed on `config["configurable"]["thread_id"]` (the session ID). When a turn starts, the checkpointer loads the full prior history automatically — the application only passes the new `HumanMessage`. After each node, the checkpointer writes the delta back to disk.
 
 ### Checkpoint repair
 
@@ -315,11 +311,19 @@ When the most recent `HumanMessage` contains any of a freetext skill's trigger k
 
 This skill provides capabilities for establishing and managing SSH connections...
 [full body]
-
-To execute commands from the ssh context above, use the available tool(s): `run_bash`.
 ```
 
-The tool hint at the end is built dynamically: Birdie resolves `skill.requires_tags` through the tag index to find the actual tool names at runtime — no names are hardcoded.
+### Tier 3 — long-term memory (on every turn)
+
+Notes stored via `/remember` are injected as a third tier at the end of the system prompt:
+
+```
+--- Long-term memory ---
+- prefers concise answers without bullet points
+- working on a Python project called Birdie
+```
+
+These are stored in the user-scoped `memory.json` and survive both restarts and session switches. They are always present once added, regardless of what the user says.
 
 ### Full context structure sent to the LLM
 
@@ -327,16 +331,19 @@ The tool hint at the end is built dynamically: Birdie resolves `skill.requires_t
 [system prompt]
   Tier 1: skill catalog
   Tier 2: freetext skill body (if triggered)
+  Tier 3: long-term memory notes (if any)
 
-[message history — full thread from MemorySaver]
-  HumanMessage  (turn 1)
+[message history — rolling window, last 20 messages from checkpointer]
+  HumanMessage  (turn N-4)
   AIMessage     (tool_calls)
   ToolMessage   (tool result)
   AIMessage     (text response)
-  HumanMessage  (turn 2)
+  HumanMessage  (turn N)
   ...
   HumanMessage  (current turn)
 ```
+
+The full history is stored in the checkpointer's SQLite database; the last 20 messages are forwarded to the LLM each turn. Tool results longer than 32,000 characters are truncated with a count of dropped bytes to keep payloads within model limits.
 
 The provider layer converts this LangChain message list into the wire format expected by each vendor (OpenAI, Mistral, Anthropic each have different conventions for tool messages and system prompts).
 
@@ -346,14 +353,16 @@ The provider layer converts this LangChain message list into the wire format exp
 
 `UserSkillPolicy` enforces which skills a user may access. Resolution order (highest priority first):
 
-1. **Per-user explicit disable** — always blocks the skill
-2. **Per-user explicit enable** ∪ **session enable** — union of both
+1. **Explicit disable** — always blocks the skill for that key
+2. **Explicit enable** — grants the skill for that key
 3. **Global defaults** — skills with `enabled_by_default: true`
 
+In the CLI, the **session ID** is used as the policy key (not the filesystem `--user` value). This means each session has fully independent skill grants: `/enable` and `/disable` affect only the current session and are persisted to the session JSON, so they are restored on resume.
+
 ```python
-agent.enable_skill_for_user("alice", "Filesystem")   # add to alice's allow-list
-agent.disable_skill_for_user("alice", "Weather")     # block even if default-on
-agent.enable_skills_for_session("sess42", ["Shell"]) # grant for one session
+# CLI uses session.id as the key
+agent.enable_skill_for_user(session.id, "Filesystem")
+agent.disable_skill_for_user(session.id, "Weather")
 ```
 
 The policy is consulted on every `call_model` and `execute_tools` invocation so changes take effect immediately on the next turn without restarting the agent.
@@ -375,6 +384,7 @@ class LLMProvider(ABC):
 | Vendor | Class | Install |
 |---|---|---|
 | OpenAI | `OpenAIProvider` | `pip install openai` |
+| Azure OpenAI | `AzureOpenAIProvider` | no extra dep — set `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` |
 | Anthropic | `AnthropicProvider` | `pip install anthropic` |
 | Mistral | `MistralProvider` | `pip install mistralai>=1.0` |
 | Google Gemini | `GeminiProvider` | no extra dep — set `GEMINI_API_KEY` |
@@ -388,7 +398,102 @@ Returned `AIMessage` objects carry `usage_metadata` with `input_tokens`, `output
 ## CLI
 
 ```
-birdie [--user USER_ID] [--skills-dir PATH]
+birdie [--user USER_ID] [--session-id SESSION_ID] [--skills-dir PATH] [--config FILE]
+```
+
+| Flag | Description |
+|---|---|
+| `--user USER_ID` | Filesystem namespace for sessions (defaults to `$USER`) |
+| `--session-id SESSION_ID` | Resume a specific session (e.g. `2026-04-28_1`) |
+| `--skills-dir PATH` | Override the default skills directory |
+| `--config FILE` | Path to a JSON provider config file |
+
+### Provider configuration
+
+By default Birdie reads `LLM_VENDOR`, `LLM_MODEL`, and the vendor API key from environment variables. The `--config` flag lets you store all of that in a file instead:
+
+```bash
+birdie --config ~/.birdie/anthropic.json
+```
+
+**Example config files**
+
+Anthropic:
+```json
+{
+  "vendor": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "api_key": "sk-ant-...",
+  "temperature": 0.3
+}
+```
+
+OpenAI:
+```json
+{
+  "vendor": "openai",
+  "model": "gpt-4o",
+  "api_key": "sk-...",
+  "max_tokens": 4096
+}
+```
+
+Azure OpenAI:
+```json
+{
+  "vendor": "azure",
+  "model": "my-gpt4o-deployment",
+  "api_key": "...",
+  "base_url": "https://my-resource.openai.azure.com/",
+  "api_version": "2024-02-01"
+}
+```
+
+Google Gemini:
+```json
+{
+  "vendor": "gemini",
+  "model": "gemini-2.5-pro",
+  "api_key": "AIza..."
+}
+```
+
+Mistral:
+```json
+{
+  "vendor": "mistral",
+  "model": "mistral-large-latest",
+  "api_key": "..."
+}
+```
+
+Ollama (local, no key needed):
+```json
+{
+  "vendor": "ollama",
+  "model": "llama3",
+  "base_url": "http://localhost:11434/v1"
+}
+```
+
+**Config fields**
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `vendor` | string | `openai` | `openai` \| `azure` \| `anthropic` \| `mistral` \| `gemini` \| `ollama` \| `langchain` |
+| `model` | string | provider default | Model identifier |
+| `api_key` | string | from env var | API key (omit to use env var) |
+| `base_url` | string | — | Override API endpoint (proxy, local server) |
+| `temperature` | float | `0.0` | Sampling temperature (0.0 – 2.0) |
+| `max_tokens` | int | — | Max completion tokens |
+| `api_version` | string | `2024-02-01` | Azure OpenAI API version |
+| `timeout` | float | `120.0` | Request timeout in seconds (Mistral) |
+
+The `LLM_PROVIDER_CONFIG` environment variable accepts an inline JSON string and takes precedence over everything else:
+
+```bash
+export LLM_PROVIDER_CONFIG='{"vendor":"anthropic","model":"claude-sonnet-4-6","api_key":"sk-ant-..."}'
+birdie
 ```
 
 **Key bindings**
@@ -405,24 +510,203 @@ birdie [--user USER_ID] [--skills-dir PATH]
 |---|---|
 | `/help` | Show available commands |
 | `/skills` | List loaded skills with enable/disable status |
-| `/tools` | List callable tools for the current user |
-| `/enable <Skill>` | Enable a skill for the current user |
-| `/disable <Skill>` | Disable a skill for the current user |
-| `/user <id>` | Switch user identity |
-| `/new` | Start a fresh conversation thread |
+| `/tools` | List callable tools for the current session |
+| `/enable <Skill>` | Enable a skill (persisted to session) |
+| `/disable <Skill>` | Disable a skill (persisted to session) |
+| `/remember <text>` | Save a note to long-term memory |
+| `/info` | Show user, session ID, turn count, and provider |
+| `/session new` | Create a new session and switch to it |
+| `/session switch <id>` | Resume an existing session |
+| `/session delete <id>` | Delete a session (creates a new one if current) |
+| `/session list` | List all sessions for this user |
+| `/session info` | Show session metadata (created, turns, memory) |
+| `/new` | Alias for `/session new` |
 | `/clear` | Clear the screen |
-| `/info` | Show current user, thread ID, and provider |
 | `/quit` | Exit |
+
+---
+
+## Memory and sessions
+
+### How agents use memory
+
+An LLM has no persistent state of its own — every API call is stateless. Building a useful assistant means giving it two distinct kinds of memory:
+
+**Short-term memory** is the message history forwarded with each request. It contains the conversation so far: the user's messages, the model's replies, tool calls, and tool results. The model uses it to maintain continuity, reference earlier messages, and understand what tools it has already called in this turn. Short-term memory is bounded by the model's context window and must be actively managed for cost.
+
+**Long-term memory** is facts that should survive across conversations and restarts. Rather than accumulating in the message list, they are stored in a separate layer and *injected into the system prompt* on every request. The model sees them as persistent background knowledge. Long-term memory requires an explicit write operation — it does not grow automatically from conversation content.
+
+### Memory in the agentic loop
+
+Each call to `call_model` assembles everything the LLM will see:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  What the LLM receives on every call_model() invocation              │
+│                                                                      │
+│  system prompt (rebuilt from in-memory skill objects, no disk I/O)  │
+│    Tier 1  skill catalog      — what tools are available this turn   │
+│    Tier 2  knowledge context  — freetext skill body (if triggered)   │
+│    Tier 3  long-term memory   — user facts (always present)          │
+│                                                                      │
+│  message window  (last 20 from the full checkpointed history)        │
+│    HumanMessage   "list files in current dir"                        │
+│    AIMessage      → calling list_files(path=".")                     │
+│    ToolMessage    "main.py\nREADME.md\n..."                          │
+│    AIMessage      "Here are the files: ..."                          │
+│    HumanMessage   "which is the largest?"   ← current turn          │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Short-term memory is the message window. Long-term memory is the Tier 3 block injected into the system prompt. Both are assembled per-turn at call time from their respective stores.
+
+The agent loop (`START → agent → tools → agent → … → END`) can execute multiple `call_model` invocations per user turn — once for each iteration around the tool loop. Each one receives the same system prompt and the same growing message window, with each completed tool call appended as a new `ToolMessage`.
+
+### Birdie's implementation
+
+#### Short-term memory — LangGraph's `SqliteSaver` checkpointer
+
+Birdie delegates all message persistence to LangGraph's `SqliteSaver`. After every graph node, the checkpointer writes the updated `AgentState` to a per-user SQLite database:
+
+```
+~/.birdie/sessions/<user_id>/checkpoints.db
+```
+
+Each session is a LangGraph **thread**, identified by the session ID (`2026-04-29_1`). When a turn starts, the checkpointer loads the full prior history for that thread automatically — the application only passes the new `HumanMessage`. The graph receives a complete, accurately-typed message list without any application-level serialization or deserialization.
+
+The context window trim happens inside `call_model`, not at the storage layer:
+
+```python
+# graph.py — inside call_model()
+all_messages = list(state["messages"])          # full history from checkpointer
+context_msgs = all_messages[-MAX_CONTEXT_MESSAGES:]  # last 20 forwarded to LLM
+```
+
+The checkpointer retains unlimited history; the 20-message cap controls only what is sent to the provider per turn.
+
+**Checkpoint repair.** If the process dies after the LLM responds (its `AIMessage` is already written to the checkpoint) but before tool execution completes (no `ToolMessage` follows), the checkpoint is left in a state that providers reject as a protocol violation. On the next invocation, `_repair_dangling_tool_calls` detects orphaned tool calls within the context window, synthesises placeholder `ToolMessage`s, and returns them alongside the real response so the checkpoint heals permanently on write.
+
+#### Long-term memory — user-scoped `memory.json`
+
+Notes added via `/remember` are written to a JSON file alongside the session files:
+
+```
+~/.birdie/sessions/<user_id>/memory.json
+```
+
+This store is **user-scoped**, not session-scoped. A fact added during session `2026-04-29_1` is still present when you run `/session new` or resume `2026-04-29_2` the next day. The file is a flat list of timestamped entries:
+
+```json
+{
+  "user_id": "alice",
+  "entries": [
+    {"id": "a3f1c2b0", "timestamp": "2026-04-29T09:12:00+00:00", "content": "prefers concise answers"},
+    {"id": "b7e4d9f1", "timestamp": "2026-04-29T10:00:00+00:00", "content": "working on project Birdie"}
+  ]
+}
+```
+
+At the start of each turn the CLI reads `memory.json` and forwards the contents as `long_term_memory` through `config["configurable"]`. The graph reads it from config — not from state — so LTM is never written into the checkpoint and never mixed with message history:
+
+```python
+# graph.py — inside _build_system_prompt()
+ltm = config.get("configurable", {}).get("long_term_memory") or []
+if ltm:
+    system += "\n\n--- Long-term memory ---\n"
+    system += "\n".join(f"- {entry}" for entry in ltm)
+```
+
+Birdie uses **explicit-only** long-term memory: nothing is extracted or summarised from the conversation automatically. Only `/remember` writes to the store, so nothing is recorded without your knowledge.
+
+#### Session files — lightweight metadata
+
+The session JSON files store only what neither the checkpointer nor the memory file can represent: skill grants and administrative metadata. They are small and fully human-readable:
+
+```json
+{
+  "id": "2026-04-29_1",
+  "user_id": "alice",
+  "created_at": "2026-04-29T08:00:00+00:00",
+  "updated_at": "2026-04-29T11:30:00+00:00",
+  "turns": 12,
+  "enabled_skills": ["Shell", "Filesystem"],
+  "disabled_skills": ["Weather"]
+}
+```
+
+There is no `messages` field — history lives in `checkpoints.db`. There is no `memory` field — facts live in `memory.json`. The session file is the glue that ties a human-readable ID to these two backing stores.
+
+#### File layout
+
+```
+~/.birdie/sessions/
+  alice/
+    checkpoints.db        ← LangGraph SqliteSaver (all sessions as LG threads)
+    memory.json           ← user-scoped long-term memory
+    2026-04-29_1.json     ← session metadata (skill grants, turn count)
+    2026-04-29_2.json
+  bob/
+    checkpoints.db
+    memory.json
+    2026-04-29_1.json
+```
+
+#### The session ID as a shared key
+
+The session ID (`2026-04-29_1`) plays three roles simultaneously:
+
+| Role | Where used | Effect |
+|---|---|---|
+| LangGraph `thread_id` | `SqliteSaver` checkpointer | Loads and saves this session's message history |
+| Skill policy key | `UserSkillPolicy` | Determines which skills are active this turn |
+| Filename | `<session_id>.json` | Links to the metadata JSON on disk |
+
+Switching sessions changes all three at once — history, skill grants, and metadata — by changing one string.
+
+### Session ID format and lifecycle
+
+Session IDs use `YYYY-MM-DD_N` where `N` increments from 1 for each new session on that calendar day:
+
+```
+2026-04-29_1   ← first session on 29 April
+2026-04-29_2   ← second session that day
+2026-04-30_1   ← first session on 30 April
+```
+
+```bash
+# Start a new session (default on first run)
+birdie --user alice
+
+# Resume a specific session
+birdie --user alice --session-id 2026-04-29_1
+```
+
+### Using long-term memory
+
+```
+you> /remember prefers concise answers without bullet points
+you> /remember working on a Python project called Birdie
+```
+
+After these commands, every subsequent turn in every session includes:
+
+```
+--- Long-term memory ---
+- prefers concise answers without bullet points
+- working on a Python project called Birdie
+```
+
+in the system prompt, for the lifetime of the user (until explicitly removed from `memory.json`).
 
 **Status bar** (bottom of terminal)
 
 ```
- mistral · mistral-large-latest   │   ctx: 1,234 tok   │   spent: ↑5,678  ↓1,234 tok
+ anthropic · claude-sonnet-4-6   │   session: 2026-04-29_1   │   ctx: 1,234 tok   │   spent: ↑5,678  ↓1,234 tok
 ```
 
-- `ctx` — input tokens in the most recent API request (current context window usage)
-- `↑` — cumulative input tokens sent this session
-- `↓` — cumulative output tokens received this session
+- `session` — the active session ID
+- `ctx` — input tokens in the most recent API call
+- `↑` / `↓` — cumulative input / output tokens this process run
 
 ---
 

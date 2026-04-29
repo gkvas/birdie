@@ -103,7 +103,7 @@ class ProviderConfig(BaseModel):
         default="openai",
         description=(
             "LLM vendor identifier.  "
-            "Supported: openai | anthropic | mistral | gemini | ollama | langchain"
+            "Supported: openai | azure | anthropic | mistral | gemini | ollama | langchain"
         ),
     )
     model: Optional[str] = Field(
@@ -114,7 +114,7 @@ class ProviderConfig(BaseModel):
         default=None,
         description=(
             "API key.  Falls back to the vendor environment variable "
-            "(OPENAI_API_KEY, ANTHROPIC_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY)."
+            "(OPENAI_API_KEY, AZURE_OPENAI_API_KEY, ANTHROPIC_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY)."
         ),
     )
     base_url: Optional[str] = Field(
@@ -240,6 +240,12 @@ class LLMProvider(ABC):
 # OpenAI-compatible message conversion helpers
 # ---------------------------------------------------------------------------
 
+# Tool results larger than this are truncated before being sent to the LLM.
+# Large shell output (e.g. `cat` on a big file) can easily exceed provider
+# context limits and trigger cryptic API errors.
+_MAX_TOOL_CONTENT_CHARS = 32_000
+
+
 def _lc_to_openai_messages(
     messages: list[BaseMessage],
     system_prompt: str | None = None,
@@ -276,10 +282,17 @@ def _lc_to_openai_messages(
                 m = {"role": "assistant", "content": msg.content or ""}
             result.append(m)
         elif isinstance(msg, ToolMessage):
+            content = str(msg.content)
+            if len(content) > _MAX_TOOL_CONTENT_CHARS:
+                dropped = len(content) - _MAX_TOOL_CONTENT_CHARS
+                content = (
+                    content[:_MAX_TOOL_CONTENT_CHARS]
+                    + f"\n[...{dropped} characters truncated]"
+                )
             tool_msg: dict[str, Any] = {
                 "role": "tool",
                 "tool_call_id": msg.tool_call_id,
-                "content": str(msg.content),
+                "content": content,
             }
             if msg.name:
                 tool_msg["name"] = msg.name
@@ -484,6 +497,68 @@ class _OpenAICompatibleProvider(LLMProvider):
 # Concrete OpenAI-compatible providers
 # ---------------------------------------------------------------------------
 
+class AzureOpenAIProvider(_OpenAICompatibleProvider):
+    """Azure OpenAI Service.
+
+    Requires three Azure-specific values beyond the base OpenAI config:
+
+    - ``base_url`` / ``AZURE_OPENAI_ENDPOINT`` — e.g.
+      ``https://<resource>.openai.azure.com/``
+    - ``model`` — the *deployment name* chosen in Azure Portal, not the
+      canonical model name (e.g. ``my-gpt4o`` not ``gpt-4o``)
+    - ``api_version`` — Azure API version string, e.g. ``2024-02-01``
+      (pass as an extra JSON field; forwarded via ``ProviderConfig``'s
+      ``extra="allow"``)
+
+    Install: no extra dependency — ``openai`` is already present.
+    Set ``AZURE_OPENAI_API_KEY`` (or ``api_key`` in the config).
+    """
+
+    _env_key_name = "AZURE_OPENAI_API_KEY"
+
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        api_key: str | None = None,
+        base_url: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        api_version: str = "2024-02-01",
+        **kwargs: Any,
+    ) -> None:
+        try:
+            import openai
+        except ImportError as e:
+            raise ImportError("pip install openai") from e
+
+        resolved_key = api_key or os.environ.get(self._env_key_name, "")
+        resolved_endpoint = base_url or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+
+        self._model = model
+        self._temperature = temperature
+        self._max_tokens = max_tokens
+        self._client = openai.AzureOpenAI(
+            api_key=resolved_key,
+            azure_endpoint=resolved_endpoint,
+            api_version=api_version,
+        )
+        self._async_client = openai.AsyncAzureOpenAI(
+            api_key=resolved_key,
+            azure_endpoint=resolved_endpoint,
+            api_version=api_version,
+        )
+        self._extra = kwargs
+
+    def list_models(self) -> list[ModelInfo]:
+        # Azure deployments are user-defined; fall back to live API listing.
+        try:
+            models = self._client.models.list()
+            return [ModelInfo(id=m.id, supports_tools=True, supports_streaming=True) for m in models.data]
+        except Exception as e:
+            log.warning("list_models failed: %s", e)
+            return []
+
+
 class OpenAIProvider(_OpenAICompatibleProvider):
     """OpenAI (GPT series)."""
 
@@ -558,6 +633,7 @@ class MistralProvider(LLMProvider):
         api_key: str | None = None,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        timeout: float = 120.0,
         **kwargs: Any,
     ) -> None:
         try:
@@ -566,7 +642,9 @@ class MistralProvider(LLMProvider):
             raise ImportError("pip install 'mistralai>=1.0'") from e
 
         key = api_key or os.environ.get("MISTRAL_API_KEY", "")
-        self._client = Mistral(api_key=key)
+        # The Mistral SDK default read timeout is ~5 s — far too short for
+        # large payloads.  120 s matches the OpenAI SDK default.
+        self._client = Mistral(api_key=key, timeout_ms=int(timeout * 1000))
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
@@ -1112,6 +1190,14 @@ def get_llm_provider(
         if cfg.max_tokens: kw["max_tokens"] = cfg.max_tokens
         return MistralProvider(**kw, **extra_kw)
 
+    if vendor == "azure":
+        kw = {"temperature": cfg.temperature}
+        if cfg.model:      kw["model"]     = cfg.model
+        if cfg.api_key:    kw["api_key"]   = cfg.api_key
+        if cfg.base_url:   kw["base_url"]  = cfg.base_url
+        if cfg.max_tokens: kw["max_tokens"] = cfg.max_tokens
+        return AzureOpenAIProvider(**kw, **extra_kw)
+
     if vendor == "gemini":
         kw = {"temperature": cfg.temperature}
         if cfg.model:      kw["model"]     = cfg.model
@@ -1141,7 +1227,7 @@ def get_llm_provider(
 
     raise ValueError(
         f"Unknown vendor '{vendor}'. "
-        "Supported: openai, anthropic, mistral, gemini, ollama, langchain"
+        "Supported: openai, azure, anthropic, mistral, gemini, ollama, langchain"
     )
 
 

@@ -141,9 +141,9 @@ schema:
         assert len(llm.bound_tools) == 1
         assert llm.bound_tools[0].name == "publicskill_tool"
 
-        # Enable PrivateSkill for user123 — both should be visible
+        # Enable PrivateSkill for thread user123 — both should be visible
         agent.enable_skill_for_user("user123", "PrivateSkill")
-        await agent.invoke("Test message", user_id="user123")
+        await agent.invoke("Test message", thread_id="user123")
         assert len(llm.bound_tools) == 2
         tool_names = {t.name for t in llm.bound_tools}
         assert "publicskill_tool" in tool_names
