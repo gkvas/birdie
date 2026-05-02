@@ -47,23 +47,27 @@ birdie
 ```
 birdie/
 ├── agent/
-│   ├── graph.py      # LangGraph state machine (agent loop)
-│   └── run.py        # DynamicAgent - public API
-├── cli.py            # Interactive REPL
+│   ├── graph.py        # LangGraph state machine (agent loop)
+│   └── run.py          # DynamicAgent - public API
+├── cli.py              # Interactive REPL
 ├── core/
-│   ├── models.py     # Skill, SkillTool data models
-│   ├── loader.py     # SKILL.MD parser
-│   ├── registry.py   # In-memory skill/tool index
-│   ├── policy.py     # Per-user/session access control
-│   ├── session.py    # Session persistence (history, LTM, skill grants)
-│   ├── adapter.py    # SkillTool → LangChain StructuredTool
-│   ├── entrypoints.py# bash / http / python / mcp / grpc resolvers
+│   ├── models.py       # Skill, SkillTool, MCPServerConfig data models
+│   ├── loader.py       # SKILL.MD parser
+│   ├── registry.py     # In-memory skill/tool index
+│   ├── policy.py       # Per-user/session access control
+│   ├── session.py      # Session persistence (history, LTM, skill grants)
+│   ├── adapter.py      # SkillTool → LangChain StructuredTool
+│   ├── entrypoints.py  # bash / http / python / grpc resolvers
+│   ├── mcp_client.py   # MCP client manager (wraps langchain-mcp-adapters)
 │   └── llm_provider.py # Vendor-agnostic LLM abstraction
 └── skills/
     ├── weather/SKILL.MD
     ├── filesystem/SKILL.MD
     ├── shell/SKILL.MD
-    └── ssh/SKILL.MD
+    ├── ssh/SKILL.MD
+    └── mcp_demo/
+        ├── SKILL.MD    # MCP skill declaration
+        └── server.py   # Example stdio MCP server
 ```
 
 ---
@@ -102,9 +106,10 @@ Entrypoints are the fixed execution mechanisms built into `core/entrypoints.py`.
 | `http:get` | `http:get https://host/path` | HTTP GET; kwargs become query parameters. |
 | `http:post` | `http:post https://host/path` | HTTP POST; kwargs become the JSON body. |
 | `python:` | `python:module.path.function` | Imports the module and calls the function with kwargs. |
-| `mcp:` | `mcp:tool_name` | Stub - wire up a real MCP client. |
 | `grpc:` | `grpc:package.Service/Method` | Stub - wire up a real gRPC channel. |
 | `container:` | `container:image_name` | Stub - wire up Docker/Podman. |
+
+> **MCP tools do not use an entrypoint scheme.** They are declared via `mcp_server` in the SKILL.MD frontmatter and loaded as native LangChain tools by `MCPClientManager`, bypassing the entrypoint resolver entirely. See the [MCP integration](#mcp-integration) section.
 
 `bash:` is the workhorse for local skills. Arguments are injected via `str.format()`, so `bash:cat {path}` called with `path="/etc/hosts"` becomes `cat /etc/hosts`.
 
@@ -234,31 +239,43 @@ The agent is a LangGraph `StateGraph` with two nodes and a conditional edge.
 START
   │
   ▼
-┌─────────────────┐
-│   agent node    │  call_model()
-│                 │  1. repair dangling tool calls in checkpoint
-│                 │  2. resolve allowed tools for this user/session
-│                 │  3. build system prompt (Tier 1 + Tier 2)
-│                 │  4. call provider.achat()
-│                 │  5. append AIMessage (+ any repairs) to state
-└────────┬────────┘
-         │
-         ▼ should_continue()
-    last message
-    has tool_calls?
-         │
-    yes  │  no
-         │  └──► END
-         ▼
-┌─────────────────┐
-│   tools node    │  execute_tools()
-│                 │  1. resolve allowed tools (same logic as agent node)
-│                 │  2. build fresh LangChain ToolNode
-│                 │  3. execute; on error return error ToolMessage
-│                 │  4. append ToolMessage(s) to state
-└────────┬────────┘
-         │
-         └──────────────────────────► agent node (loop)
+┌──────────────────────────────────────┐
+│   agent node    call_model()         │
+│                                      │
+│   1. repair dangling tool calls      │
+│   2. resolve skill tools             │
+│      (registry + policy)             │
+│   3. fetch MCP tools                 │
+│      (MCPClientManager)              │
+│   4. build system prompt             │
+│      (Tier 1 + Tier 2 + Tier 3)      │
+│   5. call provider.achat()           │
+│      with all tools merged           │
+│   6. append AIMessage to state       │
+└──────────────────┬───────────────────┘
+                   │
+                   ▼ should_continue()
+              last message
+              has tool_calls?
+                   │
+              yes  │  no
+                   │  └──► END
+                   ▼
+┌──────────────────────────────────────┐
+│   tools node    execute_tools()      │
+│                                      │
+│   1. resolve skill tools             │
+│   2. fetch MCP tools                 │
+│   3. build fresh LangChain ToolNode  │
+│      with all tools merged           │
+│   4. execute called tool             │
+│   5. on error: return error          │
+│      ToolMessage so state stays      │
+│      balanced and LLM can recover    │
+│   6. append ToolMessage(s) to state  │
+└──────────────────┬───────────────────┘
+                   │
+                   └─────────────────► agent node (loop)
 ```
 
 The loop continues until the model returns a message with no `tool_calls`. There is no hard cap on iterations - it is the model's decision to stop.
@@ -284,7 +301,191 @@ At the start of every `call_model` invocation, `_repair_dangling_tool_calls` sca
 
 ---
 
-## Context window and system prompt assembly
+## MCP integration
+
+[Model Context Protocol](https://modelcontextprotocol.io) (MCP) is an open standard that lets a server expose a set of tools over a well-defined wire protocol. Instead of writing a Python function and wiring it into an entrypoint, you run a separate process that speaks MCP - the agent connects to it, discovers the available tools, and calls them exactly as it would call any other tool.
+
+This is useful for showcasing how agents can consume external capability providers: the agent does not need to know how a tool is implemented or where it runs. It only needs to know how to reach the server.
+
+Birdie integrates MCP through [`langchain-mcp-adapters`](https://github.com/langchain-ai/langchain-mcp-adapters), which converts MCP tool definitions into native LangChain `BaseTool` objects. These are merged with the skill tools before each LLM call and each ToolNode invocation, so the model sees them alongside any `bash:` or `python:` tools without any special handling.
+
+### How it works
+
+```
+Startup
+  └─ loader discovers SKILL.MD with mcp_server: frontmatter key
+       └─ MCPClientManager.register_server(name, MCPServerConfig)
+
+First tool call (lazy connection)
+  └─ MCPClientManager.get_tools()
+       └─ MultiServerMCPClient.get_tools()
+            └─ spawns server process (stdio) or connects (SSE/HTTP)
+            └─ calls tools/list  → gets tool names + schemas
+            └─ returns List[BaseTool]  (cached for process lifetime)
+
+Every call_model() invocation
+  └─ skill tools  (SkillTool objects from registry)  → NormalizedToolDef list
+  └─ MCP tools    (BaseTool objects from manager)    → NormalizedToolDef list
+  └─ merged list sent to provider.achat() so LLM sees all tools
+
+Every execute_tools() invocation
+  └─ skill tools  → LangChain StructuredTool list
+  └─ MCP tools    → BaseTool list (already LangChain-compatible)
+  └─ merged list passed to ToolNode for execution
+```
+
+The MCP client opens a fresh session for each tool invocation. This is the design pattern recommended by `langchain-mcp-adapters` - it keeps the client stateless and avoids managing long-lived connections.
+
+### Declaring an MCP server in SKILL.MD
+
+Add an `mcp_server` block to the frontmatter. No `## Tools` section is needed - the tools are discovered dynamically from the server at runtime.
+
+**stdio transport** (server runs as a subprocess):
+
+```yaml
+---
+name: my_tools
+version: 1.0.0
+description: Tools provided by my MCP server
+enabled_by_default: false
+mcp_server:
+  transport: stdio
+  command: python
+  args: ["path/to/server.py"]
+---
+```
+
+**SSE / HTTP transport** (server is a running process you connect to):
+
+```yaml
+---
+name: remote_tools
+version: 1.0.0
+description: Tools from a remote MCP server
+enabled_by_default: false
+mcp_server:
+  transport: sse
+  url: http://localhost:8080/sse
+---
+```
+
+**`mcp_server` fields**
+
+| Field | Required | Description |
+|---|---|---|
+| `transport` | yes | `stdio` or `sse` |
+| `command` | stdio only | Executable to launch (e.g. `python`, `node`) |
+| `args` | stdio only | List of arguments passed to the command |
+| `env` | no | Extra environment variables for the subprocess |
+| `cwd` | no | Working directory for the subprocess |
+| `url` | sse only | URL of the SSE endpoint |
+| `headers` | sse only | HTTP headers to send with the connection |
+
+### Writing an MCP server
+
+An MCP server can be written in any language that has an MCP SDK. The Python SDK makes it very compact using `FastMCP`:
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("my_server")
+
+@mcp.tool()
+def add(a: int, b: int) -> int:
+    """Add two numbers."""
+    return a + b
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+```
+
+The function's name, docstring, and type annotations become the tool name, description, and argument schema automatically. The LLM sees exactly what is reflected from the function signature.
+
+### The demo server
+
+`birdie/skills/mcp_demo/` contains a minimal working example:
+
+```python
+# birdie/skills/mcp_demo/server.py
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("mcp_demo")
+
+@mcp.tool()
+def echo(message: str) -> str:
+    """Return the message unchanged."""
+    return message
+
+@mcp.tool()
+def reverse_string(text: str) -> str:
+    """Return the text with characters in reverse order."""
+    return text[::-1]
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")
+```
+
+The matching `SKILL.MD` points the agent at this server:
+
+```yaml
+---
+name: mcp_demo
+version: 1.0.0
+description: Demo tools served via MCP (echo and reverse_string)
+enabled_by_default: false
+mcp_server:
+  transport: stdio
+  command: python
+  args: ["birdie/skills/mcp_demo/server.py"]
+---
+```
+
+To try it, enable the skill for your session and call one of the tools:
+
+```
+you> /enable mcp_demo
+you> reverse "hello world"
+```
+
+The agent will call `reverse_string` via MCP and show you `dlrow olleh`.
+
+### Install the MCP extra
+
+MCP support is an optional dependency. Install it alongside Birdie:
+
+```bash
+pip install -e ".[mcp]"
+```
+
+This adds `mcp` (the official Python SDK) and `langchain-mcp-adapters`. If `mcp_server` is declared in a SKILL.MD but the extra is not installed, `MCPClientManager.get_tools()` raises an `ImportError` with a clear message on first use.
+
+### Where MCP fits in the architecture
+
+The entrypoint resolver (`entrypoints.py`) handles synchronous, stateless execution: it receives a string like `bash:cat {path}` and returns a callable. MCP does not fit this model because it requires an async connection lifecycle and returns pre-built LangChain tool objects rather than raw callables.
+
+Instead, MCP tools are handled by `MCPClientManager` (`core/mcp_client.py`) and merged directly into the graph's tool pools at the point where they are used:
+
+```
+core/mcp_client.py     MCPClientManager
+                            register_server()  ← called by DynamicAgent at startup
+                            get_tools()        ← called by graph.py on every turn
+
+agent/graph.py         call_model()
+                            skill tools (from registry) → NormalizedToolDef
+                            MCP tools   (from manager)  → NormalizedToolDef
+                            all merged → provider.achat()
+
+                       execute_tools()
+                            skill tools → LangChain StructuredTool
+                            MCP tools   → LangChain BaseTool (already usable)
+                            all merged → ToolNode
+```
+
+This keeps `MCPClientManager` as a thin, focused module and avoids coupling the entrypoint system to async connection management.
+
+---
+
+
 
 Every call to `call_model` constructs a fresh system prompt from the in-memory skill objects. Nothing is read from disk.
 
@@ -713,6 +914,6 @@ in the system prompt, for the lifetime of the user (until explicitly removed fro
 ## Running tests
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev,mcp]"
 pytest
 ```

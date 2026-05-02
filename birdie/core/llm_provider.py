@@ -1101,6 +1101,26 @@ def skilltool_to_normalized_def(skill_tool: Any) -> NormalizedToolDef:
     }
 
 
+def lc_tool_to_normalized_def(tool: Any) -> NormalizedToolDef:
+    """Convert a LangChain BaseTool (e.g. from MCP) to a NormalizedToolDef dict."""
+    args_schema = tool.args_schema
+    if args_schema is None:
+        schema: dict = {"type": "object", "properties": {}}
+    elif isinstance(args_schema, dict):
+        # MCP tools provide args_schema as a plain JSON Schema dict
+        schema = dict(args_schema)
+    else:
+        # Pydantic model class (StructuredTool pattern)
+        schema = args_schema.model_json_schema()
+    schema.pop("title", None)
+    schema.pop("$defs", None)
+    return {
+        "name": tool.name,
+        "description": tool.description or "",
+        "parameters": schema,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Provider factory
 # ---------------------------------------------------------------------------

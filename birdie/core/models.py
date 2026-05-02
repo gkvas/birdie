@@ -4,7 +4,7 @@ Core data models for the dynamic skill system.
 
 import warnings
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 
 # Pydantic v2 reserves `model_` prefixed names; `schema` shadows the legacy
 # .schema() class-method.  We silence the warning because the SKILL.MD spec
@@ -14,6 +14,19 @@ warnings.filterwarnings(
     message="Field name \"schema\" in \"SkillTool\" shadows",
     category=UserWarning,
 )
+
+
+class MCPServerConfig(BaseModel):
+    """Connection config for a single MCP server declared in a SKILL.MD file."""
+    transport: Literal["stdio", "sse"] = "stdio"
+    # stdio fields
+    command: Optional[str] = None
+    args: List[str] = []
+    env: Optional[Dict[str, str]] = None
+    cwd: Optional[str] = None
+    # sse / http fields
+    url: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
 
 
 class SkillTool(BaseModel):
@@ -45,3 +58,4 @@ class Skill(BaseModel):
     always_inject: bool = False   # inject body into system prompt every turn
     permissions: List[str] = []
     body: Optional[str] = None  # prose body injected into system prompt
+    mcp_server: Optional[MCPServerConfig] = None  # set for MCP-backed skills

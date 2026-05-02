@@ -15,6 +15,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from ..core.registry import SkillRegistry
 from ..core.loader import discover_skills_from_directory
 from ..core.policy import UserSkillPolicy
+from ..core.mcp_client import MCPClientManager
 from ..core.llm_provider import (
     LLMProvider,
     LangChainProvider,
@@ -77,10 +78,13 @@ class DynamicAgent:
         self.skills_dir = skills_dir
         self.registry = SkillRegistry()
         self.policy = UserSkillPolicy()
+        self.mcp_manager = MCPClientManager()
 
         self._load_skills()
 
-        graph = create_agent_graph(self.provider, self.registry, self.policy)
+        graph = create_agent_graph(
+            self.provider, self.registry, self.policy, self.mcp_manager
+        )
         self.app = graph.compile(checkpointer=checkpointer or MemorySaver())
 
     @classmethod
@@ -136,7 +140,13 @@ class DynamicAgent:
         skills = discover_skills_from_directory(self.skills_dir)
         for skill in skills:
             self.registry.register_skill(skill)
+            if skill.mcp_server is not None:
+                self.mcp_manager.register_server(skill.name, skill.mcp_server)
         self.policy.set_default_skills(skills)
+
+    async def shutdown(self) -> None:
+        """Release resources - call when the agent is no longer needed."""
+        pass  # MCPClientManager uses per-call sessions; nothing to tear down
 
     def enable_skill_for_user(self, user_id: str, skill_name: str) -> None:
         """Grant a skill for a session (``user_id`` is the ``thread_id`` / session ID).

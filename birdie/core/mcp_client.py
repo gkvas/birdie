@@ -1,0 +1,120 @@
+"""
+MCP client manager.
+
+Wraps ``langchain-mcp-adapters`` ``MultiServerMCPClient`` so the rest of the
+codebase only needs to call ``get_tools()`` - connection details stay here.
+
+Each call to ``get_tools()`` opens a fresh MCP session, which matches the
+library's design (stateless per-call sessions).  Normalized tool definitions
+(schemas only, no callables) are cached after the first fetch so ``call_model``
+can be re-entered cheaply.
+"""
+
+import logging
+from typing import List, Optional
+
+from langchain_core.tools import BaseTool
+
+from .models import MCPServerConfig
+
+log = logging.getLogger(__name__)
+
+
+def _to_adapter_config(name: str, cfg: MCPServerConfig) -> dict:
+    """Convert MCPServerConfig to the dict format expected by MultiServerMCPClient."""
+    if cfg.transport == "stdio":
+        entry: dict = {
+            "transport": "stdio",
+            "command": cfg.command,
+            "args": cfg.args,
+        }
+        if cfg.env is not None:
+            entry["env"] = cfg.env
+        if cfg.cwd is not None:
+            entry["cwd"] = cfg.cwd
+    else:
+        entry = {
+            "transport": cfg.transport,
+            "url": cfg.url,
+        }
+        if cfg.headers is not None:
+            entry["headers"] = cfg.headers
+    return entry
+
+
+class MCPClientManager:
+    """
+    Manages MCP server registrations and provides their tools as LangChain
+    BaseTool objects.
+
+    Usage
+    -----
+    Register servers (sync, at startup)::
+
+        manager = MCPClientManager()
+        manager.register_server("my_server", MCPServerConfig(
+            transport="stdio", command="python", args=["server.py"]
+        ))
+
+    Then retrieve tools (async, at tool-call time)::
+
+        tools = await manager.get_tools()
+
+    ``get_tools()`` opens a new MCP session on each call - this is the
+    recommended pattern from ``langchain-mcp-adapters`` (each tool invocation
+    is self-contained).  Normalized definitions (name/description/schema) are
+    cached for the lifetime of the process since schemas do not change at runtime.
+    """
+
+    def __init__(self) -> None:
+        self._configs: dict[str, dict] = {}
+        self._cached_tools: Optional[List[BaseTool]] = None
+
+    def register_server(self, name: str, config: MCPServerConfig) -> None:
+        """Register an MCP server under *name*.  Call before any ``get_tools()``."""
+        if self._cached_tools is not None:
+            log.warning(
+                "MCPClientManager: registering server '%s' after tools were already "
+                "cached - cache cleared", name
+            )
+            self._cached_tools = None
+        self._configs[name] = _to_adapter_config(name, config)
+        log.debug("Registered MCP server '%s' (%s)", name, config.transport)
+
+    @property
+    def has_servers(self) -> bool:
+        return bool(self._configs)
+
+    async def get_tools(self) -> List[BaseTool]:
+        """Return LangChain tools from all registered MCP servers.
+
+        On the first call the tool list is fetched and cached (schemas are
+        stable).  Subsequent calls return the cached list so the graph can call
+        this on every turn without paying the connection overhead.
+
+        The underlying tool objects created by ``langchain-mcp-adapters`` open
+        their own session per invocation, so the cache is safe even after the
+        initial fetch session closes.
+        """
+        if not self._configs:
+            return []
+
+        if self._cached_tools is not None:
+            return self._cached_tools
+
+        try:
+            from langchain_mcp_adapters.client import MultiServerMCPClient
+        except ImportError as exc:
+            raise ImportError(
+                "MCP support requires the 'mcp' optional extra: "
+                "pip install 'birdie[mcp]'"
+            ) from exc
+
+        client = MultiServerMCPClient(self._configs)
+        tools = await client.get_tools()
+        self._cached_tools = tools
+        log.debug(
+            "MCP: loaded %d tool(s) from %d server(s)",
+            len(tools), len(self._configs),
+        )
+        return tools

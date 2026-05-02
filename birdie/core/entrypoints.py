@@ -11,9 +11,13 @@ Supported schemes
 - ``http:get``    - HTTP GET; kwargs become query parameters
 - ``http:post``   - HTTP POST; kwargs become the JSON body
 - ``python:``     - import and call ``module.path.function(**kwargs)``
-- ``mcp:``        - stub; wire up a real MCP client
 - ``grpc:``       - stub; wire up a real gRPC channel
 - ``container:``  - stub; wire up Docker/Podman
+
+Note: MCP tools are not resolved here.  MCP servers are declared via
+``mcp_server`` in SKILL.MD frontmatter; their tools are loaded by
+``MCPClientManager`` and injected into the graph directly as LangChain
+BaseTool objects, bypassing the entrypoint system.
 """
 
 import subprocess
@@ -100,20 +104,6 @@ def resolve_python(entrypoint: str, **kwargs: Any) -> Any:
     return getattr(module, function_name)(**kwargs)
 
 
-def resolve_mcp(entrypoint: str, **kwargs: Any) -> Any:
-    """Stub for ``mcp:`` entrypoints - wire up a real MCP client here.
-
-    Args:
-        entrypoint: Full entrypoint string, e.g. ``mcp:tool_name``.
-        **kwargs: Arguments for the MCP tool.
-
-    Returns:
-        Mock response dict (replace with real MCP call).
-    """
-    tool_name = entrypoint.split(":", 1)[1]
-    return {"tool": tool_name, "args": kwargs, "status": "mock_response"}
-
-
 def resolve_grpc(entrypoint: str, **kwargs: Any) -> Any:
     """Stub for ``grpc:`` entrypoints - wire up a real gRPC channel here.
 
@@ -167,8 +157,6 @@ def resolve_entrypoint(entrypoint: str) -> Callable[..., Any]:
         return resolve_bash
     if entrypoint.startswith("python:"):
         return resolve_python
-    if entrypoint.startswith("mcp:"):
-        return resolve_mcp
     if entrypoint.startswith("container:"):
         return resolve_container
     if entrypoint.startswith("grpc:"):

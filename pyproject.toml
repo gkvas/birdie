@@ -25,6 +25,7 @@ dev = ["pytest", "pytest-asyncio"]
 mistral = ["mistralai>=1.0"]
 anthropic = ["anthropic>=0.25"]
 gemini = []
+mcp = ["mcp>=1.0", "langchain-mcp-adapters>=0.1"]
 
 [project.scripts]
 birdie = "birdie.cli:main"

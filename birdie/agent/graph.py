@@ -31,7 +31,8 @@ from langgraph.graph.message import add_messages
 from ..core.registry import SkillRegistry
 from ..core.adapter import skilltool_to_langchain_tool
 from ..core.policy import UserSkillPolicy
-from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def
+from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def, lc_tool_to_normalized_def
+from ..core.mcp_client import MCPClientManager
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ def create_agent_graph(
     provider: LLMProvider,
     registry: SkillRegistry,
     policy: UserSkillPolicy,
+    mcp_manager: MCPClientManager | None = None,
 ) -> StateGraph:
     """
     Build a LangGraph workflow that routes through the LLMProvider.
@@ -215,12 +217,15 @@ def create_agent_graph(
         repair_msgs, clean_messages = _repair_dangling_tool_calls(context_msgs)
 
         skill_tools = _get_skill_tools(config)
+        mcp_tools = await mcp_manager.get_tools() if mcp_manager else []
 
-        normalized_tools = (
-            [skilltool_to_normalized_def(t) for t in skill_tools]
-            if skill_tools and provider.supports_tools()
-            else None
-        )
+        if provider.supports_tools() and (skill_tools or mcp_tools):
+            normalized_tools = (
+                [skilltool_to_normalized_def(t) for t in skill_tools]
+                + [lc_tool_to_normalized_def(t) for t in mcp_tools]
+            )
+        else:
+            normalized_tools = None
 
         system_prompt = _build_system_prompt(state, config)
 
@@ -250,7 +255,10 @@ def create_agent_graph(
 
     async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:
         skill_tools = _get_skill_tools(config)
-        langchain_tools = [skilltool_to_langchain_tool(t) for t in skill_tools]
+        mcp_tools = await mcp_manager.get_tools() if mcp_manager else []
+        langchain_tools = (
+            [skilltool_to_langchain_tool(t) for t in skill_tools] + mcp_tools
+        )
         tool_node = ToolNode(langchain_tools)
         try:
             return await tool_node.ainvoke(state)

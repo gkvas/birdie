@@ -19,7 +19,7 @@ import re
 import yaml
 from pathlib import Path
 from typing import List
-from .models import Skill, SkillTool
+from .models import Skill, SkillTool, MCPServerConfig
 
 
 def parse_skill_markdown(content: str) -> Skill:
@@ -103,6 +103,10 @@ def parse_skill_markdown(content: str) -> Skill:
     else:
         body = None
 
+    mcp_server: MCPServerConfig | None = None
+    if 'mcp_server' in frontmatter:
+        mcp_server = MCPServerConfig(**frontmatter['mcp_server'])
+
     return Skill(
         name=frontmatter['name'],
         version=str(frontmatter.get('version', '1.0.0')),
@@ -114,6 +118,7 @@ def parse_skill_markdown(content: str) -> Skill:
         always_inject=always_inject,
         permissions=permissions,
         body=body,
+        mcp_server=mcp_server,
     )
 
 
