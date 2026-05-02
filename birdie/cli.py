@@ -556,6 +556,45 @@ def main() -> None:
     asyncio.run(_async_main(args.session_id, user_id, skills_dir, provider_config))
 
 
+_PROVIDER_HELP = """
+[bold red]No LLM vendor configured.[/bold red]
+
+Birdie needs to know which LLM provider to use. Configure it with environment
+variables or a JSON config file.
+
+[bold]Option 1 - environment variables[/bold]
+
+  [cyan]export LLM_VENDOR=openai[/cyan]          # or: anthropic, mistral, gemini, azure, ollama
+  [cyan]export LLM_MODEL=gpt-4o[/cyan]           # optional - uses provider default if omitted
+  [cyan]export OPENAI_API_KEY=sk-...[/cyan]       # vendor-specific key variable:
+                                   #   OPENAI_API_KEY, ANTHROPIC_API_KEY,
+                                   #   MISTRAL_API_KEY, GEMINI_API_KEY,
+                                   #   AZURE_OPENAI_API_KEY
+  [cyan]birdie[/cyan]
+
+[bold]Option 2 - config file[/bold]
+
+  Create a JSON file, e.g. [cyan]~/.birdie/provider.json[/cyan]:
+
+    {
+      "vendor": "openai",
+      "model": "gpt-4o",
+      "api_key": "sk-..."
+    }
+
+  Then start Birdie with:
+
+    [cyan]birdie --config ~/.birdie/provider.json[/cyan]
+
+[bold]Supported vendors:[/bold] openai, anthropic, mistral, gemini, azure, ollama
+"""
+
+
+def _abort(console: Console, message: str) -> None:
+    console.print(message)
+    sys.exit(1)
+
+
 async def _async_main(
     session_id_arg: Optional[str],
     user_id: str,
@@ -563,6 +602,16 @@ async def _async_main(
     provider_config,
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    console = Console()
+
+    # Fail fast if no vendor source is configured at all.
+    if (
+        provider_config is None
+        and not os.environ.get("LLM_PROVIDER_CONFIG")
+        and not os.environ.get("LLM_VENDOR")
+    ):
+        _abort(console, _PROVIDER_HELP)
 
     session_manager = SessionManager()
 
@@ -583,9 +632,15 @@ async def _async_main(
     # AsyncSqliteSaver requires an async context manager to own the connection
     # lifetime, so the entire REPL runs inside it.
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
-        agent = DynamicAgent.from_config(
-            provider_config, skills_dir=skills_dir, checkpointer=checkpointer
-        )
+        try:
+            agent = DynamicAgent.from_config(
+                provider_config, skills_dir=skills_dir, checkpointer=checkpointer
+            )
+        except ValueError as exc:
+            _abort(console, f"[bold red]Configuration error:[/bold red] {exc}\n\n{_PROVIDER_HELP}")
+        except ImportError as exc:
+            _abort(console, f"[bold red]Missing dependency:[/bold red] {exc}")
+
         cli = BirdieCLI(
             agent,
             session_manager=session_manager,
