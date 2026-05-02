@@ -15,7 +15,7 @@ def skilltool_to_langchain_tool(skill_tool: SkillTool) -> StructuredTool:
     """Wrap a SkillTool as a LangChain StructuredTool backed by its entrypoint.
 
     A new wrapper is created on every call so the active entrypoint resolver
-    is always fresh — important when skills are enabled/disabled between turns.
+    is always fresh - important when skills are enabled/disabled between turns.
 
     Args:
         skill_tool: The declarative skill tool to wrap.

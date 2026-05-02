@@ -57,7 +57,7 @@ class ModelInfo:
 
 
 # ---------------------------------------------------------------------------
-# ProviderConfig — validated, JSON-serialisable provider configuration
+# ProviderConfig - validated, JSON-serialisable provider configuration
 # ---------------------------------------------------------------------------
 
 class ProviderConfig(BaseModel):
@@ -262,7 +262,7 @@ def _lc_to_openai_messages(
             result.append({"role": "user", "content": str(msg.content)})
         elif isinstance(msg, AIMessage):
             if msg.tool_calls:
-                # Omit content when tool_calls are present — Mistral (and OpenAI)
+                # Omit content when tool_calls are present - Mistral (and OpenAI)
                 # reject content="" alongside tool_calls in history messages.
                 m: dict[str, Any] = {
                     "role": "assistant",
@@ -502,15 +502,15 @@ class AzureOpenAIProvider(_OpenAICompatibleProvider):
 
     Requires three Azure-specific values beyond the base OpenAI config:
 
-    - ``base_url`` / ``AZURE_OPENAI_ENDPOINT`` — e.g.
+    - ``base_url`` / ``AZURE_OPENAI_ENDPOINT`` - e.g.
       ``https://<resource>.openai.azure.com/``
-    - ``model`` — the *deployment name* chosen in Azure Portal, not the
+    - ``model`` - the *deployment name* chosen in Azure Portal, not the
       canonical model name (e.g. ``my-gpt4o`` not ``gpt-4o``)
-    - ``api_version`` — Azure API version string, e.g. ``2024-02-01``
+    - ``api_version`` - Azure API version string, e.g. ``2024-02-01``
       (pass as an extra JSON field; forwarded via ``ProviderConfig``'s
       ``extra="allow"``)
 
-    Install: no extra dependency — ``openai`` is already present.
+    Install: no extra dependency - ``openai`` is already present.
     Set ``AZURE_OPENAI_API_KEY`` (or ``api_key`` in the config).
     """
 
@@ -583,7 +583,7 @@ class GeminiProvider(_OpenAICompatibleProvider):
     Uses Google's drop-in OpenAI-compatible API so no additional SDK is
     required beyond the ``openai`` package already pulled in by langchain-openai.
 
-    Install: no extra dependency — set GEMINI_API_KEY and go.
+    Install: no extra dependency - set GEMINI_API_KEY and go.
     """
 
     _default_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -642,7 +642,7 @@ class MistralProvider(LLMProvider):
             raise ImportError("pip install 'mistralai>=1.0'") from e
 
         key = api_key or os.environ.get("MISTRAL_API_KEY", "")
-        # The Mistral SDK default read timeout is ~5 s — far too short for
+        # The Mistral SDK default read timeout is ~5 s - far too short for
         # large payloads.  120 s matches the OpenAI SDK default.
         self._client = Mistral(api_key=key, timeout_ms=int(timeout * 1000))
         self._model = model
@@ -1114,7 +1114,7 @@ def get_llm_provider(
     Accepted input types
     --------------------
     ``dict``
-        Plain Python dict — the original interface, still supported::
+        Plain Python dict - the original interface, still supported::
 
             get_llm_provider({"vendor": "openai", "model": "gpt-4o"})
 

@@ -54,7 +54,7 @@ class DynamicAgent:
     -----------
     Pass a pre-built ``checkpointer`` (e.g. ``AsyncSqliteSaver``) for durable
     message history across restarts.  When ``checkpointer`` is ``None``
-    (default), a ``MemorySaver`` is used — state is in-memory only, suitable
+    (default), a ``MemorySaver`` is used - state is in-memory only, suitable
     for tests or one-shot scripts.
 
     The ``thread_id`` passed to ``astream``/``invoke`` acts as the session
@@ -105,7 +105,7 @@ class DynamicAgent:
         Environment variable overrides (checked in priority order)
         ----------------------------------------------------------
         ``LLM_PROVIDER_CONFIG``
-            Full JSON config blob — overrides everything else.
+            Full JSON config blob - overrides everything else.
 
         ``LLM_VENDOR``
             Override just the vendor, keeping all other config fields.
@@ -172,7 +172,7 @@ class DynamicAgent:
 
         Args:
             message: The user's input text.
-            thread_id: Session identifier — used by the checkpointer to load
+            thread_id: Session identifier - used by the checkpointer to load
                 prior history and by the policy engine to resolve skill grants.
                 Defaults to ``"default"`` (a single shared session).
             long_term_memory: Strings injected as Tier 3 in the system prompt

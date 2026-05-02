@@ -3,11 +3,11 @@ SKILL.MD parser and skill discovery.
 
 Parses the two SKILL.MD formats supported by Birdie:
 
-- **Structured skills** — YAML frontmatter + ``## Tools`` section.  Each
+- **Structured skills** - YAML frontmatter + ``## Tools`` section.  Each
   ``### tool_name`` block becomes a callable ``SkillTool`` with an entrypoint
   and JSON Schema.
 
-- **Freetext skills** — YAML frontmatter only (no ``## Tools``).  The entire
+- **Freetext skills** - YAML frontmatter only (no ``## Tools``).  The entire
   Markdown body is stored in ``Skill.body`` and injected into the system
   prompt when the skill's trigger keywords fire.
 

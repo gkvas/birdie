@@ -14,7 +14,7 @@
     ~~                        \|__|         ~~                        \/__/    
 ```
 
-A LangGraph-based agent that discovers capabilities at runtime from **SKILL.MD** files. Skills, tools, and their execution entrypoints are all declared in plain Markdown — no code changes required to add new capabilities.
+A LangGraph-based agent that discovers capabilities at runtime from **SKILL.MD** files. Skills, tools, and their execution entrypoints are all declared in plain Markdown - no code changes required to add new capabilities.
 
 ---
 
@@ -48,7 +48,7 @@ birdie
 birdie/
 ├── agent/
 │   ├── graph.py      # LangGraph state machine (agent loop)
-│   └── run.py        # DynamicAgent — public API
+│   └── run.py        # DynamicAgent - public API
 ├── cli.py            # Interactive REPL
 ├── core/
 │   ├── models.py     # Skill, SkillTool data models
@@ -84,17 +84,17 @@ The skill system is built in three layers, each sitting on top of the one below:
 ├──────────────────────────────────────────────────────┤
 │  Entrypoints  (hardcoded in core/entrypoints.py)     │
 │  Fixed execution primitives: bash, http, python, …   │
-│  Not declared in SKILL.MD — part of the framework.   │
+│  Not declared in SKILL.MD - part of the framework.   │
 └──────────────────────────────────────────────────────┘
 ```
 
-Entrypoints answer *how* to run something. Tool skills answer *what* can be run. Knowledge skills answer *when and why* — and delegate the actual execution back down to a tool skill.
+Entrypoints answer *how* to run something. Tool skills answer *what* can be run. Knowledge skills answer *when and why* - and delegate the actual execution back down to a tool skill.
 
 ---
 
-### Layer 1 — Entrypoints
+### Layer 1 - Entrypoints
 
-Entrypoints are the fixed execution mechanisms built into `core/entrypoints.py`. They are **not declared in SKILL.MD** — they are the substrate that tool skills are built on. A tool skill picks one entrypoint scheme per tool; the framework resolves it at call time.
+Entrypoints are the fixed execution mechanisms built into `core/entrypoints.py`. They are **not declared in SKILL.MD** - they are the substrate that tool skills are built on. A tool skill picks one entrypoint scheme per tool; the framework resolves it at call time.
 
 | Scheme | Format | Behaviour |
 |---|---|---|
@@ -102,15 +102,15 @@ Entrypoints are the fixed execution mechanisms built into `core/entrypoints.py`.
 | `http:get` | `http:get https://host/path` | HTTP GET; kwargs become query parameters. |
 | `http:post` | `http:post https://host/path` | HTTP POST; kwargs become the JSON body. |
 | `python:` | `python:module.path.function` | Imports the module and calls the function with kwargs. |
-| `mcp:` | `mcp:tool_name` | Stub — wire up a real MCP client. |
-| `grpc:` | `grpc:package.Service/Method` | Stub — wire up a real gRPC channel. |
-| `container:` | `container:image_name` | Stub — wire up Docker/Podman. |
+| `mcp:` | `mcp:tool_name` | Stub - wire up a real MCP client. |
+| `grpc:` | `grpc:package.Service/Method` | Stub - wire up a real gRPC channel. |
+| `container:` | `container:image_name` | Stub - wire up Docker/Podman. |
 
 `bash:` is the workhorse for local skills. Arguments are injected via `str.format()`, so `bash:cat {path}` called with `path="/etc/hosts"` becomes `cat /etc/hosts`.
 
 ---
 
-### Layer 2 — Tool skills
+### Layer 2 - Tool skills
 
 Tool skills expose callable tools to the LLM. Each tool declares an entrypoint that the framework executes when the LLM calls it. Every skill lives in its own subdirectory as a `SKILL.MD` file.
 
@@ -136,7 +136,7 @@ schema:
   required: [command]
 ```
 
-Tags declared on the skill (`tags: [shell, local, system]`) propagate to every tool in the skill. This is what allows knowledge skills to find executor tools without knowing their names — they ask for tools by tag, not by name.
+Tags declared on the skill (`tags: [shell, local, system]`) propagate to every tool in the skill. This is what allows knowledge skills to find executor tools without knowing their names - they ask for tools by tag, not by name.
 
 **Frontmatter fields**
 
@@ -154,14 +154,14 @@ Tags declared on the skill (`tags: [shell, local, system]`) propagate to every t
 | Field | Required | Description |
 |---|---|---|
 | `description` | yes | Shown to the LLM as the tool description |
-| `entrypoint` | yes | `scheme:target` — see Layer 1 |
+| `entrypoint` | yes | `scheme:target` - see Layer 1 |
 | `schema` | yes | JSON Schema object describing the tool's arguments |
 
 ---
 
-### Layer 3 — Knowledge skills
+### Layer 3 - Knowledge skills
 
-Knowledge skills carry no tools of their own. Their SKILL.MD contains only frontmatter and free-form Markdown prose. The prose is injected into the system prompt when a trigger keyword appears in the user's message — it is never sent otherwise.
+Knowledge skills carry no tools of their own. Their SKILL.MD contains only frontmatter and free-form Markdown prose. The prose is injected into the system prompt when a trigger keyword appears in the user's message - it is never sent otherwise.
 
 ```markdown
 ---
@@ -182,7 +182,7 @@ triggers:
 ...
 ```
 
-When the user says anything containing "ssh" or "remote server", the full Markdown body is appended to the system prompt. The LLM then uses whatever tool skills the user has enabled — typically the Shell skill's `run_bash` — to construct and execute the SSH command. No wiring between skills is needed; the LLM connects the knowledge to the available tools itself.
+When the user says anything containing "ssh" or "remote server", the full Markdown body is appended to the system prompt. The LLM then uses whatever tool skills the user has enabled - typically the Shell skill's `run_bash` - to construct and execute the SSH command. No wiring between skills is needed; the LLM connects the knowledge to the available tools itself.
 
 > **Note:** Ensure the Shell skill (or another skill that provides execution tools) is enabled when using knowledge skills that require command execution.
 
@@ -204,7 +204,7 @@ What is lazy is **what the agent does with a skill on any given turn**:
 
 - The skill object (metadata + tool definitions) lives in memory from startup.
 - The tool's **executable wrapper** (a LangChain `StructuredTool` backed by the entrypoint resolver) is created fresh on every agent turn in `execute_tools`, because the active tool set can change between turns as users enable/disable skills.
-- The skill's **body** (freetext documentation) is read from the `Skill` object in memory but only appended to the system prompt when a trigger keyword fires — it is never sent to the LLM otherwise.
+- The skill's **body** (freetext documentation) is read from the `Skill` object in memory but only appended to the system prompt when a trigger keyword fires - it is never sent to the LLM otherwise.
 
 The loading sequence:
 
@@ -261,7 +261,7 @@ START
          └──────────────────────────► agent node (loop)
 ```
 
-The loop continues until the model returns a message with no `tool_calls`. There is no hard cap on iterations — it is the model's decision to stop.
+The loop continues until the model returns a message with no `tool_calls`. There is no hard cap on iterations - it is the model's decision to stop.
 
 ### State
 
@@ -274,7 +274,7 @@ class AgentState(TypedDict):
 
 `messages` uses the `add_messages` reducer, which appends new messages and deduplicates by message ID. The state is intentionally minimal: the session ID, long-term memory, and policy key all flow through `config["configurable"]` rather than being stored in the graph state.
 
-History persistence is handled by LangGraph's `SqliteSaver` checkpointer keyed on `config["configurable"]["thread_id"]` (the session ID). When a turn starts, the checkpointer loads the full prior history automatically — the application only passes the new `HumanMessage`. After each node, the checkpointer writes the delta back to disk.
+History persistence is handled by LangGraph's `SqliteSaver` checkpointer keyed on `config["configurable"]["thread_id"]` (the session ID). When a turn starts, the checkpointer loads the full prior history automatically - the application only passes the new `HumanMessage`. After each node, the checkpointer writes the delta back to disk.
 
 ### Checkpoint repair
 
@@ -288,7 +288,7 @@ At the start of every `call_model` invocation, `_repair_dangling_tool_calls` sca
 
 Every call to `call_model` constructs a fresh system prompt from the in-memory skill objects. Nothing is read from disk.
 
-### Tier 1 — skill catalog (always present)
+### Tier 1 - skill catalog (always present)
 
 A compact bullet list of every skill currently allowed for the user/session:
 
@@ -299,9 +299,9 @@ You have access to the following skills:
 - **ssh**: Establish and manage SSH connections...  triggers: ssh, remote server, ...
 ```
 
-This is sent on every turn regardless of what the user said. It is intentionally small — only `name`, `description`, and `triggers` from the frontmatter, not the skill body.
+This is sent on every turn regardless of what the user said. It is intentionally small - only `name`, `description`, and `triggers` from the frontmatter, not the skill body.
 
-### Tier 2 — freetext skill body (on trigger only)
+### Tier 2 - freetext skill body (on trigger only)
 
 When the most recent `HumanMessage` contains any of a freetext skill's trigger keywords (case-insensitive substring match), the skill's full Markdown body is appended:
 
@@ -313,7 +313,7 @@ This skill provides capabilities for establishing and managing SSH connections..
 [full body]
 ```
 
-### Tier 3 — long-term memory (on every turn)
+### Tier 3 - long-term memory (on every turn)
 
 Notes stored via `/remember` are injected as a third tier at the end of the system prompt:
 
@@ -333,7 +333,7 @@ These are stored in the user-scoped `memory.json` and survive both restarts and 
   Tier 2: freetext skill body (if triggered)
   Tier 3: long-term memory notes (if any)
 
-[message history — rolling window, last 20 messages from checkpointer]
+[message history - rolling window, last 20 messages from checkpointer]
   HumanMessage  (turn N-4)
   AIMessage     (tool_calls)
   ToolMessage   (tool result)
@@ -353,9 +353,9 @@ The provider layer converts this LangChain message list into the wire format exp
 
 `UserSkillPolicy` enforces which skills a user may access. Resolution order (highest priority first):
 
-1. **Explicit disable** — always blocks the skill for that key
-2. **Explicit enable** — grants the skill for that key
-3. **Global defaults** — skills with `enabled_by_default: true`
+1. **Explicit disable** - always blocks the skill for that key
+2. **Explicit enable** - grants the skill for that key
+3. **Global defaults** - skills with `enabled_by_default: true`
 
 In the CLI, the **session ID** is used as the policy key (not the filesystem `--user` value). This means each session has fully independent skill grants: `/enable` and `/disable` affect only the current session and are persisted to the session JSON, so they are restored on resume.
 
@@ -384,10 +384,10 @@ class LLMProvider(ABC):
 | Vendor | Class | Install |
 |---|---|---|
 | OpenAI | `OpenAIProvider` | `pip install openai` |
-| Azure OpenAI | `AzureOpenAIProvider` | no extra dep — set `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` |
+| Azure OpenAI | `AzureOpenAIProvider` | no extra dep - set `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` |
 | Anthropic | `AnthropicProvider` | `pip install anthropic` |
 | Mistral | `MistralProvider` | `pip install mistralai>=1.0` |
-| Google Gemini | `GeminiProvider` | no extra dep — set `GEMINI_API_KEY` |
+| Google Gemini | `GeminiProvider` | no extra dep - set `GEMINI_API_KEY` |
 | Ollama | `OllamaProvider` | local server required |
 | Any LangChain model | `LangChainProvider` | existing `BaseChatModel` |
 
@@ -483,9 +483,9 @@ Ollama (local, no key needed):
 | `vendor` | string | `openai` | `openai` \| `azure` \| `anthropic` \| `mistral` \| `gemini` \| `ollama` \| `langchain` |
 | `model` | string | provider default | Model identifier |
 | `api_key` | string | from env var | API key (omit to use env var) |
-| `base_url` | string | — | Override API endpoint (proxy, local server) |
+| `base_url` | string | - | Override API endpoint (proxy, local server) |
 | `temperature` | float | `0.0` | Sampling temperature (0.0 – 2.0) |
-| `max_tokens` | int | — | Max completion tokens |
+| `max_tokens` | int | - | Max completion tokens |
 | `api_version` | string | `2024-02-01` | Azure OpenAI API version |
 | `timeout` | float | `120.0` | Request timeout in seconds (Mistral) |
 
@@ -530,11 +530,11 @@ birdie
 
 ### How agents use memory
 
-An LLM has no persistent state of its own — every API call is stateless. Building a useful assistant means giving it two distinct kinds of memory:
+An LLM has no persistent state of its own - every API call is stateless. Building a useful assistant means giving it two distinct kinds of memory:
 
 **Short-term memory** is the message history forwarded with each request. It contains the conversation so far: the user's messages, the model's replies, tool calls, and tool results. The model uses it to maintain continuity, reference earlier messages, and understand what tools it has already called in this turn. Short-term memory is bounded by the model's context window and must be actively managed for cost.
 
-**Long-term memory** is facts that should survive across conversations and restarts. Rather than accumulating in the message list, they are stored in a separate layer and *injected into the system prompt* on every request. The model sees them as persistent background knowledge. Long-term memory requires an explicit write operation — it does not grow automatically from conversation content.
+**Long-term memory** is facts that should survive across conversations and restarts. Rather than accumulating in the message list, they are stored in a separate layer and *injected into the system prompt* on every request. The model sees them as persistent background knowledge. Long-term memory requires an explicit write operation - it does not grow automatically from conversation content.
 
 ### Memory in the agentic loop
 
@@ -545,9 +545,9 @@ Each call to `call_model` assembles everything the LLM will see:
 │  What the LLM receives on every call_model() invocation              │
 │                                                                      │
 │  system prompt (rebuilt from in-memory skill objects, no disk I/O)  │
-│    Tier 1  skill catalog      — what tools are available this turn   │
-│    Tier 2  knowledge context  — freetext skill body (if triggered)   │
-│    Tier 3  long-term memory   — user facts (always present)          │
+│    Tier 1  skill catalog      - what tools are available this turn   │
+│    Tier 2  knowledge context  - freetext skill body (if triggered)   │
+│    Tier 3  long-term memory   - user facts (always present)          │
 │                                                                      │
 │  message window  (last 20 from the full checkpointed history)        │
 │    HumanMessage   "list files in current dir"                        │
@@ -560,11 +560,11 @@ Each call to `call_model` assembles everything the LLM will see:
 
 Short-term memory is the message window. Long-term memory is the Tier 3 block injected into the system prompt. Both are assembled per-turn at call time from their respective stores.
 
-The agent loop (`START → agent → tools → agent → … → END`) can execute multiple `call_model` invocations per user turn — once for each iteration around the tool loop. Each one receives the same system prompt and the same growing message window, with each completed tool call appended as a new `ToolMessage`.
+The agent loop (`START → agent → tools → agent → … → END`) can execute multiple `call_model` invocations per user turn - once for each iteration around the tool loop. Each one receives the same system prompt and the same growing message window, with each completed tool call appended as a new `ToolMessage`.
 
 ### Birdie's implementation
 
-#### Short-term memory — LangGraph's `SqliteSaver` checkpointer
+#### Short-term memory - LangGraph's `SqliteSaver` checkpointer
 
 Birdie delegates all message persistence to LangGraph's `SqliteSaver`. After every graph node, the checkpointer writes the updated `AgentState` to a per-user SQLite database:
 
@@ -572,12 +572,12 @@ Birdie delegates all message persistence to LangGraph's `SqliteSaver`. After eve
 ~/.birdie/sessions/<user_id>/checkpoints.db
 ```
 
-Each session is a LangGraph **thread**, identified by the session ID (`2026-04-29_1`). When a turn starts, the checkpointer loads the full prior history for that thread automatically — the application only passes the new `HumanMessage`. The graph receives a complete, accurately-typed message list without any application-level serialization or deserialization.
+Each session is a LangGraph **thread**, identified by the session ID (`2026-04-29_1`). When a turn starts, the checkpointer loads the full prior history for that thread automatically - the application only passes the new `HumanMessage`. The graph receives a complete, accurately-typed message list without any application-level serialization or deserialization.
 
 The context window trim happens inside `call_model`, not at the storage layer:
 
 ```python
-# graph.py — inside call_model()
+# graph.py - inside call_model()
 all_messages = list(state["messages"])          # full history from checkpointer
 context_msgs = all_messages[-MAX_CONTEXT_MESSAGES:]  # last 20 forwarded to LLM
 ```
@@ -586,7 +586,7 @@ The checkpointer retains unlimited history; the 20-message cap controls only wha
 
 **Checkpoint repair.** If the process dies after the LLM responds (its `AIMessage` is already written to the checkpoint) but before tool execution completes (no `ToolMessage` follows), the checkpoint is left in a state that providers reject as a protocol violation. On the next invocation, `_repair_dangling_tool_calls` detects orphaned tool calls within the context window, synthesises placeholder `ToolMessage`s, and returns them alongside the real response so the checkpoint heals permanently on write.
 
-#### Long-term memory — user-scoped `memory.json`
+#### Long-term memory - user-scoped `memory.json`
 
 Notes added via `/remember` are written to a JSON file alongside the session files:
 
@@ -606,10 +606,10 @@ This store is **user-scoped**, not session-scoped. A fact added during session `
 }
 ```
 
-At the start of each turn the CLI reads `memory.json` and forwards the contents as `long_term_memory` through `config["configurable"]`. The graph reads it from config — not from state — so LTM is never written into the checkpoint and never mixed with message history:
+At the start of each turn the CLI reads `memory.json` and forwards the contents as `long_term_memory` through `config["configurable"]`. The graph reads it from config - not from state - so LTM is never written into the checkpoint and never mixed with message history:
 
 ```python
-# graph.py — inside _build_system_prompt()
+# graph.py - inside _build_system_prompt()
 ltm = config.get("configurable", {}).get("long_term_memory") or []
 if ltm:
     system += "\n\n--- Long-term memory ---\n"
@@ -618,7 +618,7 @@ if ltm:
 
 Birdie uses **explicit-only** long-term memory: nothing is extracted or summarised from the conversation automatically. Only `/remember` writes to the store, so nothing is recorded without your knowledge.
 
-#### Session files — lightweight metadata
+#### Session files - lightweight metadata
 
 The session JSON files store only what neither the checkpointer nor the memory file can represent: skill grants and administrative metadata. They are small and fully human-readable:
 
@@ -634,7 +634,7 @@ The session JSON files store only what neither the checkpointer nor the memory f
 }
 ```
 
-There is no `messages` field — history lives in `checkpoints.db`. There is no `memory` field — facts live in `memory.json`. The session file is the glue that ties a human-readable ID to these two backing stores.
+There is no `messages` field - history lives in `checkpoints.db`. There is no `memory` field - facts live in `memory.json`. The session file is the glue that ties a human-readable ID to these two backing stores.
 
 #### File layout
 
@@ -661,7 +661,7 @@ The session ID (`2026-04-29_1`) plays three roles simultaneously:
 | Skill policy key | `UserSkillPolicy` | Determines which skills are active this turn |
 | Filename | `<session_id>.json` | Links to the metadata JSON on disk |
 
-Switching sessions changes all three at once — history, skill grants, and metadata — by changing one string.
+Switching sessions changes all three at once - history, skill grants, and metadata - by changing one string.
 
 ### Session ID format and lifecycle
 
@@ -704,9 +704,9 @@ in the system prompt, for the lifetime of the user (until explicitly removed fro
  anthropic · claude-sonnet-4-6   │   session: 2026-04-29_1   │   ctx: 1,234 tok   │   spent: ↑5,678  ↓1,234 tok
 ```
 
-- `session` — the active session ID
-- `ctx` — input tokens in the most recent API call
-- `↑` / `↓` — cumulative input / output tokens this process run
+- `session` - the active session ID
+- `ctx` - input tokens in the most recent API call
+- `↑` / `↓` - cumulative input / output tokens this process run
 
 ---
 

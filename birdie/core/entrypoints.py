@@ -7,13 +7,13 @@ a result that is sent back to the LLM as a ToolMessage.
 
 Supported schemes
 -----------------
-- ``bash:``       — shell command with ``{placeholder}`` substitution
-- ``http:get``    — HTTP GET; kwargs become query parameters
-- ``http:post``   — HTTP POST; kwargs become the JSON body
-- ``python:``     — import and call ``module.path.function(**kwargs)``
-- ``mcp:``        — stub; wire up a real MCP client
-- ``grpc:``       — stub; wire up a real gRPC channel
-- ``container:``  — stub; wire up Docker/Podman
+- ``bash:``       - shell command with ``{placeholder}`` substitution
+- ``http:get``    - HTTP GET; kwargs become query parameters
+- ``http:post``   - HTTP POST; kwargs become the JSON body
+- ``python:``     - import and call ``module.path.function(**kwargs)``
+- ``mcp:``        - stub; wire up a real MCP client
+- ``grpc:``       - stub; wire up a real gRPC channel
+- ``container:``  - stub; wire up Docker/Podman
 """
 
 import subprocess
@@ -101,7 +101,7 @@ def resolve_python(entrypoint: str, **kwargs: Any) -> Any:
 
 
 def resolve_mcp(entrypoint: str, **kwargs: Any) -> Any:
-    """Stub for ``mcp:`` entrypoints — wire up a real MCP client here.
+    """Stub for ``mcp:`` entrypoints - wire up a real MCP client here.
 
     Args:
         entrypoint: Full entrypoint string, e.g. ``mcp:tool_name``.
@@ -115,7 +115,7 @@ def resolve_mcp(entrypoint: str, **kwargs: Any) -> Any:
 
 
 def resolve_grpc(entrypoint: str, **kwargs: Any) -> Any:
-    """Stub for ``grpc:`` entrypoints — wire up a real gRPC channel here.
+    """Stub for ``grpc:`` entrypoints - wire up a real gRPC channel here.
 
     Args:
         entrypoint: Full entrypoint string, e.g. ``grpc:package.Service/Method``.
@@ -129,7 +129,7 @@ def resolve_grpc(entrypoint: str, **kwargs: Any) -> Any:
 
 
 def resolve_container(entrypoint: str, **kwargs: Any) -> Any:
-    """Stub for ``container:`` entrypoints — wire up Docker/Podman here.
+    """Stub for ``container:`` entrypoints - wire up Docker/Podman here.
 
     Args:
         entrypoint: Full entrypoint string, e.g. ``container:image_name``.

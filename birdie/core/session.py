@@ -69,7 +69,7 @@ class Session:
     """
     Lightweight session metadata.
 
-    Does **not** store conversation history — that is owned by LangGraph's
+    Does **not** store conversation history - that is owned by LangGraph's
     SqliteSaver checkpointer.  The session file stores only what LangGraph
     cannot represent: skill grants and housekeeping metadata.
     """

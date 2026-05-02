@@ -40,7 +40,7 @@ from .core.session import Session, SessionManager, UserMemory
 PROMPT_STYLE = Style.from_dict({"prompt": "ansicyan bold"})
 
 HELP_TEXT = """
-[bold cyan]Birdie CLI — available slash commands[/bold cyan]
+[bold cyan]Birdie CLI - available slash commands[/bold cyan]
 
   [yellow]/help[/yellow]                    Show this help
   [yellow]/quit[/yellow]  [yellow]/exit[/yellow]            Exit the session
@@ -128,7 +128,7 @@ class BirdieCLI:
         """Render the bottom status bar for prompt_toolkit."""
         vendor = self.agent.provider.vendor_name
         model  = self.agent.provider.model_name
-        ctx    = f"{self._last_context:,}" if self._last_context else "—"
+        ctx    = f"{self._last_context:,}" if self._last_context else "-"
         spent  = f"↑{self._total_in:,}  ↓{self._total_out:,}"
         return HTML(
             f" <b>{vendor}</b> · {model}"
@@ -167,7 +167,7 @@ class BirdieCLI:
         for skill in skills:
             status = "[green]enabled[/green]" if skill.name in allowed else "[red]disabled[/red]"
             self.console.print(
-                f"  [bold]{skill.name}[/bold] v{skill.version}  {status}  — {skill.description}"
+                f"  [bold]{skill.name}[/bold] v{skill.version}  {status}  - {skill.description}"
             )
 
     def _show_tools(self) -> None:
@@ -181,7 +181,7 @@ class BirdieCLI:
             self.console.print("[dim]No tools available.[/dim]")
             return
         for tool in tools:
-            self.console.print(f"  [bold cyan]{tool.name}[/bold cyan]  — {tool.description}")
+            self.console.print(f"  [bold cyan]{tool.name}[/bold cyan]  - {tool.description}")
 
     def _show_info(self) -> None:
         """Print current user, session, and provider info."""
@@ -339,7 +339,7 @@ class BirdieCLI:
 
         History is managed by LangGraph's checkpointer (keyed by session ID as
         thread_id).  Long-term memory is read from the user-scoped memory store
-        and injected per-turn via config — it is not stored in the checkpoint.
+        and injected per-turn via config - it is not stored in the checkpoint.
 
         Args:
             message: The user's input text for this turn.
@@ -454,7 +454,7 @@ def main() -> None:
         "--user",
         metavar="USER_ID",
         default=None,
-        help="User identity — organises sessions under ~/.birdie/sessions/<user>/ "
+        help="User identity - organises sessions under ~/.birdie/sessions/<user>/ "
              "(default: system username)",
     )
     parser.add_argument(

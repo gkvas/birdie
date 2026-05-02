@@ -1,8 +1,8 @@
 """
 LangGraph state machine for the Birdie agent.
 
-The graph has two nodes — ``agent`` (calls the LLM) and ``tools`` (executes
-tool calls) — connected by a conditional edge that loops until the model
+The graph has two nodes - ``agent`` (calls the LLM) and ``tools`` (executes
+tool calls) - connected by a conditional edge that loops until the model
 produces a message with no tool calls.
 
 Node functions are closures over the shared ``provider``, ``registry``, and
@@ -11,13 +11,15 @@ Node functions are closures over the shared ``provider``, ``registry``, and
 Per-invocation context (session identity, long-term memory) is passed via
 ``config["configurable"]`` rather than stored in AgentState:
 
-* ``config["configurable"]["thread_id"]``  — session ID, used as policy key
-* ``config["configurable"]["long_term_memory"]``  — list of LTM strings
+* ``config["configurable"]["thread_id"]``  - session ID, used as policy key
+* ``config["configurable"]["long_term_memory"]``  - list of LTM strings
 
 This keeps AgentState minimal (just ``messages``) so LangGraph's checkpointer
 owns and reconstructs it without any application-level serialization.
 """
 
+import asyncio
+import logging
 from typing import TypedDict, List, Annotated, Sequence, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -31,9 +33,14 @@ from ..core.adapter import skilltool_to_langchain_tool
 from ..core.policy import UserSkillPolicy
 from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def
 
+log = logging.getLogger(__name__)
+
 # Maximum number of messages forwarded to the LLM per turn.
 # The full history is stored by the checkpointer; this window controls cost.
 MAX_CONTEXT_MESSAGES = 20
+
+# Delays (seconds) between successive retries when the provider returns 429.
+_RATE_LIMIT_RETRY_DELAYS = (5, 15, 45)
 
 
 class AgentState(TypedDict):
@@ -87,10 +94,10 @@ def create_agent_graph(
 
         Three tiers:
 
-        - **Tier 1** — compact bullet list of all allowed skills (always sent).
-        - **Tier 2a** — full prose body for ``always_inject`` skills (always sent).
-        - **Tier 2b** — full prose body for freetext skills whose triggers fired.
-        - **Tier 3** — long-term memory strings from the user's memory store.
+        - **Tier 1** - compact bullet list of all allowed skills (always sent).
+        - **Tier 2a** - full prose body for ``always_inject`` skills (always sent).
+        - **Tier 2b** - full prose body for freetext skills whose triggers fired.
+        - **Tier 3** - long-term memory strings from the user's memory store.
 
         Returns ``None`` when no skills are allowed for the session.
         """
@@ -99,7 +106,7 @@ def create_agent_graph(
         if not all_skills:
             return None
 
-        # Tier 1 — compact skill catalog (always included)
+        # Tier 1 - compact skill catalog (always included)
         lines = ["You have access to the following skills:\n"]
         for skill in all_skills:
             trigger_hint = (
@@ -108,17 +115,17 @@ def create_agent_graph(
             lines.append(f"- **{skill.name}**: {skill.description}{trigger_hint}")
         system = "\n".join(lines)
 
-        # Tier 2a — always-inject skill bodies (e.g. planning/meta skills)
+        # Tier 2a - always-inject skill bodies (e.g. planning/meta skills)
         for skill in all_skills:
             if skill.always_inject and skill.body:
                 system += f"\n\n--- {skill.name} instructions ---\n{skill.body}"
 
-        # Tier 2b — full body for triggered freetext skills
+        # Tier 2b - full body for triggered freetext skills
         for skill in _triggered_freetext(state, allowed):
             if skill.body:
                 system += f"\n\n--- {skill.name} skill context ---\n{skill.body}"
 
-        # Tier 3 — user long-term memory injected via config
+        # Tier 3 - user long-term memory injected via config
         ltm = config.get("configurable", {}).get("long_term_memory") or []
         if ltm:
             system += "\n\n--- Long-term memory ---\n"
@@ -184,6 +191,25 @@ def create_agent_graph(
             else all_messages
         )
 
+        # Ensure the context starts at a HumanMessage (Mistral rejects "tool" or
+        # "assistant" as the first role after "system").  The window boundary can
+        # fall inside a tool-call chain, leaving ToolMessages at the head.
+        # If the window has no HumanMessage at all (e.g. 10+ tool calls in one
+        # turn exceed MAX_CONTEXT_MESSAGES), fall back to the last HumanMessage
+        # in the full history so the current turn is always included.
+        for i, msg in enumerate(context_msgs):
+            if isinstance(msg, HumanMessage):
+                context_msgs = context_msgs[i:]
+                break
+        else:
+            # No HumanMessage in the trimmed window - walk back through all messages.
+            for i in range(len(all_messages) - 1, -1, -1):
+                if isinstance(all_messages[i], HumanMessage):
+                    context_msgs = all_messages[i:]
+                    break
+            else:
+                context_msgs = []
+
         # Repair any dangling tool calls within the context window.
         # Repairs are returned to state so the checkpoint heals permanently.
         repair_msgs, clean_messages = _repair_dangling_tool_calls(context_msgs)
@@ -198,11 +224,28 @@ def create_agent_graph(
 
         system_prompt = _build_system_prompt(state, config)
 
-        response = await provider.achat(
-            messages=clean_messages,
-            tools=normalized_tools,
-            system_prompt=system_prompt,
-        )
+        # Retry on HTTP 429 (rate limit) with exponential back-off.
+        response: BaseMessage | None = None
+        for attempt in range(len(_RATE_LIMIT_RETRY_DELAYS) + 1):
+            if attempt > 0:
+                delay = _RATE_LIMIT_RETRY_DELAYS[attempt - 1]
+                log.warning(
+                    "Provider rate-limited (429); retrying in %ds (attempt %d/%d)",
+                    delay, attempt + 1, len(_RATE_LIMIT_RETRY_DELAYS) + 1,
+                )
+                await asyncio.sleep(delay)
+            try:
+                response = await provider.achat(
+                    messages=clean_messages,
+                    tools=normalized_tools,
+                    system_prompt=system_prompt,
+                )
+                break
+            except Exception as exc:
+                if "429" in str(exc) and attempt < len(_RATE_LIMIT_RETRY_DELAYS):
+                    continue
+                raise
+
         return {"messages": repair_msgs + [response]}
 
     async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:

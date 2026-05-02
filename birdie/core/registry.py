@@ -186,7 +186,7 @@ class SkillRegistry:
     ) -> List[Skill]:
         """Return freetext skills whose trigger keywords appear in *text*.
 
-        Only skills without tools (freetext skills) participate — structured
+        Only skills without tools (freetext skills) participate - structured
         skills are never matched here.  Matching is case-insensitive substring.
 
         Args:

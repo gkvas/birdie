@@ -15,9 +15,9 @@ class UserSkillPolicy:
 
     Resolution order (highest priority first):
 
-    1. Per-user explicit disable — always blocks the skill.
-    2. Per-user explicit enable ∪ session enable — union of both sets.
-    3. Global defaults — skills whose ``enabled_by_default`` flag is ``True``.
+    1. Per-user explicit disable - always blocks the skill.
+    2. Per-user explicit enable ∪ session enable - union of both sets.
+    3. Global defaults - skills whose ``enabled_by_default`` flag is ``True``.
     """
 
     def __init__(self) -> None:
@@ -107,7 +107,7 @@ class UserSkillPolicy:
         priority rules described in the class docstring.
 
         Args:
-            user_id: Optional user identifier.  ``None`` means anonymous — only
+            user_id: Optional user identifier.  ``None`` means anonymous - only
                 global defaults apply.
             session_id: Optional session identifier.  Session grants are unioned
                 with user grants when both are provided.
