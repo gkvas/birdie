@@ -6,5 +6,5 @@ enabled_by_default: false
 mcp_server:
   transport: stdio
   command: python
-  args: ["birdie/skills/mcp_demo/server.py"]
+  args: ["server.py"]
 ---
