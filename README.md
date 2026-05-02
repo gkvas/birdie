@@ -18,6 +18,8 @@ A LangGraph-based agent that discovers capabilities at runtime from **SKILL.MD**
 
 ---
 
+<img src="doc/assets/demo.gif" alt="Birdie CLI demo" width="800">
+
 ## Quick start
 
 ```bash

@@ -51,7 +51,7 @@ HELP_TEXT = """
   [bold]Tool commands[/bold]
   [yellow]/tool list[/yellow]                    List all available tools
   [yellow]/tool output full[/yellow]             Show complete tool output
-  [yellow]/tool output short[/yellow]            Show first 10 lines + remaining count (default)
+  [yellow]/tool output short[/yellow]            Show first 1000 characters + remaining count (default)
   [yellow]/tool output off[/yellow]              Show only line count, no content
 
   [bold]Skill commands[/bold]
@@ -217,12 +217,11 @@ class BirdieCLI:
             )
 
         elif self._tool_output_mode == "short":
-            limit = 10
-            visible = lines[:limit]
-            body = "\n".join(visible)
-            remaining = n - limit
+            limit = 1000
+            body = content[:limit]
+            remaining = len(content) - limit
             if remaining > 0:
-                body += f"\n[dim]... {remaining} more line{'s' if remaining != 1 else ''}[/dim]"
+                body += f"\n[dim]... {remaining} more character{'s' if remaining != 1 else ''}[/dim]"
             self.console.print(Panel(
                 body,
                 title=f"[yellow]tool: {name}[/yellow]",
