@@ -1148,9 +1148,12 @@ birdie
 | Command | Description |
 |---|---|
 | `/help` | Show available commands |
-| `/tools` | List callable tools for the current session |
 | `/remember <text>` | Save a note to long-term memory |
 | `/info` | Show user, session ID, turn count, and provider |
+| `/tool list` | List callable tools for the current session |
+| `/tool output full` | Show complete tool output (default) |
+| `/tool output short` | Show first 10 lines and remaining line count |
+| `/tool output off` | Show only tool name and line count, no content |
 | `/skill list` | List all loaded skills with enabled/disabled status |
 | `/skill enable <name>` | Enable a skill (persisted to session) |
 | `/skill disable <name>` | Disable a skill (persisted to session) |

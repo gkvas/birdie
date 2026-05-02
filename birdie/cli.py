@@ -42,25 +42,32 @@ PROMPT_STYLE = Style.from_dict({"prompt": "ansicyan bold"})
 HELP_TEXT = """
 [bold cyan]Birdie CLI - available slash commands[/bold cyan]
 
-  [yellow]/help[/yellow]                    Show this help
-  [yellow]/quit[/yellow]  [yellow]/exit[/yellow]            Exit the session
-  [yellow]/new[/yellow]                     Start a fresh conversation (new thread)
-  [yellow]/tools[/yellow]                   List all available tools
-  [yellow]/remember <text>[/yellow]         Save a note to long-term memory
-  [yellow]/info[/yellow]                    Show session info (user, session, provider)
+  [yellow]/help[/yellow]                         Show this help
+  [yellow]/quit[/yellow]  [yellow]/exit[/yellow]                 Exit the session
+  [yellow]/new[/yellow]                          Start a fresh conversation (new thread)
+  [yellow]/remember <text>[/yellow]              Save a note to long-term memory
+  [yellow]/info[/yellow]                         Show session info (user, session, provider)
+
+  [bold]Tool commands[/bold]
+  [yellow]/tool list[/yellow]                    List all available tools
+  [yellow]/tool output full[/yellow]             Show complete tool output
+  [yellow]/tool output short[/yellow]            Show first 10 lines + remaining count (default)
+  [yellow]/tool output off[/yellow]              Show only line count, no content
 
   [bold]Skill commands[/bold]
-  [yellow]/skill list[/yellow]              List all loaded skills with status
-  [yellow]/skill enable <name>[/yellow]     Enable a skill (persists to session)
-  [yellow]/skill disable <name>[/yellow]    Disable a skill (persists to session)
+  [yellow]/skill list[/yellow]                   List all loaded skills with status
+  [yellow]/skill enable <name>[/yellow]          Enable a skill (persists to session)
+  [yellow]/skill disable <name>[/yellow]         Disable a skill (persists to session)
 
   [bold]Session commands[/bold]
-  [yellow]/session new[/yellow]             Create a new session and switch to it
-  [yellow]/session switch <id>[/yellow]     Switch to an existing session
-  [yellow]/session delete <id>[/yellow]     Delete a session (creates new if current)
-  [yellow]/session list[/yellow]            List all sessions for this user
-  [yellow]/session info[/yellow]            Show detailed session metadata
+  [yellow]/session new[/yellow]                  Create a new session and switch to it
+  [yellow]/session switch <id>[/yellow]          Switch to an existing session
+  [yellow]/session delete <id>[/yellow]          Delete a session (creates new if current)
+  [yellow]/session list[/yellow]                 List all sessions for this user
+  [yellow]/session info[/yellow]                 Show detailed session metadata
 """
+
+_TOOL_OUTPUT_MODES = ("full", "short", "off")
 
 
 class BirdieCLI:
@@ -82,6 +89,7 @@ class BirdieCLI:
         self._total_in: int = 0
         self._total_out: int = 0
         self._last_context: int = 0
+        self._tool_output_mode: str = "short"
 
         # Apply stored skill grants for the initial session
         self._apply_session_policy(session)
@@ -198,7 +206,62 @@ class BirdieCLI:
             f"  [dim]provider:[/dim] {vendor}"
         )
 
+    def _render_tool_output(self, name: str, content: str) -> None:
+        """Render tool output according to the current _tool_output_mode."""
+        lines = content.splitlines()
+        n = len(lines)
+
+        if self._tool_output_mode == "off":
+            self.console.print(
+                f"[dim yellow]tool: [bold]{name}[/bold] - {n} line{'s' if n != 1 else ''}[/dim yellow]"
+            )
+
+        elif self._tool_output_mode == "short":
+            limit = 10
+            visible = lines[:limit]
+            body = "\n".join(visible)
+            remaining = n - limit
+            if remaining > 0:
+                body += f"\n[dim]... {remaining} more line{'s' if remaining != 1 else ''}[/dim]"
+            self.console.print(Panel(
+                body,
+                title=f"[yellow]tool: {name}[/yellow]",
+                border_style="yellow",
+                expand=False,
+            ))
+
+        else:  # "full"
+            self.console.print(Panel(
+                Text(content, style="white"),
+                title=f"[yellow]tool: {name}[/yellow]",
+                border_style="yellow",
+                expand=False,
+            ))
+
     # -- slash command handler ------------------------------------------------
+
+    def _handle_tool(self, arg: str) -> None:
+        """Handle /tool sub-commands."""
+        parts = arg.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        subarg = parts[1].lower() if len(parts) > 1 else ""
+
+        if subcmd == "list":
+            self._show_tools()
+
+        elif subcmd == "output":
+            if subarg not in _TOOL_OUTPUT_MODES:
+                self.console.print(
+                    f"[red]Usage: /tool output full|short|off[/red]"
+                )
+            else:
+                self._tool_output_mode = subarg
+                self.console.print(f"[dim]Tool output mode: [bold]{subarg}[/bold][/dim]")
+
+        else:
+            self.console.print(
+                "[red]Usage: /tool list | output full|short|off[/red]"
+            )
 
     def _handle_skill(self, arg: str) -> None:
         """Handle /skill sub-commands."""
@@ -320,11 +383,11 @@ class BirdieCLI:
             new_session = self.session_manager.create(self.user_id)
             self._switch_session(new_session)
 
+        elif cmd == "/tool":
+            self._handle_tool(arg)
+
         elif cmd == "/skill":
             self._handle_skill(arg)
-
-        elif cmd == "/tools":
-            self._show_tools()
 
         elif cmd == "/remember":
             if not arg:
@@ -380,12 +443,7 @@ class BirdieCLI:
                     if node_name == "tools":
                         for msg in msgs:
                             if isinstance(msg, ToolMessage):
-                                self.console.print(Panel(
-                                    Text(str(msg.content), style="white"),
-                                    title=f"[yellow]tool: {msg.name}[/yellow]",
-                                    border_style="yellow",
-                                    expand=False,
-                                ))
+                                self._render_tool_output(msg.name or "", str(msg.content))
                         status.update("[dim]thinking…[/dim]")
 
                     elif node_name == "agent":
