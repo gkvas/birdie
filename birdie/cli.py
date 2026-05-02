@@ -151,14 +151,13 @@ class BirdieCLI:
 
     def _print_welcome(self) -> None:
         """Print the startup banner with loaded skills and provider info."""
-        skills = self.agent.registry.list_skills()
-        skill_names = ", ".join(s.name for s in skills) if skills else "none"
+        skill_count = len(self.agent.registry.list_skills())
         vendor = type(self.agent.provider).__name__.replace("Provider", "").lower()
         self.console.print(Panel(
             f"[bold green]Birdie[/bold green]  |  vendor: [cyan]{vendor}[/cyan]"
             f"  |  user: [cyan]{self.user_id}[/cyan]"
             f"  |  session: [cyan]{self.session.id}[/cyan]"
-            f"  |  skills: [yellow]{skill_names}[/yellow]\n"
+            f"  |  skills found: [yellow]{skill_count}[/yellow]\n"
             "Type [bold]/help[/bold] for commands, [bold]/quit[/bold] to exit.",
             border_style="green",
         ))

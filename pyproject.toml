@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "birdie-agent"
-version = "0.1.3"
+version = "0.1.4"
 description = "Dynamic skill-based LangGraph agent"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -49,6 +49,9 @@ birdie = "birdie.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["birdie*"]
+
+[tool.setuptools.package-data]
+"birdie" = ["skills/*/SKILL.MD", "skills/mcp_demo/server.py"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
