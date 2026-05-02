@@ -45,12 +45,14 @@ HELP_TEXT = """
   [yellow]/help[/yellow]                    Show this help
   [yellow]/quit[/yellow]  [yellow]/exit[/yellow]            Exit the session
   [yellow]/new[/yellow]                     Start a fresh conversation (new thread)
-  [yellow]/skills[/yellow]                  List all loaded skills
   [yellow]/tools[/yellow]                   List all available tools
-  [yellow]/enable <skill>[/yellow]          Enable a skill (persists to session)
-  [yellow]/disable <skill>[/yellow]         Disable a skill (persists to session)
   [yellow]/remember <text>[/yellow]         Save a note to long-term memory
   [yellow]/info[/yellow]                    Show session info (user, session, provider)
+
+  [bold]Skill commands[/bold]
+  [yellow]/skill list[/yellow]              List all loaded skills with status
+  [yellow]/skill enable <name>[/yellow]     Enable a skill (persists to session)
+  [yellow]/skill disable <name>[/yellow]    Disable a skill (persists to session)
 
   [bold]Session commands[/bold]
   [yellow]/session new[/yellow]             Create a new session and switch to it
@@ -198,6 +200,46 @@ class BirdieCLI:
 
     # -- slash command handler ------------------------------------------------
 
+    def _handle_skill(self, arg: str) -> None:
+        """Handle /skill sub-commands."""
+        parts = arg.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        subarg = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "list":
+            self._show_skills()
+
+        elif subcmd == "enable":
+            if not subarg:
+                self.console.print("[red]Usage: /skill enable <SkillName>[/red]")
+            else:
+                self.agent.enable_skill_for_user(self.session.id, subarg)
+                if subarg not in self.session.enabled_skills:
+                    self.session.enabled_skills.append(subarg)
+                self.session.disabled_skills = [
+                    s for s in self.session.disabled_skills if s != subarg
+                ]
+                self.session_manager.save(self.session)
+                self.console.print(f"[green]Enabled[/green] {subarg}")
+
+        elif subcmd == "disable":
+            if not subarg:
+                self.console.print("[red]Usage: /skill disable <SkillName>[/red]")
+            else:
+                self.agent.disable_skill_for_user(self.session.id, subarg)
+                if subarg not in self.session.disabled_skills:
+                    self.session.disabled_skills.append(subarg)
+                self.session.enabled_skills = [
+                    s for s in self.session.enabled_skills if s != subarg
+                ]
+                self.session_manager.save(self.session)
+                self.console.print(f"[red]Disabled[/red] {subarg}")
+
+        else:
+            self.console.print(
+                "[red]Usage: /skill list | enable <name> | disable <name>[/red]"
+            )
+
     def _handle_session(self, arg: str) -> None:
         """Handle /session sub-commands."""
         parts = arg.strip().split(maxsplit=1)
@@ -278,37 +320,11 @@ class BirdieCLI:
             new_session = self.session_manager.create(self.user_id)
             self._switch_session(new_session)
 
-        elif cmd == "/skills":
-            self._show_skills()
+        elif cmd == "/skill":
+            self._handle_skill(arg)
 
         elif cmd == "/tools":
             self._show_tools()
-
-        elif cmd == "/enable":
-            if not arg:
-                self.console.print("[red]Usage: /enable <SkillName>[/red]")
-            else:
-                self.agent.enable_skill_for_user(self.session.id, arg)
-                if arg not in self.session.enabled_skills:
-                    self.session.enabled_skills.append(arg)
-                self.session.disabled_skills = [
-                    s for s in self.session.disabled_skills if s != arg
-                ]
-                self.session_manager.save(self.session)
-                self.console.print(f"[green]Enabled[/green] {arg}")
-
-        elif cmd == "/disable":
-            if not arg:
-                self.console.print("[red]Usage: /disable <SkillName>[/red]")
-            else:
-                self.agent.disable_skill_for_user(self.session.id, arg)
-                if arg not in self.session.disabled_skills:
-                    self.session.disabled_skills.append(arg)
-                self.session.enabled_skills = [
-                    s for s in self.session.enabled_skills if s != arg
-                ]
-                self.session_manager.save(self.session)
-                self.console.print(f"[red]Disabled[/red] {arg}")
 
         elif cmd == "/remember":
             if not arg:

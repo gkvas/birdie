@@ -365,7 +365,7 @@ per turn (inside LangGraph call_model and execute_tools nodes)
 
 **Why fresh StructuredTool wrappers each turn**
 
-A `StructuredTool` is a LangChain object that bundles a callable, a name, a description, and a Pydantic schema. It could in principle be created once at startup and reused. The reason it is not: the set of tools passed to `ToolNode` must exactly reflect the skills enabled for the current session at the current turn. If a user runs `/disable Shell` mid-session, the next turn's `ToolNode` must not include `run_bash`. Building the list fresh from the policy on every turn is the simplest way to guarantee this without any invalidation logic.
+A `StructuredTool` is a LangChain object that bundles a callable, a name, a description, and a Pydantic schema. It could in principle be created once at startup and reused. The reason it is not: the set of tools passed to `ToolNode` must exactly reflect the skills enabled for the current session at the current turn. If a user runs `/skill disable Shell` mid-session, the next turn's `ToolNode` must not include `run_bash`. Building the list fresh from the policy on every turn is the simplest way to guarantee this without any invalidation logic.
 
 ### LangChain API: StructuredTool and Pydantic schema generation
 
@@ -762,7 +762,7 @@ mcp_server:
 To try it, enable the skill for your session and call one of the tools:
 
 ```
-you> /enable mcp_demo
+you> /skill enable mcp_demo
 you> reverse "hello world"
 ```
 
@@ -916,7 +916,7 @@ The provider layer converts this LangChain message list into the wire format exp
 2. **Explicit enable** - grants the skill for that key
 3. **Global defaults** - skills with `enabled_by_default: true`
 
-In the CLI, the **session ID** is used as the policy key (not the filesystem `--user` value). This means each session has fully independent skill grants: `/enable` and `/disable` affect only the current session and are persisted to the session JSON, so they are restored on resume.
+In the CLI, the **session ID** is used as the policy key (not the filesystem `--user` value). This means each session has fully independent skill grants: `/skill enable` and `/skill disable` affect only the current session and are persisted to the session JSON, so they are restored on resume.
 
 ```python
 # CLI uses session.id as the key
@@ -1148,12 +1148,12 @@ birdie
 | Command | Description |
 |---|---|
 | `/help` | Show available commands |
-| `/skills` | List loaded skills with enable/disable status |
 | `/tools` | List callable tools for the current session |
-| `/enable <Skill>` | Enable a skill (persisted to session) |
-| `/disable <Skill>` | Disable a skill (persisted to session) |
 | `/remember <text>` | Save a note to long-term memory |
 | `/info` | Show user, session ID, turn count, and provider |
+| `/skill list` | List all loaded skills with enabled/disabled status |
+| `/skill enable <name>` | Enable a skill (persisted to session) |
+| `/skill disable <name>` | Disable a skill (persisted to session) |
 | `/session new` | Create a new session and switch to it |
 | `/session switch <id>` | Resume an existing session |
 | `/session delete <id>` | Delete a session (creates a new one if current) |
