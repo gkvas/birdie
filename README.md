@@ -229,11 +229,88 @@ per turn (inside LangGraph nodes)
   └─ ToolNode([fresh StructuredTool, ...])      ← wires entrypoint resolvers
 ```
 
+### LangChain API: StructuredTool and Pydantic schema generation
+
+LangChain's `StructuredTool` is the bridge between a declarative `SkillTool` (a name, description, and JSON Schema) and something a `ToolNode` can actually execute. The conversion happens in `core/adapter.py`:
+
+```python
+from langchain_core.tools import StructuredTool
+
+tool = StructuredTool.from_function(
+    func=_wrapped,            # the callable that runs the entrypoint
+    name=skill_tool.name,
+    description=skill_tool.description,
+    args_schema=create_args_schema(skill_tool.schema),  # Pydantic model
+)
+```
+
+`StructuredTool.from_function` is the standard factory for tools whose arguments need schema validation. The three things it needs are:
+
+- **`func`** - the Python callable to invoke when the tool is called. Birdie wraps the entrypoint resolver here.
+- **`description`** - shown to the LLM as the tool's purpose. The LLM uses this to decide when to call the tool.
+- **`args_schema`** - a Pydantic `BaseModel` subclass. LangChain uses this to validate incoming arguments and to generate the JSON Schema it sends to the LLM as the function signature.
+
+The `args_schema` Pydantic class is built dynamically from the JSON Schema in the SKILL.MD using Pydantic's `create_model`:
+
+```python
+from pydantic import BaseModel, create_model
+
+# schema = {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+
+fields = {}
+for field_name, field_schema in schema["properties"].items():
+    python_type = _TYPE_MAP.get(field_schema.get("type", ""), Any)
+    if field_name in schema.get("required", []):
+        fields[field_name] = (python_type, ...)      # required: Ellipsis as default
+    else:
+        fields[field_name] = (Optional[python_type], None)  # optional: None default
+
+DynamicModel = create_model("ToolArgs", **fields)
+```
+
+`create_model` is Pydantic's factory for building model classes at runtime without writing class definitions. The resulting class behaves exactly like a hand-written `BaseModel` - LangChain can call `.model_json_schema()` on it and validate tool call arguments against it before execution.
+
 ---
 
 ## Agent loop
 
 The agent is a LangGraph `StateGraph` with two nodes and a conditional edge.
+
+### LangGraph API: building the graph
+
+The entire agent loop is defined using LangGraph's `StateGraph` builder. The full definition lives in `agent/graph.py` and `agent/run.py`:
+
+```python
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
+
+# 1. Declare the graph with its state type
+workflow = StateGraph(AgentState)
+
+# 2. Register node functions (sync or async callables)
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", execute_tools)
+
+# 3. Wire the edges
+workflow.add_edge(START, "agent")           # always start at "agent"
+workflow.add_conditional_edges(             # after "agent", decide what's next
+    "agent",
+    should_continue,                        # routing function
+    {"tools": "tools", END: END},           # return value -> destination map
+)
+workflow.add_edge("tools", "agent")         # after tools, always go back to "agent"
+
+# 4. Compile into a runnable with optional persistence
+app = workflow.compile(checkpointer=checkpointer)
+```
+
+Key concepts:
+
+- **`StateGraph(AgentState)`** - the state type is declared once at construction. Every node receives the full current state and returns a dict of updates (not the full state). LangGraph merges the updates using the field reducers.
+- **`add_node(name, func)`** - registers a function as a graph node. The function signature must be `(state, config) -> dict` (or the async equivalent). LangGraph calls it with the current state and run config automatically.
+- **`add_conditional_edges(source, router, map)`** - after `source` runs, LangGraph calls `router(state)` and uses the return value as a key into `map` to determine the next node. Returning `END` from the router (or mapping a value to `END`) terminates the graph.
+- **`add_edge(a, b)`** - unconditional transition: after `a` always go to `b`.
+- **`compile(checkpointer=...)`** - produces a `CompiledGraph` (also a `Runnable`) that can be invoked via `.ainvoke()`, `.astream()`, etc. The checkpointer is wired in here; LangGraph calls it automatically before and after each node.
 
 ```
 START
@@ -280,18 +357,79 @@ START
 
 The loop continues until the model returns a message with no `tool_calls`. There is no hard cap on iterations - it is the model's decision to stop.
 
-### State
+### State and the add_messages reducer
 
 `AgentState` is a LangGraph `TypedDict`:
 
 ```python
+from typing import Annotated, Sequence, TypedDict
+from langchain_core.messages import BaseMessage
+from langgraph.graph.message import add_messages
+
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 ```
 
-`messages` uses the `add_messages` reducer, which appends new messages and deduplicates by message ID. The state is intentionally minimal: the session ID, long-term memory, and policy key all flow through `config["configurable"]` rather than being stored in the graph state.
+The `Annotated[..., add_messages]` syntax is LangGraph's **reducer** pattern. When a node returns `{"messages": [new_msg]}`, LangGraph does not replace the `messages` list - it calls `add_messages(current, [new_msg])` to merge the update. `add_messages` appends new messages and deduplicates by message ID, which means re-delivering the same message (e.g. after a retry) does not create duplicates.
 
-History persistence is handled by LangGraph's `SqliteSaver` checkpointer keyed on `config["configurable"]["thread_id"]` (the session ID). When a turn starts, the checkpointer loads the full prior history automatically - the application only passes the new `HumanMessage`. After each node, the checkpointer writes the delta back to disk.
+Without a reducer, every node would have to return the complete messages list. With it, each node only returns the delta - new messages to append - and LangGraph handles the merge.
+
+The state is intentionally minimal: only `messages`. The session ID, long-term memory, and policy key all flow through `config["configurable"]` rather than being stored in state, because they are per-invocation context, not persistent conversation data.
+
+### LangGraph API: RunnableConfig and per-turn context
+
+Every node function receives a second argument, `config: RunnableConfig`, alongside state:
+
+```python
+from langchain_core.runnables import RunnableConfig
+
+async def call_model(state: AgentState, config: RunnableConfig) -> dict:
+    thread_id = config.get("configurable", {}).get("thread_id", "")
+    ltm       = config.get("configurable", {}).get("long_term_memory") or []
+```
+
+`RunnableConfig` is LangChain's standard carrier for execution-time metadata. The `"configurable"` key is the designated slot for application-defined values that need to flow into graph nodes without being stored in state. LangGraph propagates the same config dict to every node in the graph for a given invocation.
+
+The caller sets these values when invoking the graph:
+
+```python
+run_config = {"configurable": {
+    "thread_id": "2026-04-29_1",          # identifies the session / checkpoint
+    "long_term_memory": ["user fact 1"],  # injected into system prompt, not stored
+}}
+await app.ainvoke(initial_state, run_config)
+```
+
+`thread_id` in `config["configurable"]` is the LangGraph convention for identifying which checkpoint to load and save. Every checkpointer implementation reads this key automatically - the application does not need to pass it separately to the checkpointer.
+
+History persistence is handled by LangGraph's checkpointer keyed on `config["configurable"]["thread_id"]` (the session ID). When a turn starts, the checkpointer loads the full prior history automatically - the application only passes the new `HumanMessage`. After each node, the checkpointer writes the delta back to disk.
+
+### LangGraph API: ToolNode
+
+`ToolNode` is a prebuilt LangGraph node that handles tool execution. Rather than writing the dispatch loop manually, the graph hands a list of LangChain tools to `ToolNode` and delegates the entire execution step to it:
+
+```python
+from langgraph.prebuilt import ToolNode
+
+async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:
+    langchain_tools = (
+        [skilltool_to_langchain_tool(t) for t in skill_tools] + mcp_tools
+    )
+    tool_node = ToolNode(langchain_tools)
+    return await tool_node.ainvoke(state)
+```
+
+What `ToolNode` does internally:
+
+1. Reads `state["messages"][-1]` and extracts its `tool_calls` list (each entry has `id`, `name`, and `args`).
+2. Looks up each tool call by `name` in the provided tools list.
+3. Calls the matched tools (in parallel when multiple tool calls exist in a single `AIMessage`).
+4. Wraps each result in a `ToolMessage` with `tool_call_id` matching the original `tool_calls` entry.
+5. Returns `{"messages": [ToolMessage, ...]}` - the delta that LangGraph appends to state via the `add_messages` reducer.
+
+The `tool_call_id` pairing is how the LLM knows which result belongs to which call. Providers like Mistral and Anthropic validate that every `tool_calls` entry in an `AIMessage` has exactly one matching `ToolMessage` before they accept the message history - this is why the checkpoint repair step is necessary.
+
+A fresh `ToolNode` is created on every invocation of `execute_tools` rather than once at startup. This is deliberate: the set of allowed tools can change between turns as the user enables or disables skills, so the tool list must be resolved at call time.
 
 ### Checkpoint repair
 
@@ -309,7 +447,50 @@ This is useful for showcasing how agents can consume external capability provide
 
 Birdie integrates MCP through [`langchain-mcp-adapters`](https://github.com/langchain-ai/langchain-mcp-adapters), which converts MCP tool definitions into native LangChain `BaseTool` objects. These are merged with the skill tools before each LLM call and each ToolNode invocation, so the model sees them alongside any `bash:` or `python:` tools without any special handling.
 
-### How it works
+### LangChain API: MultiServerMCPClient
+
+MCP integration uses `langchain-mcp-adapters`, a first-party LangChain library that converts MCP tool definitions into native LangChain `BaseTool` objects. The central class is `MultiServerMCPClient`:
+
+```python
+from langchain_mcp_adapters.client import MultiServerMCPClient
+
+client = MultiServerMCPClient({
+    "mcp_demo": {
+        "transport": "stdio",
+        "command": "python",
+        "args": ["birdie/skills/mcp_demo/server.py"],
+    }
+})
+
+# Connects to each server, calls tools/list, returns List[BaseTool]
+tools: list[BaseTool] = await client.get_tools()
+```
+
+Each call to `get_tools()` opens a fresh session to each server, fetches the tool list, and closes the session. The `BaseTool` objects it returns are fully callable - invoking them opens another fresh session, sends a `tools/call` request, and returns the result. There are no persistent connections to manage.
+
+Because `BaseTool` is the same interface used by `StructuredTool` (and everything else in LangChain's tool ecosystem), the MCP tools slot directly into `ToolNode` alongside the skill tools:
+
+```python
+langchain_tools = (
+    [skilltool_to_langchain_tool(t) for t in skill_tools]  # StructuredTool
+    + mcp_tools                                             # BaseTool from MCP
+)
+tool_node = ToolNode(langchain_tools)  # ToolNode doesn't care which type
+```
+
+For the LLM's tool schema (sent in the API request), Birdie converts `BaseTool` objects to `NormalizedToolDef` dicts using `lc_tool_to_normalized_def`, which reads `tool.args_schema`. MCP tools expose `args_schema` as a plain JSON Schema dict (not a Pydantic class), so the conversion handles both cases:
+
+```python
+def lc_tool_to_normalized_def(tool: BaseTool) -> NormalizedToolDef:
+    args_schema = tool.args_schema
+    if isinstance(args_schema, dict):
+        schema = dict(args_schema)          # MCP: already a JSON Schema dict
+    else:
+        schema = args_schema.model_json_schema()  # StructuredTool: Pydantic model
+    return {"name": tool.name, "description": tool.description, "parameters": schema}
+```
+
+### How it works end to end
 
 ```
 Startup
@@ -526,6 +707,45 @@ Notes stored via `/remember` are injected as a third tier at the end of the syst
 
 These are stored in the user-scoped `memory.json` and survive both restarts and session switches. They are always present once added, regardless of what the user says.
 
+### LangChain API: the message types
+
+The entire conversation history is a list of `BaseMessage` subclasses from `langchain_core.messages`. These are the same types used across all LangChain integrations and are what every provider converts to and from:
+
+```python
+from langchain_core.messages import (
+    HumanMessage,    # role: "user"    - the human's input
+    AIMessage,       # role: "assistant" - the model's reply or tool call request
+    ToolMessage,     # role: "tool"    - the result of a tool invocation
+    SystemMessage,   # role: "system"  - injected instructions (Birdie builds this each turn)
+    AIMessageChunk,  # streaming delta - accumulated into AIMessage for history
+)
+```
+
+Each message type maps directly to a role in the provider's wire format. Birdie's `_lc_to_openai_messages` and equivalent functions in each provider translate the LangChain message list to the vendor-specific JSON format before the API call.
+
+`AIMessage` carries `tool_calls` when the model requests a tool. This is a list of dicts with `id`, `name`, and `args`:
+
+```python
+AIMessage(
+    content="",
+    tool_calls=[
+        {"id": "call_abc123", "name": "run_bash", "args": {"command": "ls -la"}}
+    ]
+)
+```
+
+`ToolMessage` closes the loop by referencing that same `id`:
+
+```python
+ToolMessage(
+    content="main.py\nREADME.md",
+    tool_call_id="call_abc123",
+    name="run_bash",
+)
+```
+
+This paired `id` relationship is enforced by every provider. `ToolNode` creates `ToolMessage` objects with the correct `tool_call_id` automatically. The checkpoint repair code fills in placeholder `ToolMessage`s when the process was interrupted before `ToolNode` could do so.
+
 ### Full context structure sent to the LLM
 
 ```
@@ -570,6 +790,46 @@ The policy is consulted on every `call_model` and `execute_tools` invocation so 
 
 ---
 
+### LangGraph API: invoking the graph and streaming
+
+`DynamicAgent` exposes two invocation methods that map directly to LangGraph's compiled graph API:
+
+```python
+# Run to completion - returns final AgentState
+result = await agent.invoke("list my files", thread_id="session-1")
+final_messages = result["messages"]
+
+# Stream node-level updates - yields one dict per node execution
+async for update in agent.astream("list my files", thread_id="session-1"):
+    # update is e.g. {"agent": {"messages": [AIMessage(...)]}}
+    # or             {"tools": {"messages": [ToolMessage(...)]}}
+    node_name = list(update.keys())[0]
+    new_messages = update[node_name]["messages"]
+```
+
+Under the hood, `astream` calls `app.astream(initial_state, run_config, stream_mode="updates")`.
+
+**`stream_mode`** controls the granularity of what is yielded:
+
+| Mode | Yields | Use case |
+|---|---|---|
+| `"updates"` | Dict of `{node_name: state_delta}` after each node | CLI display - know which node ran and what it produced |
+| `"values"` | Full `AgentState` after each node | Inspection - always see the complete current state |
+| `"messages"` | Individual LLM token chunks during streaming | Token-level streaming to the user |
+
+Birdie uses `"updates"` so the CLI can display tool call names and results as they happen, without waiting for the full turn to complete.
+
+The `initial_state` passed to `astream` or `ainvoke` contains only the new `HumanMessage`. LangGraph loads the existing thread history from the checkpointer and appends to it - the application never manages the full history:
+
+```python
+initial_state = {"messages": [HumanMessage(content=message)]}
+run_config    = {"configurable": {"thread_id": thread_id, "long_term_memory": ltm}}
+async for update in app.astream(initial_state, run_config, stream_mode="updates"):
+    ...
+```
+
+---
+
 ## Providers
 
 Birdie wraps each vendor SDK behind a common `LLMProvider` interface:
@@ -593,6 +853,46 @@ class LLMProvider(ABC):
 | Any LangChain model | `LangChainProvider` | existing `BaseChatModel` |
 
 Returned `AIMessage` objects carry `usage_metadata` with `input_tokens`, `output_tokens`, and `total_tokens` from the API response. The CLI status bar reads these to display live context and spend counters.
+
+### LangChain API: LangChainProvider and bind_tools
+
+For callers that already have a LangChain `BaseChatModel` (e.g. `ChatOpenAI`, `ChatAnthropic`), `LangChainProvider` wraps it without any native SDK dependency:
+
+```python
+from langchain_openai import ChatOpenAI
+agent = DynamicAgent(ChatOpenAI(model="gpt-4o"), skills_dir="birdie/skills")
+```
+
+Internally, `LangChainProvider` uses two key LangChain patterns:
+
+**`bind_tools`** - attaches a tool schema to the model so the LLM knows what tools are available. It returns a new runnable (the original model is not mutated):
+
+```python
+def _with_tools(self, tools: list[NormalizedToolDef] | None):
+    if not tools:
+        return self._llm
+    lc_tools = [_normalized_tool_to_lc_schema(t) for t in tools]
+    return self._llm.bind_tools(lc_tools)   # returns Runnable, not BaseChatModel
+```
+
+`bind_tools` is the LangChain standard for attaching tool definitions to any chat model. The tools are passed in the API request as the `tools` or `functions` parameter (depending on the provider). When the model decides to call a tool, the response comes back as an `AIMessage` with a populated `tool_calls` field.
+
+**`ainvoke` and `astream`** - the standard `Runnable` interface:
+
+```python
+async def achat(self, messages, tools, system_prompt, ...) -> BaseMessage:
+    msgs = self._inject_system(messages, system_prompt)
+    return await self._with_tools(tools).ainvoke(msgs)
+
+async def astream_chat(self, messages, tools, system_prompt, ...):
+    msgs = self._inject_system(messages, system_prompt)
+    async for chunk in self._with_tools(tools).astream(msgs):
+        yield chunk  # yields AIMessageChunk objects
+```
+
+`ainvoke` returns a complete `AIMessage`. `astream` yields `AIMessageChunk` objects - partial tokens that accumulate into the full message. Both are part of LangChain's `Runnable` interface, implemented by every `BaseChatModel`.
+
+The native providers (e.g. `MistralProvider`, `AnthropicProvider`) call their vendor SDKs directly and convert to/from LangChain message types manually, rather than going through `BaseChatModel`. This gives finer control over vendor-specific features (e.g. Anthropic's native system prompt parameter, Mistral's tool_call content handling) while still producing the same `AIMessage` output the graph expects.
 
 ---
 
@@ -765,15 +1065,39 @@ The agent loop (`START → agent → tools → agent → … → END`) can execu
 
 ### Birdie's implementation
 
-#### Short-term memory - LangGraph's `SqliteSaver` checkpointer
+#### Short-term memory - LangGraph's checkpointer
 
-Birdie delegates all message persistence to LangGraph's `SqliteSaver`. After every graph node, the checkpointer writes the updated `AgentState` to a per-user SQLite database:
+Birdie delegates all message persistence to LangGraph's checkpointer. After every graph node, the checkpointer writes the updated `AgentState` to a per-user SQLite database:
 
 ```
 ~/.birdie/sessions/<user_id>/checkpoints.db
 ```
 
-Each session is a LangGraph **thread**, identified by the session ID (`2026-04-29_1`). When a turn starts, the checkpointer loads the full prior history for that thread automatically - the application only passes the new `HumanMessage`. The graph receives a complete, accurately-typed message list without any application-level serialization or deserialization.
+**LangGraph API: checkpointer setup**
+
+LangGraph ships two checkpointer implementations out of the box:
+
+```python
+from langgraph.checkpoint.memory import MemorySaver          # in-process, no persistence
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver # SQLite, survives restarts
+
+# In-memory - suitable for tests and one-shot scripts
+app = workflow.compile(checkpointer=MemorySaver())
+
+# SQLite - Birdie's production default
+async with AsyncSqliteSaver.from_conn_string(db_path) as checkpointer:
+    app = workflow.compile(checkpointer=checkpointer)
+```
+
+The checkpointer is passed to `compile()`. From that point, LangGraph handles all reads and writes automatically:
+
+- **Before the first node**: the checkpointer loads the latest snapshot for the current `thread_id`. The graph sees the restored `AgentState` as if nothing had happened.
+- **After each node**: the checkpointer saves the state delta (not the full state). Deltas are merged on read, so the storage is append-only and efficient.
+- **No application code needed**: the graph never calls the checkpointer directly. LangGraph's runtime wires it in.
+
+Each session is a LangGraph **thread**, identified by the session ID (`2026-04-29_1`). The thread concept is LangGraph's unit of isolated history: two different `thread_id` values produce two completely independent conversation histories stored in the same database.
+
+When a turn starts, the checkpointer loads the full prior history for that thread automatically - the application only passes the new `HumanMessage`. The graph receives a complete, accurately-typed message list without any application-level serialization or deserialization.
 
 The context window trim happens inside `call_model`, not at the storage layer:
 
