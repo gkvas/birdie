@@ -136,7 +136,15 @@ def load_skill_from_markdown(path: str) -> Skill:
     """
     with open(path, "r") as f:
         content = f.read()
-    return parse_skill_markdown(content)
+    skill = parse_skill_markdown(content)
+    if skill.mcp_server and skill.mcp_server.args:
+        skill_dir = Path(path).resolve().parent
+        resolved = [
+            str(skill_dir / arg) if not arg.startswith("-") and not Path(arg).is_absolute() else arg
+            for arg in skill.mcp_server.args
+        ]
+        skill = skill.model_copy(update={"mcp_server": skill.mcp_server.model_copy(update={"args": resolved})})
+    return skill
 
 
 def discover_skills_from_directory(directory: str) -> List[Skill]:

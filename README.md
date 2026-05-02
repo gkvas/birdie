@@ -16,29 +16,75 @@
 
 A LangGraph-based agent that discovers capabilities at runtime from **SKILL.MD** files. Skills, tools, and their execution entrypoints are all declared in plain Markdown - no code changes required to add new capabilities.
 
+Birdie is a minimal yet fully functional implementation. The design goal is simplicity and transparency: the codebase is intended to be readable, hackable, and easy to extend. It ships with a small set of built-in skills (shell access, filesystem, SSH, todo, weather, MCP demo) that can run arbitrary local commands.
+
+> **Security notice:** Birdie has no guardrails against local tool misuse. Skills such as `Shell` and `Filesystem` can read, write, and execute anything the running user is permitted to do. Only enable skills you trust and run Birdie under an account with appropriate restrictions.
+
 ---
 
 <img src="doc/assets/demo.gif" alt="Birdie CLI demo" width="800">
 
-## Quick start
+## Installation
+
+### From PyPI (recommended)
 
 ```bash
-pip install -e .
-
-# Mistral
-LLM_VENDOR=mistral LLM_MODEL=mistral-large-latest MISTRAL_API_KEY=... birdie
-
-# OpenAI
-LLM_VENDOR=openai LLM_MODEL=gpt-4o OPENAI_API_KEY=... birdie
-
-# Anthropic
-LLM_VENDOR=anthropic LLM_MODEL=claude-sonnet-4-6 ANTHROPIC_API_KEY=... birdie
+pip install birdie-agent
 ```
 
-Or use a full JSON config:
+### From source
 
 ```bash
-export LLM_PROVIDER_CONFIG='{"vendor":"mistral","model":"mistral-large-latest","api_key":"...","temperature":0.3}'
+git clone https://github.com/gkvas/birdie.git
+cd birdie
+pip install -e .
+```
+
+## Quick start
+
+Configure your LLM provider via environment variables and run `birdie`:
+
+```bash
+# Mistral
+export LLM_VENDOR=mistral
+export LLM_MODEL=mistral-large-latest
+export MISTRAL_API_KEY=your-key-here
+birdie
+
+# OpenAI
+export LLM_VENDOR=openai
+export LLM_MODEL=gpt-4o
+export OPENAI_API_KEY=your-key-here
+birdie
+
+# Anthropic
+export LLM_VENDOR=anthropic
+export LLM_MODEL=claude-sonnet-4-6
+export ANTHROPIC_API_KEY=your-key-here
+birdie
+```
+
+Or pass a JSON config file:
+
+```bash
+birdie --config provider.json
+```
+
+```json
+{
+  "vendor": "mistral",
+  "model": "mistral-large-latest",
+  "api_key": "your-key-here",
+  "temperature": 0.3
+}
+```
+
+On Windows (PowerShell):
+
+```powershell
+$env:LLM_VENDOR = "openai"
+$env:LLM_MODEL = "gpt-4o"
+$env:OPENAI_API_KEY = "your-key-here"
 birdie
 ```
 
