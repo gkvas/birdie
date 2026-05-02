@@ -87,12 +87,40 @@ The skill system is built in three layers, each sitting on top of the one below:
 │  Each tool is wired to exactly one entrypoint.       │
 ├──────────────────────────────────────────────────────┤
 │  Entrypoints  (hardcoded in core/entrypoints.py)     │
-│  Fixed execution primitives: bash, http, python, …   │
+│  Fixed execution primitives: bash, http, python, ...  │
 │  Not declared in SKILL.MD - part of the framework.   │
 └──────────────────────────────────────────────────────┘
 ```
 
 Entrypoints answer *how* to run something. Tool skills answer *what* can be run. Knowledge skills answer *when and why* - and delegate the actual execution back down to a tool skill.
+
+### The frontmatter / body boundary
+
+Every SKILL.MD file is split into two distinct parts by the parser in `core/loader.py`. Understanding this boundary is fundamental to understanding how the skill system works.
+
+**Frontmatter** is the YAML block between the opening and closing `---` delimiters. It is parsed at startup into typed Python fields on the `Skill` Pydantic model. Frontmatter fields are structural metadata consumed by application code - the registry, the policy engine, the adapter, and the system prompt builder all read from these fields. Nothing in the frontmatter is ever sent verbatim to the LLM.
+
+**Body** is everything in the file after the closing `---`. It is stored as a single raw Markdown string in `Skill.body`. The body is not parsed, indexed, or processed in any way at load time. It is kept in memory and may be appended verbatim to the system prompt at turn time - but only under specific conditions (see below). The body is the text the LLM reads, not the text the application reads.
+
+```
+birdie/skills/ssh/SKILL.MD
+─────────────────────────────────────────────────────────
+---                          ← frontmatter start
+name: ssh                    ← parsed into Skill.name       (used by code)
+description: SSH connections ← parsed into Skill.description (used by code)
+triggers:                    ← parsed into Skill.triggers    (used by code)
+  - ssh
+  - remote server
+---                          ← frontmatter end / body start
+# SSH Skill                  ←
+                             ←  stored verbatim in Skill.body
+## Capabilities              ←  appended to system prompt
+- Establish SSH connections  ←  only when triggered
+...                          ←
+─────────────────────────────────────────────────────────
+```
+
+This boundary is what allows the skill system to be both **efficient** (only send what is needed to the LLM) and **dynamic** (add new skills without changing code - the parser handles any valid SKILL.MD).
 
 ---
 
@@ -141,7 +169,25 @@ schema:
   required: [command]
 ```
 
-Tags declared on the skill (`tags: [shell, local, system]`) propagate to every tool in the skill. This is what allows knowledge skills to find executor tools without knowing their names - they ask for tools by tag, not by name.
+For a structured tool skill, the parser does the following:
+
+- **Frontmatter** is parsed into `Skill` model fields. `name`, `description`, `tags`, `enabled_by_default`, `always_inject` all become typed attributes.
+- **`## Tools` section** is extracted from the body and parsed into a list of `SkillTool` objects, each holding `name`, `description`, `entrypoint`, and `schema`. These are stored in `Skill.tools`.
+- **`Skill.body`** is set to `None`. A plain structured skill has no prose to inject - its tools alone are its contribution. No body is stored or ever sent to the LLM.
+
+```
+After parsing a structured skill:
+
+Skill.name        = "Shell"
+Skill.description = "Execute arbitrary shell commands..."
+Skill.tags        = ["shell", "local", "system"]
+Skill.tools       = [SkillTool(name="run_bash", entrypoint="bash:{command}", schema={...})]
+Skill.body        = None   ← no prose body; nothing to inject
+```
+
+The `## Tools` section is deliberately excluded from `Skill.body`. If it were included, it would be sent as raw Markdown to the LLM on injection, which would be confusing and wasteful - the LLM already receives structured tool schemas through the function-calling API.
+
+Tags declared on the skill (`tags: [shell, local, system]`) are propagated to every tool in the skill at registration time. This is what allows knowledge skills to find executor tools without knowing their names - they ask for tools by tag, not by name.
 
 **Frontmatter fields**
 
@@ -149,24 +195,38 @@ Tags declared on the skill (`tags: [shell, local, system]`) propagate to every t
 |---|---|---|
 | `name` | yes | Unique skill identifier |
 | `version` | no | Semver string (default `1.0.0`) |
-| `description` | yes | One-line description shown to the LLM |
-| `tags` | no | Propagated to all tools; used by knowledge skills for tag-based lookup |
-| `enabled_by_default` | no | Whether all users get this skill without an explicit grant (default `true`) |
-| `always_inject` | no | Inject the skill's prose body into the system prompt on every turn |
+| `description` | yes | One-line summary - appears in the Tier 1 skill catalog sent to the LLM every turn |
+| `tags` | no | Propagated to all tools at registration time; used for tag-based lookup |
+| `enabled_by_default` | no | If `true`, all users get this skill without an explicit grant (default `true`) |
+| `always_inject` | no | See below - the exception that allows a structured skill to also have a prose body |
 
 **Tool block fields**
 
 | Field | Required | Description |
 |---|---|---|
-| `description` | yes | Shown to the LLM as the tool description |
+| `description` | yes | Shown to the LLM as the tool's purpose; the LLM uses this to decide when to call the tool |
 | `entrypoint` | yes | `scheme:target` - see Layer 1 |
-| `schema` | yes | JSON Schema object describing the tool's arguments |
+| `schema` | yes | JSON Schema object describing the tool's arguments; used to build the Pydantic `args_schema` |
+
+**The `always_inject` exception**
+
+A structured skill can optionally carry a prose body alongside its tools by setting `always_inject: true`. In this case the parser stores the prose that appears *before* the `## Tools` section in `Skill.body`, and that prose is sent to the LLM on **every single turn**, regardless of what the user said. This is for skills whose instructions are permanently relevant - for example a planning skill that tells the agent how to reason step-by-step, or a persona skill that defines communication style. Such instructions need to be present on every turn, not just when a trigger keyword fires.
+
+```
+always_inject structured skill - what gets stored:
+
+Skill.tools = [SkillTool(...), ...]    ← from ## Tools section
+Skill.body  = "Always reason step by ← prose before ## Tools
+               step before answering"   injected every turn
+```
+
+The `## Tools` section itself is never included in `Skill.body` in any case.
 
 ---
 
 ### Layer 3 - Knowledge skills
 
-Knowledge skills carry no tools of their own. Their SKILL.MD contains only frontmatter and free-form Markdown prose. The prose is injected into the system prompt when a trigger keyword appears in the user's message - it is never sent otherwise.
+Knowledge skills carry no tools of their own. Their SKILL.MD consists of frontmatter plus free-form Markdown prose - no `## Tools` section.
 
 ```markdown
 ---
@@ -187,7 +247,42 @@ triggers:
 ...
 ```
 
-When the user says anything containing "ssh" or "remote server", the full Markdown body is appended to the system prompt. The LLM then uses whatever tool skills the user has enabled - typically the Shell skill's `run_bash` - to construct and execute the SSH command. No wiring between skills is needed; the LLM connects the knowledge to the available tools itself.
+For a knowledge skill, the parser does the following:
+
+- **Frontmatter** is parsed into `Skill` model fields as usual.
+- **`## Tools` section** does not exist, so `Skill.tools` is an empty list. No `SkillTool` objects are created. Nothing is registered in the tool index.
+- **`Skill.body`** is set to the **entire Markdown body** - every character after the closing `---`. This is the full prose text, stored as-is, ready to be appended to the system prompt.
+
+```
+After parsing a knowledge skill:
+
+Skill.name     = "ssh"
+Skill.triggers = ["ssh", "remote server", "remote connection", "secure shell"]
+Skill.tools    = []     ← no tools; nothing registered in the tool index
+Skill.body     = "# SSH Skill\n\n## Capabilities\n- Establish SSH..."
+                         ← full prose body stored verbatim
+```
+
+**Why the body is not always sent**
+
+At startup, every enabled knowledge skill's body is sitting in memory. If all of them were appended to the system prompt on every turn, the prompt would grow with every skill added - potentially thousands of tokens of context that has nothing to do with what the user asked. This is wasteful and quickly becomes the dominant cost driver for API usage.
+
+The trigger mechanism is the solution: `Skill.triggers` is a list of keyword phrases. At the start of every `call_model` invocation, the agent checks whether any trigger phrase appears as a substring of the most recent `HumanMessage` (case-insensitive). If none match, the body is not sent. If any match, the full `Skill.body` is appended to the system prompt for that turn only.
+
+This keeps the baseline system prompt small - just Tier 1 (the compact skill catalog, roughly 50-100 tokens) - while making the full knowledge available on-demand. A session with 10 knowledge skills enabled pays the prose cost only for the specific skills relevant to each turn.
+
+The body injection happens entirely in `_build_system_prompt` in `graph.py`, inside the `call_model` node. It reads from in-memory `Skill` objects - there is no disk I/O:
+
+```python
+# graph.py - _build_system_prompt()
+for skill in _triggered_freetext(state, allowed):  # trigger matching
+    if skill.body:
+        system += f"\n\n--- {skill.name} skill context ---\n{skill.body}"
+```
+
+**How the knowledge reaches the tools**
+
+The LLM is now responsible for the connection. When the ssh body is injected, the LLM reads it and understands what an SSH connection requires. It then looks at the available tools (the Shell skill's `run_bash`, for example) and constructs the appropriate command. No explicit wiring between the knowledge skill and the tool skill exists in the application code - the LLM makes the connection itself based on the context.
 
 > **Note:** Ensure the Shell skill (or another skill that provides execution tools) is enabled when using knowledge skills that require command execution.
 
@@ -196,38 +291,81 @@ When the user says anything containing "ssh" or "remote server", the full Markdo
 | Field | Required | Description |
 |---|---|---|
 | `name` | yes | Unique skill identifier |
-| `description` | yes | Compact description included in the Tier 1 skill catalog |
-| `triggers` | yes | Keyword phrases; any substring match in the user's message fires the skill |
+| `description` | yes | One-line summary included in the Tier 1 skill catalog - always sent to the LLM |
+| `triggers` | yes | Keyword phrases; any case-insensitive substring match in the user's message injects the body |
 
 ---
 
 ## Skill loading
 
-Skills are loaded **eagerly at startup** from the skills directory via `discover_skills_from_directory`. Every subdirectory containing a `SKILL.MD` is parsed into a `Skill` object and registered in the `SkillRegistry`.
+### What is eager and what is lazy
 
-What is lazy is **what the agent does with a skill on any given turn**:
+Understanding which parts of the skill system are initialised at startup versus resolved at turn time is essential to understanding the design.
 
-- The skill object (metadata + tool definitions) lives in memory from startup.
-- The tool's **executable wrapper** (a LangChain `StructuredTool` backed by the entrypoint resolver) is created fresh on every agent turn in `execute_tools`, because the active tool set can change between turns as users enable/disable skills.
-- The skill's **body** (freetext documentation) is read from the `Skill` object in memory but only appended to the system prompt when a trigger keyword fires - it is never sent to the LLM otherwise.
+**Eager - happens once at startup:**
 
-The loading sequence:
+`discover_skills_from_directory` scans every subdirectory of the skills directory, finds `SKILL.MD` files, and calls `parse_skill_markdown` on each. This produces a fully populated `Skill` Pydantic object whose fields are derived entirely from the file:
+
+- `Skill.name`, `Skill.description`, `Skill.tags`, `Skill.triggers`, `Skill.enabled_by_default`, `Skill.always_inject` - from YAML frontmatter
+- `Skill.tools` - list of `SkillTool` objects parsed from the `## Tools` section (empty for knowledge skills)
+- `Skill.body` - raw Markdown string of the prose body (empty for plain structured skills, full body for knowledge skills, pre-`## Tools` prose for `always_inject` skills)
+- `Skill.mcp_server` - parsed from the `mcp_server` frontmatter key if present
+
+After parsing, each `Skill` is registered in the `SkillRegistry` (which builds name, tag, and tool-ownership indexes) and its `mcp_server` config (if any) is registered with `MCPClientManager`. Finally, `UserSkillPolicy.set_default_skills` seeds which skills are on by default.
+
+**After startup, no SKILL.MD file is ever read again.** All turn-time decisions are made from in-memory `Skill` objects.
+
+**Lazy - happens on every agent turn:**
+
+Three things are deliberately deferred to turn time:
+
+1. **Tool schema and execution wiring.** `SkillTool` objects store only the entrypoint string and JSON Schema. The `StructuredTool` wrapper that LangChain's `ToolNode` can actually execute is created fresh in `execute_tools` on every turn. This is necessary because the set of allowed skills is resolved per-turn from the policy engine - a skill can be enabled or disabled between turns, so the tool list cannot be fixed at startup.
+
+2. **Trigger matching and body injection.** The prose in `Skill.body` is never sent to the LLM automatically. On each `call_model` invocation, `_build_system_prompt` compares the most recent `HumanMessage` against the `triggers` list of every allowed knowledge skill. Only matching skills have their body appended to the system prompt for that turn. This is the primary token cost-control mechanism: skills whose knowledge is not relevant to the current message contribute nothing to the prompt.
+
+3. **MCP tool discovery.** `MCPClientManager.get_tools()` is called on every turn. The first call connects to the MCP server and caches the tool list; subsequent calls return the cache. The deferral means the MCP subprocess is not spawned until it is actually needed.
+
+**The loading sequence end to end:**
 
 ```
 startup
   └─ discover_skills_from_directory(skills_dir)
        └─ for each subdir/SKILL.MD
-            └─ parse_skill_markdown()          ← YAML frontmatter + body parsed once
-                 ├─ Skill.tools  populated      (structured skills)
-                 └─ Skill.body   populated      (freetext skills)
-  └─ SkillRegistry.register_skill(skill)        ← adds to name, tool, and tag indexes
-  └─ UserSkillPolicy.set_default_skills(skills) ← seeds enabled_by_default set
+            └─ parse_skill_markdown()
+                 ├─ YAML frontmatter   → Skill model fields (name, tags, triggers, ...)
+                 ├─ ## Tools section   → Skill.tools = [SkillTool(...), ...]
+                 │                       (empty list for knowledge skills)
+                 └─ Markdown body      → Skill.body = "raw prose string"
+                                         (None for plain structured skills)
+  └─ SkillRegistry.register_skill(skill)
+       ├─ _skills[name]          = skill
+       ├─ _tools[tool.name]      = tool     (for each tool in skill.tools)
+       ├─ _tags_index[tag]      += tool.name (tag→tool mapping)
+       └─ _tool_to_skill[tool]   = skill.name
+  └─ MCPClientManager.register_server(skill.name, skill.mcp_server)
+       (only for skills where mcp_server is set)
+  └─ UserSkillPolicy.set_default_skills(skills)
+       └─ seeds the enabled_by_default allow-set
 
-per turn (inside LangGraph nodes)
-  └─ _get_skill_tools(state)                    ← reads policy + registry (no disk I/O)
-  └─ _build_system_prompt(state)                ← reads Skill.body from memory
-  └─ ToolNode([fresh StructuredTool, ...])      ← wires entrypoint resolvers
+per turn (inside LangGraph call_model and execute_tools nodes)
+  └─ _get_allowed(config)
+       └─ UserSkillPolicy.get_allowed_skills(thread_id)   ← policy lookup, no disk I/O
+  └─ _build_system_prompt(state, config)
+       ├─ Tier 1: iterate Skill.description for all allowed skills (always)
+       ├─ Tier 2a: append Skill.body for always_inject skills (always)
+       ├─ Tier 2b: match HumanMessage against Skill.triggers,
+       │           append Skill.body for matches only    ← lazy injection
+       └─ Tier 3: append long_term_memory from config["configurable"]
+  └─ execute_tools()
+       ├─ skilltool_to_langchain_tool(t) for each allowed SkillTool
+       │   └─ StructuredTool.from_function(...)          ← created fresh each turn
+       ├─ MCPClientManager.get_tools()                   ← lazy MCP connection
+       └─ ToolNode(all_tools).ainvoke(state)
 ```
+
+**Why fresh StructuredTool wrappers each turn**
+
+A `StructuredTool` is a LangChain object that bundles a callable, a name, a description, and a Pydantic schema. It could in principle be created once at startup and reused. The reason it is not: the set of tools passed to `ToolNode` must exactly reflect the skills enabled for the current session at the current turn. If a user runs `/disable Shell` mid-session, the next turn's `ToolNode` must not include `run_bash`. Building the list fresh from the policy on every turn is the simplest way to guarantee this without any invalidation logic.
 
 ### LangChain API: StructuredTool and Pydantic schema generation
 
