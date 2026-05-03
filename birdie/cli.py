@@ -151,10 +151,15 @@ class BirdieCLI:
 
     def _print_welcome(self) -> None:
         """Print the startup banner with loaded skills and provider info."""
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            v = version("birdie-agent")
+        except PackageNotFoundError:
+            v = "dev"
         skill_count = len(self.agent.registry.list_skills())
         vendor = type(self.agent.provider).__name__.replace("Provider", "").lower()
         self.console.print(Panel(
-            f"[bold green]Birdie[/bold green]  |  vendor: [cyan]{vendor}[/cyan]"
+            f"[bold green]Birdie[/bold green] [dim]v{v}[/dim]  |  vendor: [cyan]{vendor}[/cyan]"
             f"  |  user: [cyan]{self.user_id}[/cyan]"
             f"  |  session: [cyan]{self.session.id}[/cyan]"
             f"  |  skills found: [yellow]{skill_count}[/yellow]\n"
@@ -261,6 +266,25 @@ class BirdieCLI:
                 "[red]Usage: /tool list | output full|short|off[/red]"
             )
 
+    def _resolve_skill_name(self, name: str) -> Optional[str]:
+        """Return the exact skill name if found, else None. Prints a suggestion on miss."""
+        import difflib
+        known = [s.name for s in self.agent.registry.list_skills()]
+        if name in known:
+            return name
+        matches = difflib.get_close_matches(name, known, n=1, cutoff=0.5)
+        if matches:
+            self.console.print(
+                f"[red]Skill [bold]{name}[/bold] not found.[/red] "
+                f"Did you mean [bold]{matches[0]}[/bold]?"
+            )
+        else:
+            self.console.print(
+                f"[red]Skill [bold]{name}[/bold] not found.[/red] "
+                f"Use [bold]/skill list[/bold] to see available skills."
+            )
+        return None
+
     def _handle_skill(self, arg: str) -> None:
         """Handle /skill sub-commands."""
         parts = arg.strip().split(maxsplit=1)
@@ -274,27 +298,31 @@ class BirdieCLI:
             if not subarg:
                 self.console.print("[red]Usage: /skill enable <SkillName>[/red]")
             else:
-                self.agent.enable_skill_for_user(self.session.id, subarg)
-                if subarg not in self.session.enabled_skills:
-                    self.session.enabled_skills.append(subarg)
-                self.session.disabled_skills = [
-                    s for s in self.session.disabled_skills if s != subarg
-                ]
-                self.session_manager.save(self.session)
-                self.console.print(f"[green]Enabled[/green] {subarg}")
+                resolved = self._resolve_skill_name(subarg)
+                if resolved:
+                    self.agent.enable_skill_for_user(self.session.id, resolved)
+                    if resolved not in self.session.enabled_skills:
+                        self.session.enabled_skills.append(resolved)
+                    self.session.disabled_skills = [
+                        s for s in self.session.disabled_skills if s != resolved
+                    ]
+                    self.session_manager.save(self.session)
+                    self.console.print(f"[green]Enabled[/green] {resolved}")
 
         elif subcmd == "disable":
             if not subarg:
                 self.console.print("[red]Usage: /skill disable <SkillName>[/red]")
             else:
-                self.agent.disable_skill_for_user(self.session.id, subarg)
-                if subarg not in self.session.disabled_skills:
-                    self.session.disabled_skills.append(subarg)
-                self.session.enabled_skills = [
-                    s for s in self.session.enabled_skills if s != subarg
-                ]
-                self.session_manager.save(self.session)
-                self.console.print(f"[red]Disabled[/red] {subarg}")
+                resolved = self._resolve_skill_name(subarg)
+                if resolved:
+                    self.agent.disable_skill_for_user(self.session.id, resolved)
+                    if resolved not in self.session.disabled_skills:
+                        self.session.disabled_skills.append(resolved)
+                    self.session.enabled_skills = [
+                        s for s in self.session.enabled_skills if s != resolved
+                    ]
+                    self.session_manager.save(self.session)
+                    self.console.print(f"[red]Disabled[/red] {resolved}")
 
         else:
             self.console.print(

@@ -3,7 +3,7 @@ name: ToDo
 version: 1.0.0
 description: Step-by-step planning and progress tracking for every user request.
 tags: [planning, meta]
-enabled_by_default: true
+enabled_by_default: false
 always_inject: true
 ---
 

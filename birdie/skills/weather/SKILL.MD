@@ -3,7 +3,7 @@ name: Weather
 version: 1.0.0
 description: Provides weather lookup capabilities via an external API.
 tags: [public, http, weather]
-enabled_by_default: true
+enabled_by_default: false
 ---
 
 # Skill: Weather

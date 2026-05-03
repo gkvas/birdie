@@ -1,6 +1,7 @@
 ---
 name: ssh
 description: Establish and manage SSH connections to remote machines, including key generation, configuration, and file transfers. Use when connecting to remote servers, executing remote commands, or transferring files via SCP.
+enabled_by_default: false
 triggers:
 - ssh
 - remote server
