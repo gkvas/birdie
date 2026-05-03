@@ -16,7 +16,7 @@
 
 A LangGraph-based agent that discovers capabilities at runtime from **SKILL.MD** files. Skills, tools, and their execution entrypoints are all declared in plain Markdown - no code changes required to add new capabilities.
 
-Birdie is a minimal yet fully functional implementation. The design goal is simplicity and transparency: the codebase is intended to be readable, hackable, and easy to extend. It ships with a small set of built-in skills (shell access, filesystem, SSH, todo, weather, MCP demo) that can run arbitrary local commands.
+Birdie is a minimal yet fully functional implementation. The design goal is simplicity and transparency: the codebase is intended to be readable, hackable, and easy to extend. It ships with a small set of built-in skills (shell access, filesystem, SSH, todo, weather, DuckDuckGo search, MCP demo) that can run arbitrary local commands. All skills are disabled by default and must be explicitly enabled.
 
 > **Security notice:** Birdie has no guardrails against local tool misuse. Skills such as `Shell` and `Filesystem` can read, write, and execute anything the running user is permitted to do. Only enable skills you trust and run Birdie under an account with appropriate restrictions.
 
@@ -113,6 +113,8 @@ birdie/
     ├── filesystem/SKILL.MD
     ├── shell/SKILL.MD
     ├── ssh/SKILL.MD
+    ├── todo/SKILL.MD
+    ├── duckduckgo/SKILL.MD
     └── mcp_demo/
         ├── SKILL.MD    # MCP skill declaration
         └── server.py   # Example stdio MCP server
@@ -350,6 +352,46 @@ The LLM is now responsible for the connection. When the ssh body is injected, th
 
 Understanding which parts of the skill system are initialised at startup versus resolved at turn time is essential to understanding the design.
 
+### Skill directories
+
+Birdie loads skills from two locations on every startup:
+
+1. **Bundled skills** - the `birdie/skills/` directory shipped inside the package. Always present after `pip install birdie-agent`.
+2. **User skills** - `~/.birdie/skills/` on your home directory, if it exists. Drop a new subdirectory with a `SKILL.MD` there and it will be picked up automatically on the next start - no reinstall, no flags.
+
+To use a completely different directory instead of the bundled one, pass `--skills-dir PATH`. The user skills directory `~/.birdie/skills/` is always also loaded on top of whichever primary directory is used.
+
+### Default skill state
+
+All built-in skills are **disabled by default**. This is a deliberate safety choice - skills like `Shell` and `Filesystem` can execute arbitrary local commands, and they should only be active when you explicitly choose to use them.
+
+Enable skills at the start of a session:
+
+```
+/skill enable Shell
+/skill enable DuckDuckGo
+```
+
+Enabled/disabled state is persisted per session. Use `/skill list` to see all available skills and their current status.
+
+### Built-in skills
+
+| Skill | Description |
+|---|---|
+| `Shell` | Run arbitrary shell commands |
+| `Filesystem` | Read and write local files |
+| `ssh` | Connect to remote hosts and run commands |
+| `ToDo` | Step-by-step planning and progress tracking |
+| `Weather` | Weather lookup via external API |
+| `DuckDuckGo` | Web search with no API key required |
+| `mcp_demo` | Demo MCP server (echo and reverse_string) |
+
+---
+
+### What is eager and what is lazy
+
+Understanding which parts of the skill system are initialised at startup versus resolved at turn time is essential to understanding the design.
+
 **Eager - happens once at startup:**
 
 `discover_skills_from_directory` scans every subdirectory of the skills directory, finds `SKILL.MD` files, and calls `parse_skill_markdown` on each. This produces a fully populated `Skill` Pydantic object whose fields are derived entirely from the file:
@@ -377,7 +419,8 @@ Three things are deliberately deferred to turn time:
 
 ```
 startup
-  └─ discover_skills_from_directory(skills_dir)
+  └─ for each skills dir (bundled, then ~/.birdie/skills/ if present)
+  └─ discover_skills_from_directory(dir)
        └─ for each subdir/SKILL.MD
             └─ parse_skill_markdown()
                  ├─ YAML frontmatter   → Skill model fields (name, tags, triggers, ...)
@@ -1092,7 +1135,7 @@ birdie [--user USER_ID] [--session-id SESSION_ID] [--skills-dir PATH] [--config 
 |---|---|
 | `--user USER_ID` | Filesystem namespace for sessions (defaults to `$USER`) |
 | `--session-id SESSION_ID` | Resume a specific session (e.g. `2026-04-28_1`) |
-| `--skills-dir PATH` | Override the default skills directory |
+| `--skills-dir PATH` | Override the built-in skills directory. `~/.birdie/skills/` is always also loaded on top. |
 | `--config FILE` | Path to a JSON provider config file |
 
 ### Provider configuration
@@ -1199,12 +1242,12 @@ birdie
 | `/remember <text>` | Save a note to long-term memory |
 | `/info` | Show user, session ID, turn count, and provider |
 | `/tool list` | List callable tools for the current session |
-| `/tool output full` | Show complete tool output (default) |
-| `/tool output short` | Show first 10 lines and remaining line count |
+| `/tool output full` | Show complete tool output |
+| `/tool output short` | Show first 1000 characters and remaining count (default) |
 | `/tool output off` | Show only tool name and line count, no content |
 | `/skill list` | List all loaded skills with enabled/disabled status |
-| `/skill enable <name>` | Enable a skill (persisted to session) |
-| `/skill disable <name>` | Disable a skill (persisted to session) |
+| `/skill enable <name>` | Enable a skill (persisted to session). Suggests closest match if name not found. |
+| `/skill disable <name>` | Disable a skill (persisted to session). Suggests closest match if name not found. |
 | `/session new` | Create a new session and switch to it |
 | `/session switch <id>` | Resume an existing session |
 | `/session delete <id>` | Delete a session (creates a new one if current) |
