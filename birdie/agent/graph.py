@@ -216,8 +216,9 @@ def create_agent_graph(
         # Repairs are returned to state so the checkpoint heals permanently.
         repair_msgs, clean_messages = _repair_dangling_tool_calls(context_msgs)
 
-        skill_tools = _get_skill_tools(config)
-        mcp_tools = await mcp_manager.get_tools() if mcp_manager else []
+        allowed = _get_allowed(config)
+        skill_tools = list(registry.list_tools(skill_names=list(allowed)))
+        mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
 
         if provider.supports_tools() and (skill_tools or mcp_tools):
             normalized_tools = (
@@ -254,8 +255,9 @@ def create_agent_graph(
         return {"messages": repair_msgs + [response]}
 
     async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:
-        skill_tools = _get_skill_tools(config)
-        mcp_tools = await mcp_manager.get_tools() if mcp_manager else []
+        allowed = _get_allowed(config)
+        skill_tools = list(registry.list_tools(skill_names=list(allowed)))
+        mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
         langchain_tools = (
             [skilltool_to_langchain_tool(t) for t in skill_tools] + mcp_tools
         )
