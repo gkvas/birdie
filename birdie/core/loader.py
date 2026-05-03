@@ -16,6 +16,7 @@ Skills with ``always_inject: true`` may carry both tools *and* a prose body
 """
 
 import re
+import sys
 import yaml
 from pathlib import Path
 from typing import List
@@ -160,6 +161,12 @@ def discover_skills_from_directory(directory: str) -> List[Skill]:
     Returns:
         List of successfully parsed ``Skill`` objects.
     """
+    # Add the skills root to sys.path so that python: entrypoints in user skill
+    # directories (e.g. python:tools.search_repos) can import their local modules.
+    skills_root = str(Path(directory).resolve())
+    if skills_root not in sys.path:
+        sys.path.insert(0, skills_root)
+
     skills: List[Skill] = []
     for skill_dir in Path(directory).iterdir():
         if skill_dir.is_dir():
