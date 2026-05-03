@@ -5,6 +5,8 @@ Integration tests for the dynamic skill system.
 import pytest
 import tempfile
 import os
+from pathlib import Path
+from unittest.mock import patch
 from birdie.agent.run import DynamicAgent
 from birdie.core.models import Skill, SkillTool
 
@@ -148,3 +150,84 @@ schema:
         tool_names = {t.name for t in llm.bound_tools}
         assert "publicskill_tool" in tool_names
         assert "privateskill_tool" in tool_names
+
+
+def _write_skill(directory: str, name: str, enabled_by_default: bool = False) -> None:
+    skill_dir = os.path.join(directory, name)
+    os.makedirs(skill_dir, exist_ok=True)
+    with open(os.path.join(skill_dir, "SKILL.MD"), "w") as f:
+        f.write(f"""---
+name: {name}
+version: 1.0.0
+description: Test skill {name}
+enabled_by_default: {str(enabled_by_default).lower()}
+---
+""")
+
+
+class _NoopLLM:
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, messages, config=None):
+        from langchain_core.messages import AIMessage
+        return AIMessage(content="ok")
+
+
+def test_load_skills_registers_all_skills():
+    """Skills from the primary dir are registered and policy is seeded."""
+    with tempfile.TemporaryDirectory() as skills_dir:
+        _write_skill(skills_dir, "SkillA", enabled_by_default=True)
+        _write_skill(skills_dir, "SkillB", enabled_by_default=False)
+
+        agent = DynamicAgent(_NoopLLM(), skills_dir=skills_dir)
+
+        names = {s.name for s in agent.registry.list_skills()}
+        assert "SkillA" in names
+        assert "SkillB" in names
+
+        # Policy seeded: SkillA enabled by default, SkillB not
+        allowed = agent.policy.get_allowed_skills_for_user("default")
+        assert "SkillA" in allowed
+        assert "SkillB" not in allowed
+
+
+def test_load_skills_merges_user_skills_dir():
+    """Skills in ~/.birdie/skills/ are loaded on top of primary dir skills."""
+    with tempfile.TemporaryDirectory() as primary_dir, \
+         tempfile.TemporaryDirectory() as fake_home:
+
+        _write_skill(primary_dir, "BundledSkill")
+        user_skills_dir = Path(fake_home) / ".birdie" / "skills"
+        user_skills_dir.mkdir(parents=True)
+        _write_skill(str(user_skills_dir), "UserSkill")
+
+        with patch("birdie.agent.run.Path") as mock_path:
+            # Make Path.home() return our fake home; leave Path(...) calls intact
+            real_path = Path
+            mock_path.home.return_value = real_path(fake_home)
+            mock_path.side_effect = real_path
+
+            agent = DynamicAgent(_NoopLLM(), skills_dir=primary_dir)
+
+        names = {s.name for s in agent.registry.list_skills()}
+        assert "BundledSkill" in names
+        assert "UserSkill" in names
+
+
+def test_load_skills_no_user_dir_does_not_fail():
+    """Absence of ~/.birdie/skills/ is handled silently."""
+    with tempfile.TemporaryDirectory() as primary_dir, \
+         tempfile.TemporaryDirectory() as fake_home:
+
+        _write_skill(primary_dir, "BundledSkill")
+
+        with patch("birdie.agent.run.Path") as mock_path:
+            real_path = Path
+            mock_path.home.return_value = real_path(fake_home)  # no .birdie/skills subdir
+            mock_path.side_effect = real_path
+
+            agent = DynamicAgent(_NoopLLM(), skills_dir=primary_dir)
+
+        names = {s.name for s in agent.registry.list_skills()}
+        assert "BundledSkill" in names
