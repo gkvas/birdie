@@ -562,7 +562,12 @@ def main() -> None:
         default=None,
         help="Resume an existing session by ID (e.g. 2026-04-28_1)",
     )
-    parser.add_argument("--skills-dir", default=None, help="Override skills directory")
+    parser.add_argument(
+        "--skills-dir",
+        default=None,
+        help="Override the built-in skills directory (default: bundled birdie/skills). "
+             "Additional skills are always loaded from ~/.birdie/skills/ if it exists.",
+    )
     parser.add_argument(
         "--config",
         metavar="FILE",

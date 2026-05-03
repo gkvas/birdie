@@ -136,12 +136,17 @@ class DynamicAgent:
     # -- skill management ---------------------------------------------------
 
     def _load_skills(self) -> None:
-        """Discover SKILL.MD files, register them, and seed default policy."""
-        skills = discover_skills_from_directory(self.skills_dir)
-        for skill in skills:
-            self.registry.register_skill(skill)
-            if skill.mcp_server is not None:
-                self.mcp_manager.register_server(skill.name, skill.mcp_server)
+        """Discover SKILL.MD files from all skill dirs and register them."""
+        dirs = [self.skills_dir]
+        user_skills_dir = Path.home() / ".birdie" / "skills"
+        if user_skills_dir.is_dir():
+            dirs.append(str(user_skills_dir))
+
+        for d in dirs:
+            for skill in discover_skills_from_directory(d):
+                self.registry.register_skill(skill)
+                if skill.mcp_server is not None:
+                    self.mcp_manager.register_server(skill.name, skill.mcp_server)
         self.policy.set_default_skills(skills)
 
     async def shutdown(self) -> None:
