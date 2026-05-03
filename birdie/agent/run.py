@@ -147,7 +147,7 @@ class DynamicAgent:
                 self.registry.register_skill(skill)
                 if skill.mcp_server is not None:
                     self.mcp_manager.register_server(skill.name, skill.mcp_server)
-        self.policy.set_default_skills(skills)
+        self.policy.set_default_skills(self.registry.list_skills())
 
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""
