@@ -9,9 +9,11 @@ never touches a vendor SDK directly.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1055,27 +1057,32 @@ class AzureOpenAIProvider(LangChainProvider):
 
 
 class ACPProvider(LLMProvider):
-    """Agent Client Protocol (ACP) provider.
+    """Agent Client Protocol (ACP) provider over stdio (JSON-RPC 2.0).
 
-    Connects to any ACP-compatible agent server via HTTP.  The inner agent
-    runs its own tool loop; birdie tools are not passed through in this
-    basic implementation.
+    Spawns an ACP-compatible agent binary as a child process and communicates
+    via stdin/stdout using newline-delimited JSON-RPC 2.0 messages.  No
+    network server is required - the binary is started on demand.
 
-    - ``base_url`` - URL of the running ACP server, e.g. ``http://localhost:8765``
-    - ``agent_name`` - target agent name (maps from the ``model`` config field);
-      defaults to ``"default"``
+    - ``command`` - binary to spawn, e.g. ``"claude-agent-acp"`` (maps from
+      the ``model`` config field).  Accepts a string or a list for extra args.
 
-    Requires: ``pip install httpx`` (or add ``httpx`` to dependencies).
+    The inner agent runs its own tool loop; birdie tools are not passed through.
+
+    Example config::
+
+        {"vendor": "acp", "model": "claude-agent-acp"}
+
+    The binary must be on PATH (e.g. ``npm install -g @agentclientprotocol/claude-agent-acp``).
     """
+
+    _PROTOCOL_VERSION = "2025-02-24"
 
     def __init__(
         self,
-        base_url: str,
-        agent_name: str = "default",
+        command: str | list[str] = "claude-agent-acp",
         **kwargs: Any,
     ) -> None:
-        self._base_url = base_url.rstrip("/")
-        self._agent_name = agent_name
+        self._command = [command] if isinstance(command, str) else list(command)
 
     def supports_tools(self) -> bool:
         return False
@@ -1085,6 +1092,8 @@ class ACPProvider(LLMProvider):
 
     def supports_json_mode(self) -> bool:
         return False
+
+    # -- message helpers ----------------------------------------------------
 
     def _to_acp_input(
         self,
@@ -1117,22 +1126,25 @@ class ACPProvider(LLMProvider):
                 )
         return ""
 
-    def _parse_sse_chunk(self, raw: str) -> str | None:
-        """Extract text from a single SSE data payload; return None to skip."""
-        if not raw or raw == "[DONE]":
-            return None
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError:
-            return None
-        # Try RunOutputDelta delta content
-        for part in event.get("delta", {}).get("content", []):
-            if part.get("type") == "text" and part.get("text"):
-                return part["text"]
-        # Fall back to full output block (non-streaming fallback in SSE)
-        if "output" in event:
-            return self._extract_text(event["output"]) or None
+    def _extract_delta_text(self, params: dict) -> str | None:
+        delta = params.get("delta", {})
+        if isinstance(delta, dict):
+            for part in delta.get("content", []):
+                if part.get("type") == "text" and part.get("text"):
+                    return part["text"]
         return None
+
+    # -- sync (subprocess) --------------------------------------------------
+
+    def _sync_send(self, stdin: Any, msg: dict) -> None:
+        stdin.write((json.dumps(msg) + "\n").encode())
+        stdin.flush()
+
+    def _sync_recv(self, stdout: Any) -> dict:
+        line = stdout.readline()
+        if not line:
+            raise EOFError("ACP subprocess closed stdout unexpectedly")
+        return json.loads(line.decode())
 
     def chat(
         self,
@@ -1141,33 +1153,29 @@ class ACPProvider(LLMProvider):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> BaseMessage:
+        proc = subprocess.Popen(
+            self._command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         try:
-            import httpx
-        except ImportError as e:
-            raise ImportError("pip install httpx") from e
+            self._sync_send(proc.stdin, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                         "params": {"protocolVersion": self._PROTOCOL_VERSION}})
+            self._sync_recv(proc.stdout)  # initialized
 
-        payload = {"agent_name": self._agent_name, "input": self._to_acp_input(messages, system_prompt)}
-        response = httpx.post(f"{self._base_url}/runs", json=payload, timeout=300)
-        response.raise_for_status()
-        return AIMessage(content=self._extract_text(response.json().get("output", [])))
-
-    async def achat(
-        self,
-        messages: list[BaseMessage],
-        tools: list[NormalizedToolDef] | None = None,
-        system_prompt: str | None = None,
-        **kwargs: Any,
-    ) -> BaseMessage:
-        try:
-            import httpx
-        except ImportError as e:
-            raise ImportError("pip install httpx") from e
-
-        payload = {"agent_name": self._agent_name, "input": self._to_acp_input(messages, system_prompt)}
-        async with httpx.AsyncClient() as client:
-            response = await client.post(f"{self._base_url}/runs", json=payload, timeout=300)
-            response.raise_for_status()
-        return AIMessage(content=self._extract_text(response.json().get("output", [])))
+            self._sync_send(proc.stdin, {"jsonrpc": "2.0", "id": 2, "method": "runs/create",
+                                         "params": {"input": self._to_acp_input(messages, system_prompt)}})
+            while True:
+                msg = self._sync_recv(proc.stdout)
+                if msg.get("id") == 2:
+                    return AIMessage(content=self._extract_text(msg.get("result", {}).get("output", [])))
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            proc.wait()
 
     def stream_chat(
         self,
@@ -1176,26 +1184,47 @@ class ACPProvider(LLMProvider):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> Iterator[BaseMessage]:
-        try:
-            import httpx
-        except ImportError as e:
-            raise ImportError("pip install httpx") from e
+        yield self.chat(messages, system_prompt=system_prompt)
 
-        payload = {"agent_name": self._agent_name, "input": self._to_acp_input(messages, system_prompt)}
-        with httpx.stream(
-            "POST",
-            f"{self._base_url}/runs/stream",
-            json=payload,
-            headers={"Accept": "text/event-stream"},
-            timeout=300,
-        ) as response:
-            response.raise_for_status()
-            for line in response.iter_lines():
-                if not line.startswith("data:"):
-                    continue
-                text = self._parse_sse_chunk(line[5:].strip())
-                if text:
-                    yield AIMessageChunk(content=text)
+    # -- async (asyncio subprocess) -----------------------------------------
+
+    async def _async_send(self, stdin: Any, msg: dict) -> None:
+        stdin.write((json.dumps(msg) + "\n").encode())
+        await stdin.drain()
+
+    async def _async_recv(self, stdout: Any) -> dict:
+        line = await stdout.readline()
+        if not line:
+            raise EOFError("ACP subprocess closed stdout unexpectedly")
+        return json.loads(line.decode())
+
+    async def achat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> BaseMessage:
+        proc = await asyncio.create_subprocess_exec(
+            *self._command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            await self._async_send(proc.stdin, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                                 "params": {"protocolVersion": self._PROTOCOL_VERSION}})
+            await asyncio.wait_for(self._async_recv(proc.stdout), timeout=30)
+
+            await self._async_send(proc.stdin, {"jsonrpc": "2.0", "id": 2, "method": "runs/create",
+                                                 "params": {"input": self._to_acp_input(messages, system_prompt)}})
+            while True:
+                msg = await asyncio.wait_for(self._async_recv(proc.stdout), timeout=300)
+                if msg.get("id") == 2:
+                    return AIMessage(content=self._extract_text(msg.get("result", {}).get("output", [])))
+        finally:
+            proc.stdin.close()
+            await proc.wait()
 
     async def astream_chat(
         self,
@@ -1204,30 +1233,36 @@ class ACPProvider(LLMProvider):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[BaseMessage]:
+        proc = await asyncio.create_subprocess_exec(
+            *self._command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
         try:
-            import httpx
-        except ImportError as e:
-            raise ImportError("pip install httpx") from e
+            await self._async_send(proc.stdin, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                                 "params": {"protocolVersion": self._PROTOCOL_VERSION}})
+            await asyncio.wait_for(self._async_recv(proc.stdout), timeout=30)
 
-        payload = {"agent_name": self._agent_name, "input": self._to_acp_input(messages, system_prompt)}
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST",
-                f"{self._base_url}/runs/stream",
-                json=payload,
-                headers={"Accept": "text/event-stream"},
-                timeout=300,
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line.startswith("data:"):
-                        continue
-                    text = self._parse_sse_chunk(line[5:].strip())
+            await self._async_send(proc.stdin, {"jsonrpc": "2.0", "id": 2, "method": "runs/create",
+                                                 "params": {"input": self._to_acp_input(messages, system_prompt)}})
+            while True:
+                msg = await asyncio.wait_for(self._async_recv(proc.stdout), timeout=300)
+                if msg.get("id") == 2:
+                    text = self._extract_text(msg.get("result", {}).get("output", []))
                     if text:
                         yield AIMessageChunk(content=text)
+                    break
+                if "method" in msg:
+                    text = self._extract_delta_text(msg.get("params", {}))
+                    if text:
+                        yield AIMessageChunk(content=text)
+        finally:
+            proc.stdin.close()
+            await proc.wait()
 
     def list_models(self) -> list[ModelInfo]:
-        return [ModelInfo(id=self._agent_name, supports_streaming=True)]
+        return [ModelInfo(id=self._command[0], supports_streaming=True)]
 
 
 def _normalized_tool_to_lc_schema(t: NormalizedToolDef):
@@ -1410,8 +1445,7 @@ def get_llm_provider(
 
     if vendor == "acp":
         kw: dict[str, Any] = {}
-        if cfg.base_url: kw["base_url"]    = cfg.base_url
-        if cfg.model:    kw["agent_name"]  = cfg.model
+        if cfg.model: kw["command"] = cfg.model
         return ACPProvider(**kw, **extra_kw)
 
     raise ValueError(

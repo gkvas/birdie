@@ -1080,7 +1080,7 @@ class LLMProvider(ABC):
 | Google Gemini | `GeminiProvider` | no extra dep - set `GEMINI_API_KEY` |
 | Ollama | `OllamaProvider` | local server required |
 | Any LangChain model | `LangChainProvider` | existing `BaseChatModel` |
-| ACP agent | `ACPProvider` | ACP adapter running locally (e.g. `claude-agent-acp`) |
+| ACP agent | `ACPProvider` | ACP adapter binary on PATH (e.g. `npm install -g @agentclientprotocol/claude-agent-acp`) |
 
 Returned `AIMessage` objects carry `usage_metadata` with `input_tokens`, `output_tokens`, and `total_tokens` from the API response. The CLI status bar reads these to display live context and spend counters.
 
@@ -1211,12 +1211,11 @@ ACP agent (e.g. Claude Code via `claude-agent-acp`):
 ```json
 {
   "vendor": "acp",
-  "base_url": "http://localhost:8765",
-  "model": "default"
+  "model": "claude-agent-acp"
 }
 ```
 
-The `model` field selects the named agent on the ACP server (defaults to `"default"`). The underlying LLM model is configured on the adapter side. Birdie tools are not passed through - the inner agent runs its own tool loop.
+The `model` field is the binary name to spawn. Birdie starts it as a child process and communicates via stdin/stdout (JSON-RPC 2.0 over stdio) - no network server required. The binary must be on PATH. The inner agent runs its own tool loop; birdie tools are not passed through.
 
 **Config fields**
 

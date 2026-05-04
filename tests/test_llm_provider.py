@@ -356,85 +356,83 @@ class TestAzureOpenAIProvider:
 # ---------------------------------------------------------------------------
 
 class TestACPProvider:
-    from birdie.core.llm_provider import ACPProvider
 
-    def _make_run_response(self, text="Hello from ACP"):
-        return {
-            "run_id": "run-123",
-            "status": "completed",
+    def _make_proc(self, *response_lines):
+        """Return a mock Popen process whose stdout yields the given JSON-RPC lines."""
+        initialized = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-02-24"}}) + "\n"
+        lines = [initialized.encode()] + [(json.dumps(r) + "\n").encode() for r in response_lines]
+        mock_proc = MagicMock()
+        mock_proc.stdin = MagicMock()
+        mock_proc.stderr = MagicMock()
+        mock_proc.stdout.readline.side_effect = lines
+        mock_proc.wait.return_value = 0
+        return mock_proc
+
+    def _run_result(self, text="Hello from ACP"):
+        return {"jsonrpc": "2.0", "id": 2, "result": {
             "output": [{"role": "assistant", "content": [{"type": "text", "text": text}]}],
-        }
+            "status": "completed",
+        }}
 
     def test_chat(self, sample_messages):
         from birdie.core.llm_provider import ACPProvider
-        import httpx
-        response = MagicMock(spec=httpx.Response)
-        response.json.return_value = self._make_run_response("Hi there")
-        response.raise_for_status = MagicMock()
-        with patch("httpx.post", return_value=response) as mock_post:
-            provider = ACPProvider(base_url="http://localhost:8765", agent_name="my-agent")
+        mock_proc = self._make_proc(self._run_result("Hi there"))
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
             result = provider.chat(sample_messages)
         assert isinstance(result, AIMessage)
         assert result.content == "Hi there"
-        mock_post.assert_called_once()
-        call_kw = mock_post.call_args
-        assert call_kw[0][0] == "http://localhost:8765/runs"
-        payload = call_kw[1]["json"]
-        assert payload["agent_name"] == "my-agent"
+
+    def test_chat_sends_correct_rpc(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(self._run_result())
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.chat(sample_messages, system_prompt="Be helpful")
+        # Second write call is the runs/create; decode and check payload
+        calls = mock_proc.stdin.write.call_args_list
+        run_msg = json.loads(calls[1][0][0].decode())
+        assert run_msg["method"] == "runs/create"
+        roles = [m["role"] for m in run_msg["params"]["input"]]
+        assert roles[0] == "system"
 
     def test_chat_message_conversion(self):
         from birdie.core.llm_provider import ACPProvider
-        import httpx
-        response = MagicMock(spec=httpx.Response)
-        response.json.return_value = self._make_run_response()
-        response.raise_for_status = MagicMock()
-        with patch("httpx.post", return_value=response) as mock_post:
-            provider = ACPProvider(base_url="http://localhost:8765")
+        mock_proc = self._make_proc(self._run_result())
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
             provider.chat(
                 [HumanMessage(content="Hello"), AIMessage(content="Hi"), HumanMessage(content="Follow up")],
                 system_prompt="Be helpful",
             )
-        payload = mock_post.call_args[1]["json"]
-        roles = [m["role"] for m in payload["input"]]
+        calls = mock_proc.stdin.write.call_args_list
+        run_msg = json.loads(calls[1][0][0].decode())
+        roles = [m["role"] for m in run_msg["params"]["input"]]
         assert roles == ["system", "user", "assistant", "user"]
 
     def test_list_models(self):
         from birdie.core.llm_provider import ACPProvider
-        provider = ACPProvider(base_url="http://localhost:8765", agent_name="claude-acp")
-        models = provider.list_models()
-        assert models[0].id == "claude-acp"
+        provider = ACPProvider(command="claude-agent-acp")
+        assert provider.list_models()[0].id == "claude-agent-acp"
 
     def test_capability_flags(self):
         from birdie.core.llm_provider import ACPProvider
-        provider = ACPProvider(base_url="http://localhost:8765")
+        provider = ACPProvider(command="claude-agent-acp")
         assert provider.supports_tools() is False
         assert provider.supports_streaming() is True
         assert provider.supports_json_mode() is False
 
-    def test_parse_sse_chunk_delta(self):
+    def test_extract_delta_text(self):
         from birdie.core.llm_provider import ACPProvider
-        import json
-        provider = ACPProvider(base_url="http://localhost:8765")
-        raw = json.dumps({"delta": {"role": "assistant", "content": [{"type": "text", "text": "chunk"}]}})
-        assert provider._parse_sse_chunk(raw) == "chunk"
-
-    def test_parse_sse_chunk_done(self):
-        from birdie.core.llm_provider import ACPProvider
-        provider = ACPProvider(base_url="http://localhost:8765")
-        assert provider._parse_sse_chunk("[DONE]") is None
-        assert provider._parse_sse_chunk("") is None
+        provider = ACPProvider(command="claude-agent-acp")
+        params = {"delta": {"content": [{"type": "text", "text": "chunk"}]}}
+        assert provider._extract_delta_text(params) == "chunk"
+        assert provider._extract_delta_text({}) is None
 
     @patch("birdie.core.llm_provider.ACPProvider.__init__", return_value=None)
     def test_acp_vendor_factory(self, mock_init):
-        get_llm_provider({
-            "vendor": "acp",
-            "base_url": "http://localhost:8765",
-            "model": "claude-acp",
-        })
-        mock_init.assert_called_once_with(
-            base_url="http://localhost:8765",
-            agent_name="claude-acp",
-        )
+        get_llm_provider({"vendor": "acp", "model": "claude-agent-acp"})
+        mock_init.assert_called_once_with(command="claude-agent-acp")
 
 
 # ---------------------------------------------------------------------------
