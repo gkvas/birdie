@@ -103,7 +103,7 @@ class ProviderConfig(BaseModel):
         default="openai",
         description=(
             "LLM vendor identifier.  "
-            "Supported: openai | azure | anthropic | mistral | gemini | ollama | langchain"
+            "Supported: openai | azure | anthropic | mistral | gemini | ollama | langchain | acp"
         ),
     )
     model: Optional[str] = Field(
@@ -1054,6 +1054,182 @@ class AzureOpenAIProvider(LangChainProvider):
         super().__init__(llm=AzureChatOpenAI(**llm_kw))
 
 
+class ACPProvider(LLMProvider):
+    """Agent Client Protocol (ACP) provider.
+
+    Connects to any ACP-compatible agent server via HTTP.  The inner agent
+    runs its own tool loop; birdie tools are not passed through in this
+    basic implementation.
+
+    - ``base_url`` - URL of the running ACP server, e.g. ``http://localhost:8765``
+    - ``agent_name`` - target agent name (maps from the ``model`` config field);
+      defaults to ``"default"``
+
+    Requires: ``pip install httpx`` (or add ``httpx`` to dependencies).
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        agent_name: str = "default",
+        **kwargs: Any,
+    ) -> None:
+        self._base_url = base_url.rstrip("/")
+        self._agent_name = agent_name
+
+    def supports_tools(self) -> bool:
+        return False
+
+    def supports_streaming(self) -> bool:
+        return True
+
+    def supports_json_mode(self) -> bool:
+        return False
+
+    def _to_acp_input(
+        self,
+        messages: list[BaseMessage],
+        system_prompt: str | None,
+    ) -> list[dict]:
+        result = []
+        if system_prompt:
+            result.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                role = "system"
+            elif isinstance(msg, HumanMessage):
+                role = "user"
+            elif isinstance(msg, AIMessage):
+                role = "assistant"
+            else:
+                continue
+            text = msg.content if isinstance(msg.content, str) else str(msg.content)
+            result.append({"role": role, "content": [{"type": "text", "text": text}]})
+        return result
+
+    def _extract_text(self, output: list[dict]) -> str:
+        for msg in reversed(output):
+            if msg.get("role") == "assistant":
+                return "".join(
+                    p.get("text", "")
+                    for p in msg.get("content", [])
+                    if p.get("type") == "text"
+                )
+        return ""
+
+    def _parse_sse_chunk(self, raw: str) -> str | None:
+        """Extract text from a single SSE data payload; return None to skip."""
+        if not raw or raw == "[DONE]":
+            return None
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        # Try RunOutputDelta delta content
+        for part in event.get("delta", {}).get("content", []):
+            if part.get("type") == "text" and part.get("text"):
+                return part["text"]
+        # Fall back to full output block (non-streaming fallback in SSE)
+        if "output" in event:
+            return self._extract_text(event["output"]) or None
+        return None
+
+    def chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> BaseMessage:
+        try:
+            import httpx
+        except ImportError as e:
+            raise ImportError("pip install httpx") from e
+
+        payload = {"agent_name": self._agent_name, "input": self._to_acp_input(messages, system_prompt)}
+        response = httpx.post(f"{self._base_url}/runs", json=payload, timeout=300)
+        response.raise_for_status()
+        return AIMessage(content=self._extract_text(response.json().get("output", [])))
+
+    async def achat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> BaseMessage:
+        try:
+            import httpx
+        except ImportError as e:
+            raise ImportError("pip install httpx") from e
+
+        payload = {"agent_name": self._agent_name, "input": self._to_acp_input(messages, system_prompt)}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{self._base_url}/runs", json=payload, timeout=300)
+            response.raise_for_status()
+        return AIMessage(content=self._extract_text(response.json().get("output", [])))
+
+    def stream_chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> Iterator[BaseMessage]:
+        try:
+            import httpx
+        except ImportError as e:
+            raise ImportError("pip install httpx") from e
+
+        payload = {"agent_name": self._agent_name, "input": self._to_acp_input(messages, system_prompt)}
+        with httpx.stream(
+            "POST",
+            f"{self._base_url}/runs/stream",
+            json=payload,
+            headers={"Accept": "text/event-stream"},
+            timeout=300,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.startswith("data:"):
+                    continue
+                text = self._parse_sse_chunk(line[5:].strip())
+                if text:
+                    yield AIMessageChunk(content=text)
+
+    async def astream_chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[BaseMessage]:
+        try:
+            import httpx
+        except ImportError as e:
+            raise ImportError("pip install httpx") from e
+
+        payload = {"agent_name": self._agent_name, "input": self._to_acp_input(messages, system_prompt)}
+        async with httpx.AsyncClient() as client:
+            async with client.stream(
+                "POST",
+                f"{self._base_url}/runs/stream",
+                json=payload,
+                headers={"Accept": "text/event-stream"},
+                timeout=300,
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    text = self._parse_sse_chunk(line[5:].strip())
+                    if text:
+                        yield AIMessageChunk(content=text)
+
+    def list_models(self) -> list[ModelInfo]:
+        return [ModelInfo(id=self._agent_name, supports_streaming=True)]
+
+
 def _normalized_tool_to_lc_schema(t: NormalizedToolDef):
     """
     Create a schema-only LangChain StructuredTool from a NormalizedToolDef.
@@ -1232,9 +1408,15 @@ def get_llm_provider(
             )
         return LangChainProvider(llm_obj)
 
+    if vendor == "acp":
+        kw: dict[str, Any] = {}
+        if cfg.base_url: kw["base_url"]    = cfg.base_url
+        if cfg.model:    kw["agent_name"]  = cfg.model
+        return ACPProvider(**kw, **extra_kw)
+
     raise ValueError(
         f"Unknown vendor '{vendor}'. "
-        "Supported: openai, azure, anthropic, mistral, gemini, ollama, langchain"
+        "Supported: openai, azure, anthropic, mistral, gemini, ollama, langchain, acp"
     )
 
 
