@@ -497,68 +497,6 @@ class _OpenAICompatibleProvider(LLMProvider):
 # Concrete OpenAI-compatible providers
 # ---------------------------------------------------------------------------
 
-class AzureOpenAIProvider(_OpenAICompatibleProvider):
-    """Azure OpenAI Service.
-
-    Requires three Azure-specific values beyond the base OpenAI config:
-
-    - ``base_url`` / ``AZURE_OPENAI_ENDPOINT`` - e.g.
-      ``https://<resource>.openai.azure.com/``
-    - ``model`` - the *deployment name* chosen in Azure Portal, not the
-      canonical model name (e.g. ``my-gpt4o`` not ``gpt-4o``)
-    - ``api_version`` - Azure API version string, e.g. ``2024-02-01``
-      (pass as an extra JSON field; forwarded via ``ProviderConfig``'s
-      ``extra="allow"``)
-
-    Install: no extra dependency - ``openai`` is already present.
-    Set ``AZURE_OPENAI_API_KEY`` (or ``api_key`` in the config).
-    """
-
-    _env_key_name = "AZURE_OPENAI_API_KEY"
-
-    def __init__(
-        self,
-        model: str = "gpt-4o",
-        api_key: str | None = None,
-        base_url: str | None = None,
-        temperature: float = 0.0,
-        max_tokens: int | None = None,
-        api_version: str = "2024-02-01",
-        **kwargs: Any,
-    ) -> None:
-        try:
-            import openai
-        except ImportError as e:
-            raise ImportError("pip install openai") from e
-
-        resolved_key = api_key or os.environ.get(self._env_key_name, "")
-        resolved_endpoint = base_url or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
-
-        self._model = model
-        self._temperature = temperature
-        self._max_tokens = max_tokens
-        self._client = openai.AzureOpenAI(
-            api_key=resolved_key,
-            azure_endpoint=resolved_endpoint,
-            api_version=api_version,
-        )
-        self._async_client = openai.AsyncAzureOpenAI(
-            api_key=resolved_key,
-            azure_endpoint=resolved_endpoint,
-            api_version=api_version,
-        )
-        self._extra = kwargs
-
-    def list_models(self) -> list[ModelInfo]:
-        # Azure deployments are user-defined; fall back to live API listing.
-        try:
-            models = self._client.models.list()
-            return [ModelInfo(id=m.id, supports_tools=True, supports_streaming=True) for m in models.data]
-        except Exception as e:
-            log.warning("list_models failed: %s", e)
-            return []
-
-
 class OpenAIProvider(_OpenAICompatibleProvider):
     """OpenAI (GPT series)."""
 
@@ -1065,6 +1003,55 @@ class LangChainProvider(LLMProvider):
     def list_models(self) -> list[ModelInfo]:
         model_name = getattr(self._llm, "model_name", None) or getattr(self._llm, "model", "unknown")
         return [ModelInfo(id=str(model_name), supports_tools=True, supports_streaming=True)]
+
+
+class AzureOpenAIProvider(LangChainProvider):
+    """Azure OpenAI Service using AzureChatOpenAI from langchain-openai.
+
+    Requires three Azure-specific values beyond the base OpenAI config:
+
+    - ``base_url`` / ``AZURE_OPENAI_ENDPOINT`` - e.g.
+      ``https://<resource>.openai.azure.com/``
+    - ``model`` - the *deployment name* chosen in Azure Portal, not the
+      canonical model name (e.g. ``my-gpt4o`` not ``gpt-4o``)
+    - ``api_version`` - Azure API version string, e.g. ``2024-02-01``
+      (pass as an extra JSON field; forwarded via ``ProviderConfig``'s
+      ``extra="allow"``)
+
+    Install: no extra dependency - ``langchain-openai`` is already present.
+    Set ``AZURE_OPENAI_API_KEY`` (or ``api_key`` in the config).
+    """
+
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        api_key: str | None = None,
+        base_url: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        api_version: str = "2024-02-01",
+        **kwargs: Any,
+    ) -> None:
+        try:
+            from langchain_openai import AzureChatOpenAI
+        except ImportError as e:
+            raise ImportError("pip install langchain-openai") from e
+
+        resolved_key = api_key or os.environ.get("AZURE_OPENAI_API_KEY")
+        resolved_endpoint = base_url or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+
+        llm_kw: dict[str, Any] = {
+            "azure_deployment": model,
+            "azure_endpoint": resolved_endpoint,
+            "api_version": api_version,
+            "temperature": temperature,
+        }
+        if resolved_key:
+            llm_kw["api_key"] = resolved_key
+        if max_tokens:
+            llm_kw["max_tokens"] = max_tokens
+
+        super().__init__(llm=AzureChatOpenAI(**llm_kw))
 
 
 def _normalized_tool_to_lc_schema(t: NormalizedToolDef):

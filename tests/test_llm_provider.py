@@ -294,6 +294,64 @@ class TestLangChainProvider:
 
 
 # ---------------------------------------------------------------------------
+# AzureOpenAIProvider
+# ---------------------------------------------------------------------------
+
+class TestAzureOpenAIProvider:
+    def _make_mock_azure_llm(self, response_content="Hello"):
+        ai_msg = AIMessage(content=response_content, tool_calls=[])
+        llm = MagicMock()
+        llm.invoke.return_value = ai_msg
+        llm.model_name = "my-gpt4o-deployment"
+        bound = MagicMock()
+        bound.invoke.return_value = ai_msg
+        llm.bind_tools.return_value = bound
+        return llm
+
+    @patch("langchain_openai.AzureChatOpenAI")
+    def test_init_passes_correct_params(self, MockAzureChatOpenAI):
+        from birdie.core.llm_provider import AzureOpenAIProvider
+        MockAzureChatOpenAI.return_value = self._make_mock_azure_llm()
+        AzureOpenAIProvider(
+            model="my-gpt4o-deployment",
+            api_key="azure-key",
+            base_url="https://my-resource.openai.azure.com/",
+            api_version="2024-02-01",
+            temperature=0.5,
+        )
+        MockAzureChatOpenAI.assert_called_once_with(
+            azure_deployment="my-gpt4o-deployment",
+            azure_endpoint="https://my-resource.openai.azure.com/",
+            api_version="2024-02-01",
+            temperature=0.5,
+            api_key="azure-key",
+        )
+
+    @patch("langchain_openai.AzureChatOpenAI")
+    def test_tools_use_bind_tools(self, MockAzureChatOpenAI, sample_messages, sample_tools):
+        from birdie.core.llm_provider import AzureOpenAIProvider
+        mock_llm = self._make_mock_azure_llm()
+        MockAzureChatOpenAI.return_value = mock_llm
+        provider = AzureOpenAIProvider(
+            model="my-gpt4o-deployment",
+            base_url="https://my-resource.openai.azure.com/",
+        )
+        provider.chat(sample_messages, tools=sample_tools)
+        mock_llm.bind_tools.assert_called_once()
+
+    @patch("langchain_openai.AzureChatOpenAI")
+    def test_env_var_fallback(self, MockAzureChatOpenAI, monkeypatch):
+        from birdie.core.llm_provider import AzureOpenAIProvider
+        MockAzureChatOpenAI.return_value = self._make_mock_azure_llm()
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "env-key")
+        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://env-resource.openai.azure.com/")
+        AzureOpenAIProvider(model="my-deployment")
+        call_kw = MockAzureChatOpenAI.call_args[1]
+        assert call_kw["api_key"] == "env-key"
+        assert call_kw["azure_endpoint"] == "https://env-resource.openai.azure.com/"
+
+
+# ---------------------------------------------------------------------------
 # get_llm_provider factory
 # ---------------------------------------------------------------------------
 
