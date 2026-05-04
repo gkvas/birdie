@@ -75,3 +75,9 @@ def test_list_tools_with_filters(sample_skill):
     # Test empty filtering
     tools = registry.list_tools(tags=["nonexistent"])
     assert len(tools) == 0
+
+    # Empty skill_names list must return zero tools, not all tools.
+    # All built-in skills have enabled_by_default=False, so allowed is often
+    # an empty set; list_tools(skill_names=[]) must honour that constraint.
+    tools = registry.list_tools(skill_names=[])
+    assert len(tools) == 0

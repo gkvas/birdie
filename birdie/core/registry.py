@@ -137,7 +137,7 @@ class SkillRegistry:
                     tag_filtered.update(self._tags_index[tag])
             tool_names.intersection_update(tag_filtered)
 
-        if skill_names:
+        if skill_names is not None:
             skill_filtered: Set[str] = set()
             for skill_name in skill_names:
                 if skill_name in self._skills:
