@@ -237,6 +237,35 @@ class LLMProvider(ABC):
         """Active model identifier."""
         return getattr(self, "_model", "unknown")
 
+    # -- traffic logging helpers --------------------------------------------
+
+    def _log_request(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None,
+        system_prompt: str | None = None,
+    ) -> None:
+        if not log.isEnabledFor(logging.DEBUG):
+            return
+        tool_names = [t["name"] for t in (tools or [])]
+        last_human = next(
+            (str(m.content) for m in reversed(messages) if isinstance(m, HumanMessage)),
+            "",
+        )
+        log.debug(
+            "REQUEST  model=%s  messages=%d  tools=%s\n  last_user: %s",
+            self.model_name, len(messages), tool_names, last_human[:2000],
+        )
+
+    def _log_response(self, msg: BaseMessage) -> None:
+        if not log.isEnabledFor(logging.DEBUG):
+            return
+        tc = [tc["name"] for tc in getattr(msg, "tool_calls", [])]
+        log.debug(
+            "RESPONSE  model=%s  tool_calls=%s\n  content: %s",
+            self.model_name, tc, str(msg.content)[:2000],
+        )
+
 
 # ---------------------------------------------------------------------------
 # OpenAI-compatible message conversion helpers
@@ -441,8 +470,11 @@ class _OpenAICompatibleProvider(LLMProvider):
         **kwargs: Any,
     ) -> BaseMessage:
         kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens, json_mode)
+        self._log_request(messages, tools, system_prompt)
         response = self._client.chat.completions.create(**kw)
-        return _openai_msg_to_lc(response.choices[0].message, response.usage)
+        result = _openai_msg_to_lc(response.choices[0].message, response.usage)
+        self._log_response(result)
+        return result
 
     async def achat(
         self,
@@ -455,8 +487,11 @@ class _OpenAICompatibleProvider(LLMProvider):
         **kwargs: Any,
     ) -> BaseMessage:
         kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens, json_mode)
+        self._log_request(messages, tools, system_prompt)
         response = await self._async_client.chat.completions.create(**kw)
-        return _openai_msg_to_lc(response.choices[0].message, response.usage)
+        result = _openai_msg_to_lc(response.choices[0].message, response.usage)
+        self._log_response(result)
+        return result
 
     def stream_chat(
         self,
@@ -632,8 +667,11 @@ class MistralProvider(LLMProvider):
         **kwargs: Any,
     ) -> BaseMessage:
         kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens, json_mode)
+        self._log_request(messages, tools, system_prompt)
         response = self._client.chat.complete(**kw)
-        return _openai_msg_to_lc(response.choices[0].message, response.usage)
+        result = _openai_msg_to_lc(response.choices[0].message, response.usage)
+        self._log_response(result)
+        return result
 
     async def achat(
         self,
@@ -646,8 +684,11 @@ class MistralProvider(LLMProvider):
         **kwargs: Any,
     ) -> BaseMessage:
         kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens, json_mode)
+        self._log_request(messages, tools, system_prompt)
         response = await self._client.chat.complete_async(**kw)
-        return _openai_msg_to_lc(response.choices[0].message, response.usage)
+        result = _openai_msg_to_lc(response.choices[0].message, response.usage)
+        self._log_response(result)
+        return result
 
     def stream_chat(
         self,
@@ -856,8 +897,11 @@ class AnthropicProvider(LLMProvider):
         **kwargs: Any,
     ) -> BaseMessage:
         kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens)
+        self._log_request(messages, tools, system_prompt)
         response = self._client.messages.create(**kw)
-        return _anthropic_response_to_lc(response)
+        result = _anthropic_response_to_lc(response)
+        self._log_response(result)
+        return result
 
     async def achat(
         self,
@@ -870,8 +914,11 @@ class AnthropicProvider(LLMProvider):
         **kwargs: Any,
     ) -> BaseMessage:
         kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens)
+        self._log_request(messages, tools, system_prompt)
         response = await self._async_client.messages.create(**kw)
-        return _anthropic_response_to_lc(response)
+        result = _anthropic_response_to_lc(response)
+        self._log_response(result)
+        return result
 
     def stream_chat(
         self,
@@ -966,7 +1013,10 @@ class LangChainProvider(LLMProvider):
         **kwargs: Any,
     ) -> BaseMessage:
         msgs = self._inject_system(messages, system_prompt)
-        return self._with_tools(tools).invoke(msgs)
+        self._log_request(messages, tools, system_prompt)
+        result = self._with_tools(tools).invoke(msgs)
+        self._log_response(result)
+        return result
 
     async def achat(
         self,
@@ -979,7 +1029,10 @@ class LangChainProvider(LLMProvider):
         **kwargs: Any,
     ) -> BaseMessage:
         msgs = self._inject_system(messages, system_prompt)
-        return await self._with_tools(tools).ainvoke(msgs)
+        self._log_request(messages, tools, system_prompt)
+        result = await self._with_tools(tools).ainvoke(msgs)
+        self._log_response(result)
+        return result
 
     def stream_chat(
         self,
@@ -1358,11 +1411,13 @@ class ACPProvider(LLMProvider):
         try:
             session_id = await self._async_initialize_session(proc)
 
+            prompt_text = self._last_user_text(messages, system_prompt)
+            log.debug("REQUEST  acp=%s\n  prompt: %s", self._command[0], prompt_text[:2000])
             await self._async_send(proc.stdin, {
                 "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
                 "params": {
                     "sessionId": session_id,
-                    "prompt": self._prompt_blocks(self._last_user_text(messages, system_prompt)),
+                    "prompt": self._prompt_blocks(prompt_text),
                 },
             })
 
@@ -1370,7 +1425,9 @@ class ACPProvider(LLMProvider):
             while True:
                 msg = await self._async_recv(proc.stdout)
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
-                    return AIMessage(content="".join(text_parts))
+                    result = AIMessage(content="".join(text_parts))
+                    log.debug("RESPONSE  acp=%s\n  content: %s", self._command[0], result.content[:2000])
+                    return result
                 if "id" in msg and "method" in msg:
                     await self._async_handle_agent_request(proc.stdin, msg)
                 elif "method" in msg and "id" not in msg:

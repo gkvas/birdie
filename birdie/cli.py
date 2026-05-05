@@ -15,10 +15,15 @@ Entry point: ``birdie`` console script → :func:`main`.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional
+
+import httpx
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
@@ -59,6 +64,12 @@ HELP_TEXT = """
   [yellow]/skill enable <name>[/yellow]          Enable a skill (persists to session)
   [yellow]/skill disable <name>[/yellow]         Disable a skill (persists to session)
 
+  [bold]Logging commands[/bold]
+  [yellow]/log llm on[/yellow]                  Enable LLM request/response logging to ~/.birdie/llm.log
+  [yellow]/log llm off[/yellow]                 Disable LLM logging
+  [yellow]/log http on[/yellow]                 Enable raw HTTP traffic logging to ~/.birdie/http.log
+  [yellow]/log http off[/yellow]                Disable HTTP logging
+
   [bold]Session commands[/bold]
   [yellow]/session new[/yellow]                  Create a new session and switch to it
   [yellow]/session switch <id>[/yellow]          Switch to an existing session
@@ -90,6 +101,9 @@ class BirdieCLI:
         self._total_out: int = 0
         self._last_context: int = 0
         self._tool_output_mode: str = "short"
+        self._llm_log_handler: Optional[logging.FileHandler] = None
+        self._orig_async_send = None
+        self._orig_sync_send = None
 
         # Apply stored skill grants for the initial session
         self._apply_session_policy(session)
@@ -241,6 +255,113 @@ class BirdieCLI:
                 expand=False,
             ))
 
+    # -- logging --------------------------------------------------------------
+
+    def _handle_log(self, arg: str) -> None:
+        """Handle /log sub-commands."""
+        parts = arg.strip().split()
+        subcmd = parts[0].lower() if parts else ""
+        subarg = parts[1].lower() if len(parts) > 1 else ""
+
+        if subcmd == "llm":
+            if subarg == "on":
+                self._llm_log_on()
+            elif subarg == "off":
+                self._llm_log_off()
+            else:
+                self.console.print("[red]Usage: /log llm on|off[/red]")
+        elif subcmd == "http":
+            if subarg == "on":
+                self._http_log_on()
+            elif subarg == "off":
+                self._http_log_off()
+            else:
+                self.console.print("[red]Usage: /log http on|off[/red]")
+        else:
+            self.console.print("[red]Usage: /log llm|http on|off[/red]")
+
+    def _llm_log_on(self) -> None:
+        if self._llm_log_handler:
+            self.console.print("[dim]LLM logging is already on.[/dim]")
+            return
+        log_path = Path.home() / ".birdie" / "llm.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handler = logging.FileHandler(str(log_path))
+        handler.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
+        logger = logging.getLogger("birdie.core.llm_provider")
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        self._llm_log_handler = handler
+        self.console.print(f"[dim]LLM logging on → [bold]{log_path}[/bold][/dim]")
+
+    def _llm_log_off(self) -> None:
+        if not self._llm_log_handler:
+            self.console.print("[dim]LLM logging is already off.[/dim]")
+            return
+        logger = logging.getLogger("birdie.core.llm_provider")
+        logger.removeHandler(self._llm_log_handler)
+        self._llm_log_handler.close()
+        self._llm_log_handler = None
+        self.console.print("[dim]LLM logging off.[/dim]")
+
+    def _http_log_on(self) -> None:
+        if self._orig_async_send is not None:
+            self.console.print("[dim]HTTP logging is already on.[/dim]")
+            return
+        log_path = Path.home() / ".birdie" / "http.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = str(log_path)
+
+        def _write(label: str, headline: str, body: str) -> None:
+            ts = time.strftime("%H:%M:%S")
+            try:
+                body = json.dumps(json.loads(body), indent=2)
+            except Exception:
+                pass
+            with open(log_file, "a") as f:
+                f.write(f"\n{ts} {label} {headline}\n{body}\n")
+
+        orig_async = httpx.AsyncClient.send
+        orig_sync = httpx.Client.send
+        self._orig_async_send = orig_async
+        self._orig_sync_send = orig_sync
+
+        async def _async_send(client_self, request, **kwargs):
+            req_body = request.content.decode("utf-8", errors="replace")
+            _write(">>", f"{request.method} {request.url}", req_body)
+            response = await orig_async(client_self, request, **kwargs)
+            if not kwargs.get("stream", False):
+                _write("<<", str(response.status_code),
+                       response.content.decode("utf-8", errors="replace"))
+            else:
+                _write("<<", str(response.status_code), "(streaming)")
+            return response
+
+        def _sync_send(client_self, request, **kwargs):
+            req_body = request.content.decode("utf-8", errors="replace")
+            _write(">>", f"{request.method} {request.url}", req_body)
+            response = orig_sync(client_self, request, **kwargs)
+            if not kwargs.get("stream", False):
+                _write("<<", str(response.status_code),
+                       response.content.decode("utf-8", errors="replace"))
+            else:
+                _write("<<", str(response.status_code), "(streaming)")
+            return response
+
+        httpx.AsyncClient.send = _async_send
+        httpx.Client.send = _sync_send
+        self.console.print(f"[dim]HTTP logging on → [bold]{log_path}[/bold][/dim]")
+
+    def _http_log_off(self) -> None:
+        if self._orig_async_send is None:
+            self.console.print("[dim]HTTP logging is already off.[/dim]")
+            return
+        httpx.AsyncClient.send = self._orig_async_send
+        httpx.Client.send = self._orig_sync_send
+        self._orig_async_send = None
+        self._orig_sync_send = None
+        self.console.print("[dim]HTTP logging off.[/dim]")
+
     # -- slash command handler ------------------------------------------------
 
     def _handle_tool(self, arg: str) -> None:
@@ -255,7 +376,7 @@ class BirdieCLI:
         elif subcmd == "output":
             if subarg not in _TOOL_OUTPUT_MODES:
                 self.console.print(
-                    f"[red]Usage: /tool output full|short|off[/red]"
+                    "[red]Usage: /tool output full|short|off[/red]"
                 )
             else:
                 self._tool_output_mode = subarg
@@ -409,6 +530,9 @@ class BirdieCLI:
             new_session = self.session_manager.create(self.user_id)
             self._switch_session(new_session)
 
+        elif cmd == "/log":
+            self._handle_log(arg)
+
         elif cmd == "/tool":
             self._handle_tool(arg)
 
@@ -421,7 +545,7 @@ class BirdieCLI:
             else:
                 self.user_memory.add(arg)
                 self.session_manager.save_user_memory(self.user_memory)
-                self.console.print(f"[dim]Remembered.[/dim]")
+                self.console.print("[dim]Remembered.[/dim]")
 
         elif cmd == "/info":
             self._show_info()
