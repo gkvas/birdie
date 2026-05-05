@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -42,7 +43,10 @@ from .core.models import Skill
 from .core.session import Session, SessionManager, UserMemory
 
 
-PROMPT_STYLE = Style.from_dict({"prompt": "ansicyan bold"})
+PROMPT_STYLE = Style.from_dict({
+    "prompt": "ansicyan bold",
+    "ctrlc-hint": "#888888",
+})
 
 HELP_TEXT = """
 [bold cyan]Birdie CLI - available slash commands[/bold cyan]
@@ -108,12 +112,21 @@ class BirdieCLI:
         # Apply stored skill grants for the initial session
         self._apply_session_policy(session)
 
+        self._ctrl_c_warned: bool = False
+
         kb = KeyBindings()
 
         @kb.add("c-c")
-        def _quit(event):
-            """Ctrl+C exits Birdie."""
-            event.app.exit(result=None, exception=SystemExit(0))
+        def _ctrl_c(event):
+            buf = event.current_buffer
+            if buf.text:
+                buf.reset()
+                self._ctrl_c_warned = False
+            elif self._ctrl_c_warned:
+                event.app.exit(result=None, exception=SystemExit(0))
+            else:
+                self._ctrl_c_warned = True
+                event.app.invalidate()
 
         @kb.add("c-j")
         def _newline(event):
@@ -138,6 +151,26 @@ class BirdieCLI:
             self.agent.enable_skill_for_user(session.id, skill)
         for skill in session.disabled_skills:
             self.agent.disable_skill_for_user(session.id, skill)
+
+    def _get_prompt(self):
+        if self._ctrl_c_warned:
+            return [
+                ("class:prompt", "you> "),
+                ("class:ctrlc-hint", "Press Ctrl+C again to exit, or type new instructions to continue"),
+            ]
+        return [("class:prompt", "you> ")]
+
+    def _pre_run(self):
+        from prompt_toolkit.application import get_app
+        app = get_app()
+        buf = app.current_buffer
+
+        def _on_changed(_):
+            if self._ctrl_c_warned and buf.text:
+                self._ctrl_c_warned = False
+                app.invalidate()
+
+        buf.on_text_changed += _on_changed
 
     def _switch_session(self, session: Session) -> None:
         """Replace the active session, apply its policy, and refresh the display."""
@@ -642,8 +675,10 @@ class BirdieCLI:
         while True:
             try:
                 user_input = await self.session_prompt.prompt_async(
-                    [("class:prompt", "you> ")],
+                    self._get_prompt,
+                    pre_run=self._pre_run,
                 )
+                self._ctrl_c_warned = False
             except SystemExit:
                 self.console.print("[dim]Goodbye.[/dim]")
                 return
@@ -661,13 +696,20 @@ class BirdieCLI:
                 self._handle_slash(user_input)
                 continue
 
+            loop = asyncio.get_running_loop()
+            task = loop.create_task(self._stream_turn(user_input))
+            loop.add_signal_handler(signal.SIGINT, task.cancel)
             try:
-                await self._stream_turn(user_input)
+                await task
+            except asyncio.CancelledError:
+                self.console.print("\n[dim]Interrupted.[/dim]")
             except Exception as exc:
                 self.console.print(
                     f"[red bold]Error:[/red bold] {type(exc).__name__}: {exc}"
                 )
                 self.console.print_exception(show_locals=False)
+            finally:
+                loop.remove_signal_handler(signal.SIGINT)
 
 
 def main() -> None:

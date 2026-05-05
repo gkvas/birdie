@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.7] - 2026-05-05
+
+### Added
+- `/log llm on|off` - attach a file handler to the `birdie.core.llm_provider`
+  logger; every request (model, message count, last user text) and response
+  (content, tool calls) is written to `~/.birdie/llm.log`
+- `/log http on|off` - monkey-patch `httpx.AsyncClient.send` /
+  `httpx.Client.send` to capture full JSON request and response bodies to
+  `~/.birdie/http.log`; streaming responses are noted but not reassembled
+  (ACP traffic uses stdio, so use `/log llm` for that provider instead)
+
+### Changed
+- Ctrl+C behaviour overhauled:
+  - Ctrl+C with text in the input line clears the line (standard shell
+    behaviour) instead of exiting
+  - Ctrl+C on an empty line shows a grey inline hint ("Press Ctrl+C again to
+    exit, or type new instructions to continue"); typing any character dismisses
+    it; a second Ctrl+C exits
+  - Ctrl+C while the agent is thinking or executing a tool cancels the active
+    `asyncio.Task` and returns immediately to the `you>` prompt, printing
+    "Interrupted."
+
 ## [0.2.5] - 2026-05-04
 
 ### Changed
