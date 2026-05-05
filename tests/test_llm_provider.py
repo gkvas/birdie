@@ -358,9 +358,17 @@ class TestAzureOpenAIProvider:
 class TestACPProvider:
 
     def _make_proc(self, *response_lines):
-        """Return a mock Popen process whose stdout yields the given JSON-RPC lines."""
-        initialized = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-02-24"}}) + "\n"
-        lines = [initialized.encode()] + [(json.dumps(r) + "\n").encode() for r in response_lines]
+        """Return a mock Popen whose stdout yields initialize + session/new + response lines."""
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "test-agent", "version": "1.0.0"}, "agentCapabilities": {}},
+        }) + "\n"
+        session_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "result": {"sessionId": "sess_test123"},
+        }) + "\n"
+        lines = [init_resp.encode(), session_resp.encode()] + [
+            (json.dumps(r) + "\n").encode() for r in response_lines
+        ]
         mock_proc = MagicMock()
         mock_proc.stdin = MagicMock()
         mock_proc.stderr = MagicMock()
@@ -368,15 +376,18 @@ class TestACPProvider:
         mock_proc.wait.return_value = 0
         return mock_proc
 
-    def _run_result(self, text="Hello from ACP"):
-        return {"jsonrpc": "2.0", "id": 2, "result": {
-            "output": [{"role": "assistant", "content": [{"type": "text", "text": text}]}],
-            "status": "completed",
+    def _chunk_notification(self, text):
+        return {"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "sess_test123",
+            "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}},
         }}
+
+    def _prompt_result(self):
+        return {"jsonrpc": "2.0", "id": 2, "result": {"stopReason": "end_turn"}}
 
     def test_chat(self, sample_messages):
         from birdie.core.llm_provider import ACPProvider
-        mock_proc = self._make_proc(self._run_result("Hi there"))
+        mock_proc = self._make_proc(self._chunk_notification("Hi there"), self._prompt_result())
         with patch("subprocess.Popen", return_value=mock_proc):
             provider = ACPProvider(command="claude-agent-acp")
             result = provider.chat(sample_messages)
@@ -385,20 +396,23 @@ class TestACPProvider:
 
     def test_chat_sends_correct_rpc(self, sample_messages):
         from birdie.core.llm_provider import ACPProvider
-        mock_proc = self._make_proc(self._run_result())
+        mock_proc = self._make_proc(self._prompt_result())
         with patch("subprocess.Popen", return_value=mock_proc):
             provider = ACPProvider(command="claude-agent-acp")
             provider.chat(sample_messages, system_prompt="Be helpful")
-        # Second write call is the runs/create; decode and check payload
         calls = mock_proc.stdin.write.call_args_list
-        run_msg = json.loads(calls[1][0][0].decode())
-        assert run_msg["method"] == "runs/create"
-        roles = [m["role"] for m in run_msg["params"]["input"]]
-        assert roles[0] == "system"
+        # calls[0]=initialize, calls[1]=session/new, calls[2]=session/prompt
+        assert json.loads(calls[0][0][0].decode())["method"] == "initialize"
+        assert json.loads(calls[1][0][0].decode())["method"] == "session/new"
+        prompt_msg = json.loads(calls[2][0][0].decode())
+        assert prompt_msg["method"] == "session/prompt"
+        blocks = prompt_msg["params"]["prompt"]
+        text = blocks[0]["text"]
+        assert "Be helpful" in text
 
-    def test_chat_message_conversion(self):
+    def test_chat_sends_last_human_message(self):
         from birdie.core.llm_provider import ACPProvider
-        mock_proc = self._make_proc(self._run_result())
+        mock_proc = self._make_proc(self._prompt_result())
         with patch("subprocess.Popen", return_value=mock_proc):
             provider = ACPProvider(command="claude-agent-acp")
             provider.chat(
@@ -406,9 +420,11 @@ class TestACPProvider:
                 system_prompt="Be helpful",
             )
         calls = mock_proc.stdin.write.call_args_list
-        run_msg = json.loads(calls[1][0][0].decode())
-        roles = [m["role"] for m in run_msg["params"]["input"]]
-        assert roles == ["system", "user", "assistant", "user"]
+        prompt_msg = json.loads(calls[2][0][0].decode())
+        blocks = prompt_msg["params"]["prompt"]
+        text = blocks[0]["text"]
+        assert "Follow up" in text
+        assert "Be helpful" in text
 
     def test_list_models(self):
         from birdie.core.llm_provider import ACPProvider
@@ -422,12 +438,14 @@ class TestACPProvider:
         assert provider.supports_streaming() is True
         assert provider.supports_json_mode() is False
 
-    def test_extract_delta_text(self):
+    def test_extract_chunk_text(self):
         from birdie.core.llm_provider import ACPProvider
         provider = ACPProvider(command="claude-agent-acp")
-        params = {"delta": {"content": [{"type": "text", "text": "chunk"}]}}
-        assert provider._extract_delta_text(params) == "chunk"
-        assert provider._extract_delta_text({}) is None
+        params = {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "chunk"}}}
+        assert provider._extract_chunk_text(params) == "chunk"
+        assert provider._extract_chunk_text({}) is None
+        params2 = {"update": {"sessionUpdate": "tool_call_update"}}
+        assert provider._extract_chunk_text(params2) is None
 
     @patch("birdie.core.llm_provider.ACPProvider.__init__", return_value=None)
     def test_acp_vendor_factory(self, mock_init):

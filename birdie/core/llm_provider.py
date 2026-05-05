@@ -1063,10 +1063,19 @@ class ACPProvider(LLMProvider):
     via stdin/stdout using newline-delimited JSON-RPC 2.0 messages.  No
     network server is required - the binary is started on demand.
 
+    The protocol follows three mandatory phases per turn:
+      1. initialize  - negotiate protocol version
+      2. session/new - create a session, receive sessionId
+      3. session/prompt - send user message, receive streaming updates + final response
+
+    The provider also handles incoming requests from the agent:
+      - session/request_permission -> auto-allow
+      - fs/read_text_file / fs/write_text_file -> perform local I/O
+      - terminal/create -> run the command and return output
+
     - ``command`` - binary to spawn, e.g. ``"claude-agent-acp"`` (maps from
       the ``model`` config field).  Accepts a string or a list for extra args.
-
-    The inner agent runs its own tool loop; birdie tools are not passed through.
+    - ``cwd`` - working directory reported to the agent (defaults to os.getcwd()).
 
     Example config::
 
@@ -1075,14 +1084,16 @@ class ACPProvider(LLMProvider):
     The binary must be on PATH (e.g. ``npm install -g @agentclientprotocol/claude-agent-acp``).
     """
 
-    _PROTOCOL_VERSION = "2025-02-24"
+    _PROTOCOL_VERSION = 1  # integer, as specified by the ACP protocol
 
     def __init__(
         self,
         command: str | list[str] = "claude-agent-acp",
+        cwd: str | None = None,
         **kwargs: Any,
     ) -> None:
         self._command = [command] if isinstance(command, str) else list(command)
+        self._cwd = cwd or os.getcwd()
 
     def supports_tools(self) -> bool:
         return False
@@ -1095,46 +1106,44 @@ class ACPProvider(LLMProvider):
 
     # -- message helpers ----------------------------------------------------
 
-    def _to_acp_input(
+    def _last_user_text(
         self,
         messages: list[BaseMessage],
         system_prompt: str | None,
-    ) -> list[dict]:
-        result = []
-        if system_prompt:
-            result.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
-        for msg in messages:
-            if isinstance(msg, SystemMessage):
-                role = "system"
-            elif isinstance(msg, HumanMessage):
-                role = "user"
-            elif isinstance(msg, AIMessage):
-                role = "assistant"
-            else:
-                continue
-            text = msg.content if isinstance(msg.content, str) else str(msg.content)
-            result.append({"role": role, "content": [{"type": "text", "text": text}]})
-        return result
+    ) -> str:
+        """Extract the last human message, optionally prefixed with the system prompt."""
+        effective_system = system_prompt
+        if not effective_system:
+            for msg in messages:
+                if isinstance(msg, SystemMessage):
+                    effective_system = str(msg.content)
+                    break
 
-    def _extract_text(self, output: list[dict]) -> str:
-        for msg in reversed(output):
-            if msg.get("role") == "assistant":
-                return "".join(
-                    p.get("text", "")
-                    for p in msg.get("content", [])
-                    if p.get("type") == "text"
-                )
-        return ""
+        last_human = ""
+        for msg in reversed(messages):
+            if isinstance(msg, HumanMessage):
+                last_human = msg.content if isinstance(msg.content, str) else str(msg.content)
+                break
 
-    def _extract_delta_text(self, params: dict) -> str | None:
-        delta = params.get("delta", {})
-        if isinstance(delta, dict):
-            for part in delta.get("content", []):
-                if part.get("type") == "text" and part.get("text"):
-                    return part["text"]
+        if effective_system:
+            return f"{effective_system}\n\n{last_human}"
+        return last_human
+
+    def _prompt_blocks(self, text: str) -> list:
+        """Build the ACP content blocks array for session/prompt."""
+        return [{"type": "text", "text": text}]
+
+    def _extract_chunk_text(self, params: dict) -> str | None:
+        """Extract text from an agent_message_chunk session/update notification."""
+        update = params.get("update", {})
+        if update.get("sessionUpdate") != "agent_message_chunk":
+            return None
+        content = update.get("content", {})
+        if isinstance(content, dict) and content.get("type") == "text":
+            return content.get("text") or None
         return None
 
-    # -- sync (subprocess) --------------------------------------------------
+    # -- sync low-level -----------------------------------------------------
 
     def _sync_send(self, stdin: Any, msg: dict) -> None:
         stdin.write((json.dumps(msg) + "\n").encode())
@@ -1145,6 +1154,48 @@ class ACPProvider(LLMProvider):
         if not line:
             raise EOFError("ACP subprocess closed stdout unexpectedly")
         return json.loads(line.decode())
+
+    def _sync_handle_agent_request(self, stdin: Any, msg: dict) -> None:
+        """Respond to an incoming JSON-RPC request from the agent (sync)."""
+        method = msg.get("method", "")
+        req_id = msg["id"]
+        params = msg.get("params", {})
+
+        if method == "session/request_permission":
+            self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id, "result": {"optionId": "allow"}})
+
+        elif method == "fs/read_text_file":
+            try:
+                content = Path(params["path"]).read_text()
+                self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id, "result": {"content": content}})
+            except Exception as exc:
+                self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                        "error": {"code": -32000, "message": str(exc)}})
+
+        elif method == "fs/write_text_file":
+            try:
+                Path(params["path"]).write_text(params.get("content", ""))
+                self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id, "result": {}})
+            except Exception as exc:
+                self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                        "error": {"code": -32000, "message": str(exc)}})
+
+        elif method == "terminal/create":
+            try:
+                proc = subprocess.run(
+                    params.get("command", ""), shell=True, capture_output=True,
+                    text=True, cwd=params.get("cwd", self._cwd), timeout=60,
+                )
+                output = proc.stdout + proc.stderr
+                self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                        "result": {"terminalId": "term_001", "output": output}})
+            except Exception as exc:
+                self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                        "error": {"code": -32000, "message": str(exc)}})
+
+        else:
+            self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                    "error": {"code": -32601, "message": f"Method not found: {method}"}})
 
     def chat(
         self,
@@ -1160,16 +1211,45 @@ class ACPProvider(LLMProvider):
             stderr=subprocess.PIPE,
         )
         try:
-            self._sync_send(proc.stdin, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                                         "params": {"protocolVersion": self._PROTOCOL_VERSION}})
-            self._sync_recv(proc.stdout)  # initialized
+            # Phase 1: initialize
+            self._sync_send(proc.stdin, {
+                "jsonrpc": "2.0", "id": 0, "method": "initialize",
+                "params": {
+                    "protocolVersion": self._PROTOCOL_VERSION,
+                    "clientInfo": {"name": "birdie", "version": "0.2.5"},
+                    "clientCapabilities": {},
+                },
+            })
+            self._sync_recv(proc.stdout)  # consume initialize response
 
-            self._sync_send(proc.stdin, {"jsonrpc": "2.0", "id": 2, "method": "runs/create",
-                                         "params": {"input": self._to_acp_input(messages, system_prompt)}})
+            # Phase 2: session/new
+            self._sync_send(proc.stdin, {
+                "jsonrpc": "2.0", "id": 1, "method": "session/new",
+                "params": {"cwd": self._cwd, "mcpServers": []},
+            })
+            session_resp = self._sync_recv(proc.stdout)
+            session_id = session_resp.get("result", {}).get("sessionId", "")
+
+            # Phase 3: session/prompt
+            self._sync_send(proc.stdin, {
+                "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": self._prompt_blocks(self._last_user_text(messages, system_prompt)),
+                },
+            })
+
+            text_parts: list[str] = []
             while True:
                 msg = self._sync_recv(proc.stdout)
-                if msg.get("id") == 2:
-                    return AIMessage(content=self._extract_text(msg.get("result", {}).get("output", [])))
+                if "id" in msg and msg.get("id") == 2 and "result" in msg:
+                    return AIMessage(content="".join(text_parts))
+                if "id" in msg and "method" in msg:
+                    self._sync_handle_agent_request(proc.stdin, msg)
+                elif "method" in msg and "id" not in msg:
+                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    if chunk:
+                        text_parts.append(chunk)
         finally:
             try:
                 proc.stdin.close()
@@ -1186,17 +1266,81 @@ class ACPProvider(LLMProvider):
     ) -> Iterator[BaseMessage]:
         yield self.chat(messages, system_prompt=system_prompt)
 
-    # -- async (asyncio subprocess) -----------------------------------------
+    # -- async low-level ----------------------------------------------------
 
     async def _async_send(self, stdin: Any, msg: dict) -> None:
         stdin.write((json.dumps(msg) + "\n").encode())
         await stdin.drain()
 
-    async def _async_recv(self, stdout: Any) -> dict:
-        line = await stdout.readline()
+    async def _async_recv(self, stdout: Any, timeout: float = 300.0) -> dict:
+        line = await asyncio.wait_for(stdout.readline(), timeout=timeout)
         if not line:
             raise EOFError("ACP subprocess closed stdout unexpectedly")
         return json.loads(line.decode())
+
+    async def _async_handle_agent_request(self, stdin: Any, msg: dict) -> None:
+        """Respond to an incoming JSON-RPC request from the agent (async)."""
+        method = msg.get("method", "")
+        req_id = msg["id"]
+        params = msg.get("params", {})
+
+        if method == "session/request_permission":
+            await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id, "result": {"optionId": "allow"}})
+
+        elif method == "fs/read_text_file":
+            try:
+                content = Path(params["path"]).read_text()
+                await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id, "result": {"content": content}})
+            except Exception as exc:
+                await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                               "error": {"code": -32000, "message": str(exc)}})
+
+        elif method == "fs/write_text_file":
+            try:
+                Path(params["path"]).write_text(params.get("content", ""))
+                await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id, "result": {}})
+            except Exception as exc:
+                await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                               "error": {"code": -32000, "message": str(exc)}})
+
+        elif method == "terminal/create":
+            try:
+                p = await asyncio.create_subprocess_shell(
+                    params.get("command", ""),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=params.get("cwd", self._cwd),
+                )
+                out, err = await asyncio.wait_for(p.communicate(), timeout=60)
+                output = (out or b"").decode() + (err or b"").decode()
+                await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                               "result": {"terminalId": "term_001", "output": output}})
+            except Exception as exc:
+                await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                               "error": {"code": -32000, "message": str(exc)}})
+
+        else:
+            await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                           "error": {"code": -32601, "message": f"Method not found: {method}"}})
+
+    async def _async_initialize_session(self, proc: Any) -> str:
+        """Run Phase 1 + Phase 2; return the sessionId."""
+        await self._async_send(proc.stdin, {
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": self._PROTOCOL_VERSION,
+                "clientInfo": {"name": "birdie", "version": "0.2.5"},
+                "clientCapabilities": {},
+            },
+        })
+        await self._async_recv(proc.stdout, timeout=30)
+
+        await self._async_send(proc.stdin, {
+            "jsonrpc": "2.0", "id": 1, "method": "session/new",
+            "params": {"cwd": self._cwd, "mcpServers": []},
+        })
+        session_resp = await self._async_recv(proc.stdout, timeout=30)
+        return session_resp.get("result", {}).get("sessionId", "")
 
     async def achat(
         self,
@@ -1212,16 +1356,27 @@ class ACPProvider(LLMProvider):
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            await self._async_send(proc.stdin, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                                                 "params": {"protocolVersion": self._PROTOCOL_VERSION}})
-            await asyncio.wait_for(self._async_recv(proc.stdout), timeout=30)
+            session_id = await self._async_initialize_session(proc)
 
-            await self._async_send(proc.stdin, {"jsonrpc": "2.0", "id": 2, "method": "runs/create",
-                                                 "params": {"input": self._to_acp_input(messages, system_prompt)}})
+            await self._async_send(proc.stdin, {
+                "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": self._prompt_blocks(self._last_user_text(messages, system_prompt)),
+                },
+            })
+
+            text_parts: list[str] = []
             while True:
-                msg = await asyncio.wait_for(self._async_recv(proc.stdout), timeout=300)
-                if msg.get("id") == 2:
-                    return AIMessage(content=self._extract_text(msg.get("result", {}).get("output", [])))
+                msg = await self._async_recv(proc.stdout)
+                if "id" in msg and msg.get("id") == 2 and "result" in msg:
+                    return AIMessage(content="".join(text_parts))
+                if "id" in msg and "method" in msg:
+                    await self._async_handle_agent_request(proc.stdin, msg)
+                elif "method" in msg and "id" not in msg:
+                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    if chunk:
+                        text_parts.append(chunk)
         finally:
             proc.stdin.close()
             await proc.wait()
@@ -1240,23 +1395,26 @@ class ACPProvider(LLMProvider):
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            await self._async_send(proc.stdin, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                                                 "params": {"protocolVersion": self._PROTOCOL_VERSION}})
-            await asyncio.wait_for(self._async_recv(proc.stdout), timeout=30)
+            session_id = await self._async_initialize_session(proc)
 
-            await self._async_send(proc.stdin, {"jsonrpc": "2.0", "id": 2, "method": "runs/create",
-                                                 "params": {"input": self._to_acp_input(messages, system_prompt)}})
+            await self._async_send(proc.stdin, {
+                "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": self._prompt_blocks(self._last_user_text(messages, system_prompt)),
+                },
+            })
+
             while True:
-                msg = await asyncio.wait_for(self._async_recv(proc.stdout), timeout=300)
-                if msg.get("id") == 2:
-                    text = self._extract_text(msg.get("result", {}).get("output", []))
-                    if text:
-                        yield AIMessageChunk(content=text)
+                msg = await self._async_recv(proc.stdout)
+                if "id" in msg and msg.get("id") == 2 and "result" in msg:
                     break
-                if "method" in msg:
-                    text = self._extract_delta_text(msg.get("params", {}))
-                    if text:
-                        yield AIMessageChunk(content=text)
+                if "id" in msg and "method" in msg:
+                    await self._async_handle_agent_request(proc.stdin, msg)
+                elif "method" in msg and "id" not in msg:
+                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    if chunk:
+                        yield AIMessageChunk(content=chunk)
         finally:
             proc.stdin.close()
             await proc.wait()
