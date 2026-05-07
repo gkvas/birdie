@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.8] - 2026-05-07
+
+### Added
+- Custom system prompt via `.birdie/system_prompt.md` - if the file exists in
+  the current working directory its contents are prepended to the system prompt
+  on every turn (Tier 0), before the skill catalog; re-read each turn so
+  changes take effect immediately without restarting Birdie
+
+### Fixed
+- Pass `config` to `ToolNode.ainvoke()` for correct LangGraph compatibility;
+  the previous call without `config` broke checkpointer context propagation in
+  newer LangGraph versions
+
 ## [0.2.7] - 2026-05-05
 
 ### Changed
