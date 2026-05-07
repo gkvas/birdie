@@ -263,7 +263,7 @@ def create_agent_graph(
         )
         tool_node = ToolNode(langchain_tools)
         try:
-            return await tool_node.ainvoke(state)
+            return await tool_node.ainvoke(state, config)
         except Exception as exc:
             # If the ToolNode itself raises before producing output, synthesize
             # error ToolMessages so the state stays balanced and the LLM can
