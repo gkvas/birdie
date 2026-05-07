@@ -28,8 +28,7 @@ import httpx
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
-from prompt_toolkit.completion import Completer, PathCompleter
-from prompt_toolkit.enums import CompleteStyle
+from prompt_toolkit.completion import PathCompleter, CompleteEvent
 from prompt_toolkit.document import Document as _PTDocument
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import HTML
@@ -89,21 +88,6 @@ HELP_TEXT = """
 _TOOL_OUTPUT_MODES = ("full", "short", "off")
 
 
-class _CdCompleter(Completer):
-    """Tab-completes directory paths for the /cd command."""
-
-    _PREFIX = "/cd "
-    _path = PathCompleter(only_directories=True, expanduser=True)
-
-    def get_completions(self, document, complete_event):
-        text = document.text_before_cursor
-        if not text.lower().startswith(self._PREFIX):
-            return
-        path_part = text[len(self._PREFIX):]
-        yield from self._path.get_completions(
-            _PTDocument(path_part, len(path_part)), complete_event
-        )
-
 
 class BirdieCLI:
     def __init__(
@@ -133,6 +117,8 @@ class BirdieCLI:
         self._apply_session_policy(session)
 
         self._ctrl_c_warned: bool = False
+        # State for /cd Tab cycling
+        self._cd_cycle: dict = {"completions": [], "index": -1, "path": None}
 
         kb = KeyBindings()
 
@@ -142,6 +128,7 @@ class BirdieCLI:
             if buf.text:
                 buf.reset()
                 self._ctrl_c_warned = False
+                self._cd_cycle["path"] = None
             elif self._ctrl_c_warned:
                 event.app.exit(result=None, exception=SystemExit(0))
             else:
@@ -153,13 +140,52 @@ class BirdieCLI:
             """Ctrl+J inserts a newline for multi-line input."""
             event.current_buffer.insert_text("\n")
 
+        _cd_completer = PathCompleter(only_directories=True, expanduser=True)
+
+        @kb.add("tab")
+        def _tab(event):
+            """Cycle through directory completions for /cd; do nothing otherwise."""
+            buf = event.current_buffer
+            text = buf.document.text_before_cursor
+            _CD_PREFIX = "/cd "
+            if not text.lower().startswith(_CD_PREFIX):
+                return
+            path_part = text[len(_CD_PREFIX):]
+            if path_part != self._cd_cycle["path"]:
+                # Path changed - ask PathCompleter for fresh matches
+                doc = _PTDocument(path_part, len(path_part))
+                raw = list(_cd_completer.get_completions(
+                    doc, CompleteEvent(completion_requested=True)
+                ))
+                if not raw:
+                    return
+                # Convert each Completion to the full path that would follow "/cd "
+                # PathCompleter yields: text=suffix, start_position=0 (append at cursor)
+                # or start_position<0 (replace last N chars).  The full path is:
+                # path_part[:len(path_part)+start_position] + completion.text + "/"
+                full_paths = [
+                    path_part[: len(path_part) + c.start_position] + c.text + "/"
+                    for c in raw
+                ]
+                self._cd_cycle["completions"] = full_paths
+                self._cd_cycle["index"] = 0
+                self._cd_cycle["path"] = path_part
+            else:
+                # Same prefix - advance to next match
+                n = len(self._cd_cycle["completions"])
+                if n == 0:
+                    return
+                self._cd_cycle["index"] = (self._cd_cycle["index"] + 1) % n
+            selected = self._cd_cycle["completions"][self._cd_cycle["index"]]
+            buf.delete_before_cursor(len(path_part))
+            buf.insert_text(selected)
+            # Track the inserted text so the next Tab advances rather than resets
+            self._cd_cycle["path"] = selected
+
         history_path = Path.home() / ".birdie_history"
         self.session_prompt: PromptSession = PromptSession(
             history=FileHistory(str(history_path)),
             auto_suggest=AutoSuggestFromHistory(),
-            completer=_CdCompleter(),
-            complete_while_typing=False,
-            complete_style=CompleteStyle.READLINE_LIKE,
             style=PROMPT_STYLE,
             key_bindings=kb,
             multiline=False,
