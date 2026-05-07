@@ -54,6 +54,7 @@ HELP_TEXT = """
   [yellow]/help[/yellow]                         Show this help
   [yellow]/quit[/yellow]  [yellow]/exit[/yellow]                 Exit the session
   [yellow]/new[/yellow]                          Start a fresh conversation (new thread)
+  [yellow]/cd <path>[/yellow]                    Change working directory (default: home)
   [yellow]/remember <text>[/yellow]              Save a note to long-term memory
   [yellow]/info[/yellow]                         Show session info (user, session, provider)
 
@@ -551,6 +552,22 @@ class BirdieCLI:
                 "[red]Usage: /session new | switch <id> | delete <id> | list | info[/red]"
             )
 
+    def _handle_cd(self, arg: str) -> None:
+        target = Path(arg.strip()).expanduser() if arg.strip() else Path.home()
+        try:
+            os.chdir(target)
+            try:
+                display = f"~/{Path.cwd().relative_to(Path.home())}"
+            except ValueError:
+                display = str(Path.cwd())
+            self.console.print(f"[dim]{display}[/dim]")
+        except FileNotFoundError:
+            self.console.print(f"[red]No such directory:[/red] {target}")
+        except NotADirectoryError:
+            self.console.print(f"[red]Not a directory:[/red] {target}")
+        except PermissionError:
+            self.console.print(f"[red]Permission denied:[/red] {target}")
+
     def _handle_slash(self, line: str) -> bool:
         """Return True if line was a slash command (handled here), False otherwise."""
         parts = line.strip().split(maxsplit=1)
@@ -591,6 +608,9 @@ class BirdieCLI:
 
         elif cmd == "/session":
             self._handle_session(arg)
+
+        elif cmd == "/cd":
+            self._handle_cd(arg)
 
         elif cmd == "/clear":
             self.console.clear()
