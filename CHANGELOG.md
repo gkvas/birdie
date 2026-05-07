@@ -2,6 +2,16 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.9] - 2026-05-07
+
+### Added
+- Working directory shown in the status bar (`~/...` notation when under home,
+  absolute path otherwise)
+- `/cd <path>` command to change the working directory; no argument goes to
+  home; supports `~` expansion and relative paths; errors reported inline
+- Tab completion for `/cd` path arguments - only directories, `~` expansion,
+  activated by Tab only (not while typing)
+
 ## [0.2.8] - 2026-05-07
 
 ### Added
