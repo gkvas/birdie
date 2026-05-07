@@ -187,8 +187,14 @@ class BirdieCLI:
         model  = self.agent.provider.model_name
         ctx    = f"{self._last_context:,}" if self._last_context else "-"
         spent  = f"↑{self._total_in:,}  ↓{self._total_out:,}"
+        try:
+            cwd = Path.cwd().relative_to(Path.home())
+            cwd_str = f"~/{cwd}"
+        except ValueError:
+            cwd_str = str(Path.cwd())
         return HTML(
             f" <b>{vendor}</b> · {model}"
+            f"   │   {cwd_str}"
             f"   │   session: {self.session.id}"
             f"   │   ctx: {ctx} tok"
             f"   │   spent: {spent} tok"
