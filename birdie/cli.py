@@ -29,7 +29,7 @@ import httpx
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, PathCompleter
-from prompt_toolkit.enums import CompleteStyle
+from prompt_toolkit.shortcuts import CompleteStyle
 from prompt_toolkit.document import Document as _PTDocument
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import HTML
