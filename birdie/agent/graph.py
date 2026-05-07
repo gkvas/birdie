@@ -20,6 +20,7 @@ owns and reconstructs it without any application-level serialization.
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import TypedDict, List, Annotated, Sequence, Tuple
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
@@ -91,22 +92,38 @@ def create_agent_graph(
         """Return the callable SkillTools for all allowed skills this turn."""
         return list(registry.list_tools(skill_names=list(_get_allowed(config))))
 
+    def _load_custom_system_prompt() -> str | None:
+        """Load a custom system prompt from .birdie/system_prompt.md if present."""
+        path = Path(".birdie") / "system_prompt.md"
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").strip()
+            return text if text else None
+        return None
+
     def _build_system_prompt(state: AgentState, config: RunnableConfig) -> str | None:
         """Assemble the system prompt for this turn from in-memory skill objects.
 
-        Three tiers:
+        Four tiers:
 
+        - **Tier 0** - custom instructions from ``.birdie/system_prompt.md`` (if present).
         - **Tier 1** - compact bullet list of all allowed skills (always sent).
         - **Tier 2a** - full prose body for ``always_inject`` skills (always sent).
         - **Tier 2b** - full prose body for freetext skills whose triggers fired.
         - **Tier 3** - long-term memory strings from the user's memory store.
 
-        Returns ``None`` when no skills are allowed for the session.
+        Returns ``None`` when no skills are allowed and no custom prompt exists.
         """
+        custom = _load_custom_system_prompt()
+
         allowed = _get_allowed(config)
         all_skills = [s for s in registry.list_skills() if s.name in allowed]
         if not all_skills:
-            return None
+            return custom  # may be None
+
+        # Tier 0 - custom project/user instructions
+        system = ""
+        if custom:
+            system = custom + "\n\n"
 
         # Tier 1 - compact skill catalog (always included)
         lines = ["You have access to the following skills:\n"]
@@ -115,7 +132,7 @@ def create_agent_graph(
                 f"  triggers: {', '.join(skill.triggers)}" if skill.triggers else ""
             )
             lines.append(f"- **{skill.name}**: {skill.description}{trigger_hint}")
-        system = "\n".join(lines)
+        system += "\n".join(lines)
 
         # Tier 2a - always-inject skill bodies (e.g. planning/meta skills)
         for skill in all_skills:
