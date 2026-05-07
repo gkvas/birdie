@@ -442,6 +442,7 @@ per turn (inside LangGraph call_model and execute_tools nodes)
   └─ _get_allowed(config)
        └─ UserSkillPolicy.get_allowed_skills(thread_id)   ← policy lookup, no disk I/O
   └─ _build_system_prompt(state, config)
+       ├─ Tier 0: read .birdie/system_prompt.md if present (disk read)
        ├─ Tier 1: iterate Skill.description for all allowed skills (always)
        ├─ Tier 2a: append Skill.body for always_inject skills (always)
        ├─ Tier 2b: match HumanMessage against Skill.triggers,
@@ -897,7 +898,21 @@ This keeps `MCPClientManager` as a thin, focused module and avoids coupling the 
 
 
 
-Every call to `call_model` constructs a fresh system prompt from the in-memory skill objects. Nothing is read from disk.
+Every call to `call_model` constructs a fresh system prompt. The prompt is built in four tiers.
+
+### Tier 0 - custom instructions (always present, if configured)
+
+If the file `.birdie/system_prompt.md` exists in the current working directory, its contents are prepended to the system prompt on every turn, before all skill context. This is the place to give the agent a persona, standing constraints, or project-specific instructions that should always be active regardless of which skills are enabled.
+
+```bash
+# Create a project-specific system prompt
+cat > .birdie/system_prompt.md << 'EOF'
+You are a senior Python engineer working on this codebase.
+Always prefer readability over cleverness. Never use deprecated APIs.
+EOF
+```
+
+The file is re-read on every turn so changes take effect immediately without restarting Birdie.
 
 ### Tier 1 - skill catalog (always present)
 
@@ -1243,7 +1258,10 @@ birdie
 |---|---|
 | `Enter` | Submit message |
 | `Ctrl+J` | Insert newline (multi-line message) |
-| `Ctrl+C` | Quit |
+| `Ctrl+C` (non-empty input) | Clear the current input line |
+| `Ctrl+C` (empty input, first press) | Show a grey hint: "Press Ctrl+C again to exit, or type new instructions to continue" |
+| `Ctrl+C` (empty input, second press) | Exit |
+| `Ctrl+C` (while agent is thinking or executing a tool) | Cancel the current turn and return to the prompt |
 
 **Slash commands**
 
@@ -1265,6 +1283,8 @@ birdie
 | `/session list` | List all sessions for this user |
 | `/session info` | Show session metadata (created, turns, memory) |
 | `/new` | Alias for `/session new` |
+| `/log llm on\|off` | Enable/disable LLM request/response logging to `~/.birdie/llm.log` |
+| `/log http on\|off` | Enable/disable raw HTTP body logging to `~/.birdie/http.log` (not applicable to ACP provider) |
 | `/clear` | Clear the screen |
 | `/quit` | Exit |
 
@@ -1288,7 +1308,8 @@ Each call to `call_model` assembles everything the LLM will see:
 ┌──────────────────────────────────────────────────────────────────────┐
 │  What the LLM receives on every call_model() invocation              │
 │                                                                      │
-│  system prompt (rebuilt from in-memory skill objects, no disk I/O)  │
+│  system prompt                                                       │
+│    Tier 0  custom instructions - .birdie/system_prompt.md (if any)  │
 │    Tier 1  skill catalog      - what tools are available this turn   │
 │    Tier 2  knowledge context  - freetext skill body (if triggered)   │
 │    Tier 3  long-term memory   - user facts (always present)          │
