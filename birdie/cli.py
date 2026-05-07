@@ -28,6 +28,8 @@ import httpx
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import Completer, PathCompleter
+from prompt_toolkit.document import Document as _PTDocument
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
@@ -86,6 +88,22 @@ HELP_TEXT = """
 _TOOL_OUTPUT_MODES = ("full", "short", "off")
 
 
+class _CdCompleter(Completer):
+    """Tab-completes directory paths for the /cd command."""
+
+    _PREFIX = "/cd "
+    _path = PathCompleter(only_directories=True, expanduser=True)
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.lower().startswith(self._PREFIX):
+            return
+        path_part = text[len(self._PREFIX):]
+        yield from self._path.get_completions(
+            _PTDocument(path_part, len(path_part)), complete_event
+        )
+
+
 class BirdieCLI:
     def __init__(
         self,
@@ -138,6 +156,8 @@ class BirdieCLI:
         self.session_prompt: PromptSession = PromptSession(
             history=FileHistory(str(history_path)),
             auto_suggest=AutoSuggestFromHistory(),
+            completer=_CdCompleter(),
+            complete_while_typing=False,
             style=PROMPT_STYLE,
             key_bindings=kb,
             multiline=False,
