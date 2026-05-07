@@ -29,6 +29,7 @@ import httpx
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import Completer, PathCompleter
+from prompt_toolkit.enums import CompleteStyle
 from prompt_toolkit.document import Document as _PTDocument
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.formatted_text import HTML
@@ -158,6 +159,7 @@ class BirdieCLI:
             auto_suggest=AutoSuggestFromHistory(),
             completer=_CdCompleter(),
             complete_while_typing=False,
+            complete_style=CompleteStyle.READLINE_LIKE,
             style=PROMPT_STYLE,
             key_bindings=kb,
             multiline=False,
