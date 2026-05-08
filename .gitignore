@@ -54,3 +54,4 @@ Thumbs.db
 
 # Distribution / packaging
 MANIFEST
+examples/persistence_demo.db
