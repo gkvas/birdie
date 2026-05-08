@@ -3,8 +3,8 @@ Interactive REPL for Birdie.
 
 Presents a prompt-toolkit prompt with:
 
-- Streaming output rendered via Rich (tool calls in yellow panels, AI text
-  in green Markdown panels).
+- Streaming output rendered via Rich (tool calls with 🐦 prefix, AI text
+  indented as plain text, tool output indented with ⎿).
 - A bottom status bar showing vendor, model, session ID, and token counters.
 - Slash commands for session management, skill control, and navigation.
 - Ctrl+C to quit; Ctrl+J to insert a newline for multi-line input.
@@ -36,9 +36,6 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
 from rich.console import Console
-from rich.markdown import Markdown
-from rich.panel import Panel
-from rich.text import Text
 
 from .agent.run import DynamicAgent
 from .core.models import Skill
@@ -260,14 +257,14 @@ class BirdieCLI:
             v = "dev"
         skill_count = len(self.agent.registry.list_skills())
         vendor = type(self.agent.provider).__name__.replace("Provider", "").lower()
-        self.console.print(Panel(
-            f"[bold green]Birdie[/bold green] [dim]v{v}[/dim]  |  vendor: [cyan]{vendor}[/cyan]"
-            f"  |  user: [cyan]{self.user_id}[/cyan]"
-            f"  |  session: [cyan]{self.session.id}[/cyan]"
-            f"  |  skills found: [yellow]{skill_count}[/yellow]\n"
-            "Type [bold]/help[/bold] for commands, [bold]/quit[/bold] to exit.",
-            border_style="green",
-        ))
+        self.console.print(
+            f"[bold green]Birdie[/bold green] [dim]v{v}[/dim]  "
+            f"vendor: [cyan]{vendor}[/cyan]  "
+            f"user: [cyan]{self.user_id}[/cyan]  "
+            f"session: [cyan]{self.session.id}[/cyan]  "
+            f"skills: [yellow]{skill_count}[/yellow]"
+        )
+        self.console.print("[dim]Type /help for commands, /quit to exit.[/dim]")
 
     def _show_help(self) -> None:
         """Print the slash-command reference."""
@@ -314,34 +311,30 @@ class BirdieCLI:
 
     def _render_tool_output(self, name: str, content: str) -> None:
         """Render tool output according to the current _tool_output_mode."""
-        lines = content.splitlines()
+        lines = content.splitlines() or [""]
         n = len(lines)
 
         if self._tool_output_mode == "off":
-            self.console.print(
-                f"[dim yellow]tool: [bold]{name}[/bold] - {n} line{'s' if n != 1 else ''}[/dim yellow]"
-            )
+            self.console.print(f"[dim]   {n} line{'s' if n != 1 else ''}[/dim]")
+            self.console.print()
+            return
 
-        elif self._tool_output_mode == "short":
+        if self._tool_output_mode == "short":
             limit = 1000
-            body = content[:limit]
+            display = content[:limit]
             remaining = len(content) - limit
-            if remaining > 0:
-                body += f"\n[dim]... {remaining} more character{'s' if remaining != 1 else ''}[/dim]"
-            self.console.print(Panel(
-                body,
-                title=f"[yellow]tool: {name}[/yellow]",
-                border_style="yellow",
-                expand=False,
-            ))
-
+            display_lines = display.splitlines() or [""]
         else:  # "full"
-            self.console.print(Panel(
-                Text(content, style="white"),
-                title=f"[yellow]tool: {name}[/yellow]",
-                border_style="yellow",
-                expand=False,
-            ))
+            display_lines = lines
+            remaining = 0
+
+        for line in display_lines:
+            self.console.print(f"[dim]   {line}[/dim]", highlight=False)
+        if remaining > 0:
+            self.console.print(
+                f"[dim]   ... {remaining} more character{'s' if remaining != 1 else ''}[/dim]"
+            )
+        self.console.print()
 
     # -- logging --------------------------------------------------------------
 
@@ -716,18 +709,23 @@ class BirdieCLI:
                                         f"{k}={v!r}" for k, v in tc["args"].items()
                                     )
                                     self.console.print(
-                                        f"[dim yellow]→ calling [bold]{tc['name']}[/bold]"
-                                        f"({args_str})[/dim yellow]"
+                                        f"🐦 [bold]{tc['name']}[/bold]({args_str})"
                                     )
                                 if getattr(msg, "tool_calls", None):
                                     status.update("[dim]running tools…[/dim]")
                                 elif msg.content:
                                     status.stop()
-                                    self.console.print(Panel(
-                                        Markdown(msg.content),
-                                        title="[green]birdie[/green]",
-                                        border_style="green",
-                                    ))
+                                    content = msg.content
+                                    if isinstance(content, list):
+                                        content = "\n".join(
+                                            b.get("text", "") if isinstance(b, dict) else str(b)
+                                            for b in content
+                                        )
+                                    lines = str(content).splitlines()
+                                    for i, line in enumerate(lines):
+                                        prefix = "🐦 " if i == 0 else "   "
+                                        self.console.print(f"{prefix}{line}", highlight=False)
+                                    self.console.print()
                                     printed_any = True
         finally:
             status.stop()
