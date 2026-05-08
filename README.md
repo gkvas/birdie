@@ -424,7 +424,7 @@ Understanding which parts of the skill system are initialised at startup versus 
 - `Skill.body` - raw Markdown string of the prose body (empty for plain structured skills, full body for knowledge skills, pre-`## Tools` prose for `always_inject` skills)
 - `Skill.mcp_server` - parsed from the `mcp_server` frontmatter key if present
 
-After parsing, each `Skill` is registered in the `SkillRegistry` (which builds name, tag, and tool-ownership indexes) and its `mcp_server` config (if any) is registered with `MCPClientManager`. Finally, `UserSkillPolicy.set_default_skills` seeds which skills are on by default.
+After parsing, each `Skill` is registered in the `SkillRegistry` (which builds name, tag, and tool-ownership indexes) and its `mcp_server` config (if any) is registered with `MCPClientManager`. Finally, `SkillPolicy.set_default_skills` seeds which skills are on by default.
 
 **After startup, no SKILL.MD file is ever read again.** All turn-time decisions are made from in-memory `Skill` objects.
 
@@ -458,12 +458,12 @@ startup
        └─ _tool_to_skill[tool]   = skill.name
   └─ MCPClientManager.register_server(skill.name, skill.mcp_server)
        (only for skills where mcp_server is set)
-  └─ UserSkillPolicy.set_default_skills(skills)
+  └─ SkillPolicy.set_default_skills(skills)
        └─ seeds the enabled_by_default allow-set
 
 per turn (inside LangGraph call_model and execute_tools nodes)
   └─ _get_allowed(config)
-       └─ UserSkillPolicy.get_allowed_skills(thread_id)   ← policy lookup, no disk I/O
+       └─ SkillPolicy.get_allowed_skills(thread_id)   ← policy lookup, no disk I/O
   └─ _build_system_prompt(state, config)
        ├─ Tier 0: read .birdie/system_prompt.md if present (disk read)
        ├─ Tier 1: iterate Skill.description for all allowed skills (always)
@@ -1039,18 +1039,14 @@ The provider layer converts this LangChain message list into the wire format exp
 
 ## Access control
 
-`UserSkillPolicy` enforces which skills a user may access. Resolution order (highest priority first):
+`SkillPolicy` tracks which skills each session may access. All skills are disabled by default; skills with `enabled_by_default: true` seed the initial set. Each session starts with the global defaults and the set is mutated directly by enable/disable calls.
 
-1. **Explicit disable** - always blocks the skill for that key
-2. **Explicit enable** - grants the skill for that key
-3. **Global defaults** - skills with `enabled_by_default: true`
-
-In the CLI, the **session ID** is used as the policy key (not the filesystem `--user` value). This means each session has fully independent skill grants: `/skill enable` and `/skill disable` affect only the current session and are persisted to the session JSON, so they are restored on resume.
+In the CLI, the **session ID** is used as the policy key. Each session has fully independent skill grants: `/skill enable` and `/skill disable` affect only the current session and are persisted to the session JSON, so they are restored on resume.
 
 ```python
 # CLI uses session.id as the key
-agent.enable_skill_for_user(session.id, "Filesystem")
-agent.disable_skill_for_user(session.id, "Weather")
+agent.enable_skill(session.id, "Filesystem")
+agent.disable_skill(session.id, "Weather")
 ```
 
 The policy is consulted on every `call_model` and `execute_tools` invocation so changes take effect immediately on the next turn without restarting the agent.
@@ -1506,7 +1502,7 @@ The session ID (`2026-04-29_1`) plays three roles simultaneously:
 | Role | Where used | Effect |
 |---|---|---|
 | LangGraph `thread_id` | `SqliteSaver` checkpointer | Loads and saves this session's message history |
-| Skill policy key | `UserSkillPolicy` | Determines which skills are active this turn |
+| Skill policy key | `SkillPolicy` | Determines which skills are active this turn |
 | Filename | `<session_id>.json` | Links to the metadata JSON on disk |
 
 Switching sessions changes all three at once - history, skill grants, and metadata - by changing one string.
