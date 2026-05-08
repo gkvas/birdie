@@ -25,6 +25,9 @@ Then set your LLM credentials:
     export LLM_MODEL=claude-sonnet-4-6
     export ANTHROPIC_API_KEY=sk-ant-...
 
+    # Or use LLM_PROVIDER_CONFIG for a single JSON blob (overrides the above):
+    export LLM_PROVIDER_CONFIG='{"vendor":"anthropic","model":"claude-sonnet-4-6","api_key":"sk-ant-..."}'
+
 Run
 ───
     python examples/10_mcp_tool.py

@@ -20,6 +20,9 @@ Set your LLM provider credentials, for example:
     export LLM_MODEL=gpt-4o
     export OPENAI_API_KEY=sk-...
 
+    # Or use LLM_PROVIDER_CONFIG for a single JSON blob (overrides the above):
+    export LLM_PROVIDER_CONFIG='{"vendor":"anthropic","model":"claude-sonnet-4-6","api_key":"sk-ant-..."}'
+
 Run
 ───
     python examples/01_hello_world.py

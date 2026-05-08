@@ -42,13 +42,15 @@ pip install -e .
 
 ## Quick start
 
-Configure your LLM provider via environment variables and run `birdie`:
+Configure your LLM provider and run `birdie`.  There are three ways:
+
+**1. Individual environment variables**
 
 ```bash
-# Mistral
-export LLM_VENDOR=mistral
-export LLM_MODEL=mistral-large-latest
-export MISTRAL_API_KEY=your-key-here
+# Anthropic
+export LLM_VENDOR=anthropic
+export LLM_MODEL=claude-sonnet-4-6
+export ANTHROPIC_API_KEY=your-key-here
 birdie
 
 # OpenAI
@@ -57,14 +59,35 @@ export LLM_MODEL=gpt-4o
 export OPENAI_API_KEY=your-key-here
 birdie
 
-# Anthropic
-export LLM_VENDOR=anthropic
-export LLM_MODEL=claude-sonnet-4-6
-export ANTHROPIC_API_KEY=your-key-here
+# Azure OpenAI
+export LLM_VENDOR=azure
+export LLM_MODEL=my-gpt4o-deployment   # your Azure deployment name
+export AZURE_OPENAI_API_KEY=your-key-here
+export AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com/
+birdie
+
+# Mistral
+export LLM_VENDOR=mistral
+export LLM_MODEL=mistral-large-latest
+export MISTRAL_API_KEY=your-key-here
 birdie
 ```
 
-Or pass a JSON config file:
+**2. `LLM_PROVIDER_CONFIG` - single JSON blob** (overrides all other variables)
+
+```bash
+export LLM_PROVIDER_CONFIG='{"vendor":"anthropic","model":"claude-sonnet-4-6","api_key":"sk-ant-..."}'
+birdie
+```
+
+Useful for storing credentials in a file outside shell history:
+
+```bash
+export LLM_PROVIDER_CONFIG="$(cat ~/.birdie/anthropic.json)"
+birdie
+```
+
+**3. JSON config file via `--config`**
 
 ```bash
 birdie --config provider.json
@@ -1156,13 +1179,49 @@ birdie [--user USER_ID] [--session-id SESSION_ID] [--skills-dir PATH] [--config 
 
 ### Provider configuration
 
-By default Birdie reads `LLM_VENDOR`, `LLM_MODEL`, and the vendor API key from environment variables. The `--config` flag lets you store all of that in a file instead:
+Birdie resolves the LLM provider in this priority order:
+
+1. `LLM_PROVIDER_CONFIG` environment variable (full JSON blob - overrides everything)
+2. `--config FILE` flag (path to a JSON file)
+3. `LLM_VENDOR` + `LLM_MODEL` + vendor-specific API key env vars
+
+**Environment variables per vendor**
+
+| Vendor | Required variables |
+|--------|-------------------|
+| Anthropic | `LLM_VENDOR=anthropic`, `LLM_MODEL=claude-sonnet-4-6`, `ANTHROPIC_API_KEY` |
+| OpenAI | `LLM_VENDOR=openai`, `LLM_MODEL=gpt-4o`, `OPENAI_API_KEY` |
+| Azure OpenAI | `LLM_VENDOR=azure`, `LLM_MODEL=<deployment-name>`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT` |
+| Mistral | `LLM_VENDOR=mistral`, `LLM_MODEL=mistral-large-latest`, `MISTRAL_API_KEY` |
+| Google Gemini | `LLM_VENDOR=gemini`, `LLM_MODEL=gemini-2.5-pro`, `GEMINI_API_KEY` |
+| Ollama | `LLM_VENDOR=ollama`, `LLM_MODEL=llama3` (no key; server must be running) |
+
+Azure OpenAI example:
+```bash
+export LLM_VENDOR=azure
+export LLM_MODEL=my-gpt4o-deployment   # deployment name from Azure Portal
+export AZURE_OPENAI_API_KEY=...
+export AZURE_OPENAI_ENDPOINT=https://my-resource.openai.azure.com/
+# Optional: API version (default: 2024-02-01)
+# export AZURE_OPENAI_API_VERSION=2024-05-01-preview
+birdie
+```
+
+**`LLM_PROVIDER_CONFIG`** - pass the full config as an inline JSON string:
 
 ```bash
+export LLM_PROVIDER_CONFIG='{"vendor":"anthropic","model":"claude-sonnet-4-6","api_key":"sk-ant-..."}'
+birdie
+```
+
+Or load from a file (keeps keys out of shell history):
+
+```bash
+export LLM_PROVIDER_CONFIG="$(cat ~/.birdie/anthropic.json)"
 birdie --config ~/.birdie/anthropic.json
 ```
 
-**Example config files**
+**Example config files** (for `--config` or `LLM_PROVIDER_CONFIG`):
 
 Anthropic:
 ```json
