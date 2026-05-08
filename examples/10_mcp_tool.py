@@ -31,6 +31,7 @@ Run
 """
 
 import asyncio
+import sys
 from pathlib import Path
 
 from birdie.agent.run import DynamicAgent
@@ -44,6 +45,13 @@ MCP_SERVER = Path(__file__).parent.parent / "birdie" / "skills" / "mcp_demo" / "
 SESSION_ID = "mcp-demo"
 
 
+def _text(content) -> str:
+    """Return message content as a plain string (handles list-of-blocks format)."""
+    if isinstance(content, list):
+        return "\n".join(b.get("text", str(b)) if isinstance(b, dict) else str(b) for b in content)
+    return str(content)
+
+
 async def main() -> None:
     agent = DynamicAgent.from_config(skills_dir=str(SKILLS_DIR))
 
@@ -54,7 +62,7 @@ async def main() -> None:
         "mcp_demo",
         MCPServerConfig(
             transport="stdio",
-            command="python",
+            command=sys.executable,
             args=[str(MCP_SERVER)],
         ),
     )
@@ -90,9 +98,9 @@ async def main() -> None:
                 for tc in msg.tool_calls:
                     print(f"  → [MCP] {tc['name']}({tc['args']})")
             elif kind == "ToolMessage":
-                print(f"  ← [MCP result] {msg.content.strip()}")
+                print(f"  ← [MCP result] {_text(msg.content).strip()}")
             elif kind == "AIMessage" and msg.content:
-                print(f"Agent: {msg.content}")
+                print(f"Agent: {_text(msg.content)}")
         print()
 
 

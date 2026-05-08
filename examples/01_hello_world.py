@@ -39,7 +39,7 @@ async def main() -> None:
     # environment variables (see module docstring for options).
     agent = DynamicAgent.from_config(skills_dir=str(SKILLS_DIR))
 
-    print(f"Provider : {agent.provider.vendor_name()} / {agent.provider.model_name()}")
+    print(f"Provider : {agent.provider.vendor_name} / {agent.provider.model_name}")
     print(f"Skills   : {[s.name for s in agent.registry.list_skills()]} (all disabled)\n")
 
     message = "In one sentence, what is the LangGraph framework?"
