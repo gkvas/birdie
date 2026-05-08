@@ -2,6 +2,29 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.10] - 2026-05-08
+
+### Changed
+- `UserSkillPolicy` renamed to `SkillPolicy`; the per-"user" enable/disable
+  tracking now uses session IDs consistently throughout - the old name was
+  misleading because the policy was always keyed by session/thread ID, not by
+  a distinct user identity
+- Policy internals simplified: three separate dicts replaced by a single
+  `_session_skills` dict seeded from `enabled_by_default` on first access and
+  mutated directly by `enable_skill` / `disable_skill`
+- `DynamicAgent.enable_skill_for_user` / `disable_skill_for_user` renamed to
+  `enable_skill` / `disable_skill`
+
+### Added
+- 10 runnable example scripts in `examples/` covering hello world, skill
+  inspection, web search, shell commands, multi-turn conversation, streaming,
+  long-term memory, SQLite persistence, custom skills, and MCP-backed skills
+- `LLM_PROVIDER_CONFIG` environment variable: pass a full JSON provider config
+  as a single variable, overriding all other provider env vars; accepts a JSON
+  string or a path to a `.json` file
+- Azure OpenAI env var documentation and examples (`AZURE_OPENAI_API_KEY`,
+  `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_VERSION`)
+
 ## [0.2.9] - 2026-05-07
 
 ### Added
