@@ -279,7 +279,7 @@ class BirdieCLI:
         if not skills:
             self.console.print("[dim]No skills loaded.[/dim]")
             return
-        allowed = self.agent.policy.get_allowed_skills_for_session(self.session.id)
+        allowed = self.agent.policy.get_allowed_skills(self.session.id)
         for skill in skills:
             status = "[green]enabled[/green]" if skill.name in allowed else "[red]disabled[/red]"
             self.console.print(
@@ -288,7 +288,7 @@ class BirdieCLI:
 
     def _show_tools(self) -> None:
         """List all callable tools available in the current session."""
-        allowed = self.agent.policy.get_allowed_skills_for_session(self.session.id)
+        allowed = self.agent.policy.get_allowed_skills(self.session.id)
         tools = [
             t for t in self.agent.registry.list_tools()
             if self.agent.registry.is_tool_allowed(t.name, allowed)

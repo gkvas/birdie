@@ -85,11 +85,10 @@ def main() -> None:
     print(f"  {sorted(after_disable)}")
     print()
 
-    # ── 7. Session-scoped fixed skill set ─────────────────────────────────────
-    # enable_skills_for_session() sets an exact list for the session lifetime,
-    # overriding both defaults and any per-user grants.
+    # ── 7. Session with an explicit fixed skill set ───────────────────────────
+    # enable_skills_for_session() replaces the default seed with an exact list.
     agent.enable_skills_for_session("restricted", ["Filesystem"])
-    restricted = agent.policy.get_allowed_skills_for_session("restricted")
+    restricted = agent.policy.get_allowed_skills("restricted")
     print("=== Session-scoped skills for 'restricted' ===")
     print(f"  {sorted(restricted)}")
     print()

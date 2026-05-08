@@ -43,50 +43,67 @@ def sample_skills():
 
 
 def test_default_skills(sample_skills):
-    """Test default skill settings."""
+    """Global defaults reflect enabled_by_default flags."""
     policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
 
-    # Weather is enabled by default, Filesystem is not
     allowed = policy.get_allowed_skills()
     assert "Weather" in allowed
     assert "Filesystem" not in allowed
 
 
-def test_session_specific_skills(sample_skills):
-    """Test per-session incremental skill grants."""
+def test_session_seeded_from_defaults(sample_skills):
+    """A new session starts with the global defaults."""
     policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
 
-    # Enable Filesystem for session123
-    policy.enable_skill("session123", "Filesystem")
-
-    allowed = policy.get_allowed_skills(session_id="session123")
-    assert "Weather" in allowed  # Default skill
-    assert "Filesystem" in allowed  # Session-specific skill
-
-    # Disable Weather for session123
-    policy.disable_skill("session123", "Weather")
-
-    allowed = policy.get_allowed_skills(session_id="session123")
-    assert "Weather" not in allowed  # Disabled for session
-    assert "Filesystem" in allowed  # Still enabled
+    allowed = policy.get_allowed_skills("new-session")
+    assert "Weather" in allowed
+    assert "Filesystem" not in allowed
 
 
-def test_fixed_session_skills(sample_skills):
-    """Test fixed-set session grants via enable_skills_for_session."""
+def test_enable_skill(sample_skills):
+    """enable_skill adds a skill to the session set."""
     policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
 
-    # Grant a fixed set to session456
-    policy.enable_skills_for_session("session456", ["Filesystem"])
-
-    allowed = policy.get_allowed_skills(session_id="session456")
-    # Weather is a default, Filesystem is added via fixed grant
+    policy.enable_skill("s1", "Filesystem")
+    allowed = policy.get_allowed_skills("s1")
     assert "Weather" in allowed
     assert "Filesystem" in allowed
 
-    # Test combined incremental + fixed
-    policy.enable_skill("session123", "Weather")
-    allowed = policy.get_allowed_skills(session_id="session123")
-    assert "Weather" in allowed  # incremental enable
+
+def test_disable_skill(sample_skills):
+    """disable_skill removes a skill from the session set."""
+    policy = SkillPolicy()
+    policy.set_default_skills(sample_skills)
+
+    policy.disable_skill("s1", "Weather")
+    allowed = policy.get_allowed_skills("s1")
+    assert "Weather" not in allowed
+    assert "Filesystem" not in allowed
+
+
+def test_enable_skills_for_session_replaces_defaults(sample_skills):
+    """enable_skills_for_session sets an exact list, ignoring defaults."""
+    policy = SkillPolicy()
+    policy.set_default_skills(sample_skills)
+
+    policy.enable_skills_for_session("s1", ["Filesystem"])
+    allowed = policy.get_allowed_skills("s1")
+    assert "Filesystem" in allowed
+    assert "Weather" not in allowed  # default not included in explicit list
+
+
+def test_sessions_are_independent(sample_skills):
+    """Mutations to one session do not affect another."""
+    policy = SkillPolicy()
+    policy.set_default_skills(sample_skills)
+
+    policy.enable_skill("s1", "Filesystem")
+    policy.disable_skill("s2", "Weather")
+
+    assert "Filesystem" in policy.get_allowed_skills("s1")
+    assert "Filesystem" not in policy.get_allowed_skills("s2")
+    assert "Weather" in policy.get_allowed_skills("s1")
+    assert "Weather" not in policy.get_allowed_skills("s2")

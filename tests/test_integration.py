@@ -187,7 +187,7 @@ def test_load_skills_registers_all_skills():
         assert "SkillB" in names
 
         # Policy seeded: SkillA enabled by default, SkillB not
-        allowed = agent.policy.get_allowed_skills_for_session("default")
+        allowed = agent.policy.get_allowed_skills("default")
         assert "SkillA" in allowed
         assert "SkillB" not in allowed
 
