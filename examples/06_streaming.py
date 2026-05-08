@@ -36,7 +36,7 @@ SESSION_ID = "streaming-demo"
 
 async def main() -> None:
     agent = DynamicAgent.from_config(skills_dir=str(SKILLS_DIR))
-    agent.enable_skill_for_user(SESSION_ID, "Shell")
+    agent.enable_skill(SESSION_ID, "Shell")
 
     message = "List the Python files in the current directory, then tell me how many there are."
     print(f"User: {message}\n")

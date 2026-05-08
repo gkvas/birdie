@@ -37,12 +37,12 @@ def main() -> None:
     print("=== Example 1: Basic Weather Query (default skills) ===")
     asyncio.run(run_example(agent, "What's the weather in Paris?"))
 
-    print("\n=== Example 2: User with Filesystem Access ===")
-    agent.enable_skill_for_user("user123", "Filesystem")
+    print("\n=== Example 2: Session with Filesystem Access ===")
+    agent.enable_skill("session123", "Filesystem")
     asyncio.run(run_example(
         agent,
         "List files in the current directory and show me README.md",
-        user_id="user123",
+        thread_id="session123",
     ))
 
     print("\n=== Example 3: Session with Weather Forecast ===")
@@ -50,26 +50,18 @@ def main() -> None:
     asyncio.run(run_example(
         agent,
         "What's the 5-day forecast for Berlin?",
-        session_id="session456",
+        thread_id="session456",
     ))
 
 
 async def run_example(
     agent: DynamicAgent,
     message: str,
-    user_id: str | None = None,
-    session_id: str | None = None,
+    thread_id: str = "default",
 ) -> None:
-    """Invoke the agent with *message* and print the last message content.
-
-    Args:
-        agent: The running ``DynamicAgent`` instance.
-        message: User input to send.
-        user_id: Optional user identifier for per-user skill grants.
-        session_id: Optional session identifier for session-scoped grants.
-    """
+    """Invoke the agent with *message* and print the last message content."""
     print(f"User: {message}")
-    result = await agent.invoke(message, user_id=user_id, session_id=session_id)
+    result = await agent.invoke(message, thread_id=thread_id)
     last = result["messages"][-1]
     print(f"Agent: {last.content if hasattr(last, 'content') else last}")
 

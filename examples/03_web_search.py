@@ -51,9 +51,9 @@ async def main() -> None:
     agent = DynamicAgent.from_config(skills_dir=str(SKILLS_DIR))
 
     # Grant the DuckDuckGo skill to this session.
-    agent.enable_skill_for_user(SESSION_ID, "DuckDuckGo")
+    agent.enable_skill(SESSION_ID, "DuckDuckGo")
 
-    enabled = sorted(agent.policy.get_allowed_skills(user_id=SESSION_ID))
+    enabled = sorted(agent.policy.get_allowed_skills(session_id=SESSION_ID))
     print(f"Enabled skills: {enabled}\n")
 
     query = "What is LangGraph and what problems does it solve for AI agent development?"

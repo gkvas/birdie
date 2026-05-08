@@ -1,9 +1,9 @@
 """
-Unit tests for the UserSkillPolicy.
+Unit tests for SkillPolicy.
 """
 
 import pytest
-from birdie.core.policy import UserSkillPolicy
+from birdie.core.policy import SkillPolicy
 from birdie.core.models import Skill, SkillTool
 
 
@@ -22,7 +22,7 @@ def sample_skills():
         entrypoint="bash:ls",
         schema={"type": "object", "properties": {"path": {"type": "string"}}}
     )
-    
+
     weather_skill = Skill(
         name="Weather",
         version="1.0.0",
@@ -30,7 +30,7 @@ def sample_skills():
         tools=[tool1],
         enabled_by_default=True
     )
-    
+
     fs_skill = Skill(
         name="Filesystem",
         version="1.0.0",
@@ -38,55 +38,72 @@ def sample_skills():
         tools=[tool2],
         enabled_by_default=False
     )
-    
+
     return [weather_skill, fs_skill]
 
 
 def test_default_skills(sample_skills):
-    """Test default skill settings."""
-    policy = UserSkillPolicy()
+    """Global defaults reflect enabled_by_default flags."""
+    policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
-    
-    # Weather is enabled by default, Filesystem is not
+
     allowed = policy.get_allowed_skills()
     assert "Weather" in allowed
     assert "Filesystem" not in allowed
 
 
-def test_user_specific_skills(sample_skills):
-    """Test user-specific skill settings."""
-    policy = UserSkillPolicy()
+def test_session_seeded_from_defaults(sample_skills):
+    """A new session starts with the global defaults."""
+    policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
-    
-    # Enable Filesystem for user123
-    policy.enable_skill_for_user("user123", "Filesystem")
-    
-    allowed = policy.get_allowed_skills(user_id="user123")
-    assert "Weather" in allowed  # Default skill
-    assert "Filesystem" in allowed  # User-specific skill
-    
-    # Disable Weather for user123
-    policy.disable_skill_for_user("user123", "Weather")
-    
-    allowed = policy.get_allowed_skills(user_id="user123")
-    assert "Weather" not in allowed  # Disabled for user
-    assert "Filesystem" in allowed  # Still enabled
+
+    allowed = policy.get_allowed_skills("new-session")
+    assert "Weather" in allowed
+    assert "Filesystem" not in allowed
 
 
-def test_session_specific_skills(sample_skills):
-    """Test session-specific skill settings."""
-    policy = UserSkillPolicy()
+def test_enable_skill(sample_skills):
+    """enable_skill adds a skill to the session set."""
+    policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
-    
-    # Enable only Filesystem for session456
-    policy.enable_skills_for_session("session456", ["Filesystem"])
-    
-    allowed = policy.get_allowed_skills(session_id="session456")
-    assert "Weather" not in allowed  # Not in session skills
-    assert "Filesystem" in allowed  # Session-specific skill
-    
-    # Test combined user and session
-    policy.enable_skill_for_user("user123", "Weather")
-    allowed = policy.get_allowed_skills(user_id="user123", session_id="session456")
-    assert "Weather" in allowed  # User skill
-    assert "Filesystem" in allowed  # Session skill
+
+    policy.enable_skill("s1", "Filesystem")
+    allowed = policy.get_allowed_skills("s1")
+    assert "Weather" in allowed
+    assert "Filesystem" in allowed
+
+
+def test_disable_skill(sample_skills):
+    """disable_skill removes a skill from the session set."""
+    policy = SkillPolicy()
+    policy.set_default_skills(sample_skills)
+
+    policy.disable_skill("s1", "Weather")
+    allowed = policy.get_allowed_skills("s1")
+    assert "Weather" not in allowed
+    assert "Filesystem" not in allowed
+
+
+def test_enable_skills_for_session_replaces_defaults(sample_skills):
+    """enable_skills_for_session sets an exact list, ignoring defaults."""
+    policy = SkillPolicy()
+    policy.set_default_skills(sample_skills)
+
+    policy.enable_skills_for_session("s1", ["Filesystem"])
+    allowed = policy.get_allowed_skills("s1")
+    assert "Filesystem" in allowed
+    assert "Weather" not in allowed  # default not included in explicit list
+
+
+def test_sessions_are_independent(sample_skills):
+    """Mutations to one session do not affect another."""
+    policy = SkillPolicy()
+    policy.set_default_skills(sample_skills)
+
+    policy.enable_skill("s1", "Filesystem")
+    policy.disable_skill("s2", "Weather")
+
+    assert "Filesystem" in policy.get_allowed_skills("s1")
+    assert "Filesystem" not in policy.get_allowed_skills("s2")
+    assert "Weather" in policy.get_allowed_skills("s1")
+    assert "Weather" not in policy.get_allowed_skills("s2")
