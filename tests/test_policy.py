@@ -1,9 +1,9 @@
 """
-Unit tests for the UserSkillPolicy.
+Unit tests for SkillPolicy.
 """
 
 import pytest
-from birdie.core.policy import UserSkillPolicy
+from birdie.core.policy import SkillPolicy
 from birdie.core.models import Skill, SkillTool
 
 
@@ -22,7 +22,7 @@ def sample_skills():
         entrypoint="bash:ls",
         schema={"type": "object", "properties": {"path": {"type": "string"}}}
     )
-    
+
     weather_skill = Skill(
         name="Weather",
         version="1.0.0",
@@ -30,7 +30,7 @@ def sample_skills():
         tools=[tool1],
         enabled_by_default=True
     )
-    
+
     fs_skill = Skill(
         name="Filesystem",
         version="1.0.0",
@@ -38,55 +38,55 @@ def sample_skills():
         tools=[tool2],
         enabled_by_default=False
     )
-    
+
     return [weather_skill, fs_skill]
 
 
 def test_default_skills(sample_skills):
     """Test default skill settings."""
-    policy = UserSkillPolicy()
+    policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
-    
+
     # Weather is enabled by default, Filesystem is not
     allowed = policy.get_allowed_skills()
     assert "Weather" in allowed
     assert "Filesystem" not in allowed
 
 
-def test_user_specific_skills(sample_skills):
-    """Test user-specific skill settings."""
-    policy = UserSkillPolicy()
+def test_session_specific_skills(sample_skills):
+    """Test per-session incremental skill grants."""
+    policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
-    
-    # Enable Filesystem for user123
-    policy.enable_skill_for_user("user123", "Filesystem")
-    
-    allowed = policy.get_allowed_skills(user_id="user123")
+
+    # Enable Filesystem for session123
+    policy.enable_skill("session123", "Filesystem")
+
+    allowed = policy.get_allowed_skills(session_id="session123")
     assert "Weather" in allowed  # Default skill
-    assert "Filesystem" in allowed  # User-specific skill
-    
-    # Disable Weather for user123
-    policy.disable_skill_for_user("user123", "Weather")
-    
-    allowed = policy.get_allowed_skills(user_id="user123")
-    assert "Weather" not in allowed  # Disabled for user
+    assert "Filesystem" in allowed  # Session-specific skill
+
+    # Disable Weather for session123
+    policy.disable_skill("session123", "Weather")
+
+    allowed = policy.get_allowed_skills(session_id="session123")
+    assert "Weather" not in allowed  # Disabled for session
     assert "Filesystem" in allowed  # Still enabled
 
 
-def test_session_specific_skills(sample_skills):
-    """Test session-specific skill settings."""
-    policy = UserSkillPolicy()
+def test_fixed_session_skills(sample_skills):
+    """Test fixed-set session grants via enable_skills_for_session."""
+    policy = SkillPolicy()
     policy.set_default_skills(sample_skills)
-    
-    # Enable only Filesystem for session456
+
+    # Grant a fixed set to session456
     policy.enable_skills_for_session("session456", ["Filesystem"])
-    
+
     allowed = policy.get_allowed_skills(session_id="session456")
-    assert "Weather" not in allowed  # Not in session skills
-    assert "Filesystem" in allowed  # Session-specific skill
-    
-    # Test combined user and session
-    policy.enable_skill_for_user("user123", "Weather")
-    allowed = policy.get_allowed_skills(user_id="user123", session_id="session456")
-    assert "Weather" in allowed  # User skill
-    assert "Filesystem" in allowed  # Session skill
+    # Weather is a default, Filesystem is added via fixed grant
+    assert "Weather" in allowed
+    assert "Filesystem" in allowed
+
+    # Test combined incremental + fixed
+    policy.enable_skill("session123", "Weather")
+    allowed = policy.get_allowed_skills(session_id="session123")
+    assert "Weather" in allowed  # incremental enable

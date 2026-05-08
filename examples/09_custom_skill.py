@@ -90,7 +90,7 @@ async def main() -> None:
         agent.policy.set_default_skills(agent.registry.list_skills())
 
         # Confirm the skill is live.
-        allowed = agent.policy.get_allowed_skills_for_user("default")
+        allowed = agent.policy.get_allowed_skills_for_session("default")
         print(f"=== Dice in default allowed set: {'Dice' in allowed} ===\n")
 
         # Ask the agent to use the new skill.

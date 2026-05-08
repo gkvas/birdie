@@ -54,7 +54,7 @@ async def ask(agent: DynamicAgent, question: str) -> None:
 
 async def main() -> None:
     agent = DynamicAgent.from_config(skills_dir=str(SKILLS_DIR))
-    agent.enable_skill_for_user(SESSION_ID, "Shell")
+    agent.enable_skill(SESSION_ID, "Shell")
 
     # Three independent questions — each is a fresh invoke() call on the same
     # thread, so the agent accumulates context across them.

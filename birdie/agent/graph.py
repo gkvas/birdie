@@ -31,7 +31,7 @@ from langgraph.graph.message import add_messages
 
 from ..core.registry import SkillRegistry
 from ..core.adapter import skilltool_to_langchain_tool
-from ..core.policy import UserSkillPolicy
+from ..core.policy import SkillPolicy
 from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def, lc_tool_to_normalized_def
 from ..core.mcp_client import MCPClientManager
 
@@ -52,7 +52,7 @@ class AgentState(TypedDict):
 def create_agent_graph(
     provider: LLMProvider,
     registry: SkillRegistry,
-    policy: UserSkillPolicy,
+    policy: SkillPolicy,
     mcp_manager: MCPClientManager | None = None,
 ) -> StateGraph:
     """
@@ -75,7 +75,7 @@ def create_agent_graph(
 
     def _get_allowed(config: RunnableConfig) -> set:
         """Resolve the allowed skill name set for the current session."""
-        return policy.get_allowed_skills(user_id=_session_id(config))
+        return policy.get_allowed_skills(session_id=_session_id(config))
 
     def _last_user_text(state: AgentState) -> str:
         """Return the content of the most recent HumanMessage in state."""

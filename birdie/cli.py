@@ -197,9 +197,9 @@ class BirdieCLI:
     def _apply_session_policy(self, session: Session) -> None:
         """Apply stored skill grants from session to the policy."""
         for skill in session.enabled_skills:
-            self.agent.enable_skill_for_user(session.id, skill)
+            self.agent.enable_skill(session.id, skill)
         for skill in session.disabled_skills:
-            self.agent.disable_skill_for_user(session.id, skill)
+            self.agent.disable_skill(session.id, skill)
 
     def _get_prompt(self):
         if self._ctrl_c_warned:
@@ -279,7 +279,7 @@ class BirdieCLI:
         if not skills:
             self.console.print("[dim]No skills loaded.[/dim]")
             return
-        allowed = self.agent.policy.get_allowed_skills_for_user(self.session.id)
+        allowed = self.agent.policy.get_allowed_skills_for_session(self.session.id)
         for skill in skills:
             status = "[green]enabled[/green]" if skill.name in allowed else "[red]disabled[/red]"
             self.console.print(
@@ -288,7 +288,7 @@ class BirdieCLI:
 
     def _show_tools(self) -> None:
         """List all callable tools available in the current session."""
-        allowed = self.agent.policy.get_allowed_skills_for_user(self.session.id)
+        allowed = self.agent.policy.get_allowed_skills_for_session(self.session.id)
         tools = [
             t for t in self.agent.registry.list_tools()
             if self.agent.registry.is_tool_allowed(t.name, allowed)
@@ -509,7 +509,7 @@ class BirdieCLI:
             else:
                 resolved = self._resolve_skill_name(subarg)
                 if resolved:
-                    self.agent.enable_skill_for_user(self.session.id, resolved)
+                    self.agent.enable_skill(self.session.id, resolved)
                     if resolved not in self.session.enabled_skills:
                         self.session.enabled_skills.append(resolved)
                     self.session.disabled_skills = [
@@ -524,7 +524,7 @@ class BirdieCLI:
             else:
                 resolved = self._resolve_skill_name(subarg)
                 if resolved:
-                    self.agent.disable_skill_for_user(self.session.id, resolved)
+                    self.agent.disable_skill(self.session.id, resolved)
                     if resolved not in self.session.disabled_skills:
                         self.session.disabled_skills.append(resolved)
                     self.session.enabled_skills = [

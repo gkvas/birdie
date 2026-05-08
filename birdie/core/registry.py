@@ -167,7 +167,7 @@ class SkillRegistry:
 
         Args:
             tool_name: Exact tool name to check.
-            allowed_skill_names: Set of allowed skill names from ``UserSkillPolicy``.
+            allowed_skill_names: Set of allowed skill names from ``SkillPolicy``.
                 Pass ``None`` to skip the skill check (tool is allowed if it exists).
 
         Returns:

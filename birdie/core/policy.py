@@ -1,29 +1,30 @@
 """
-Per-user and per-session skill access control.
+Per-session skill access control.
 
-``UserSkillPolicy`` is the single authoritative source for which skills a
-given user or session may access on any turn.  The agent consults it before
-building the system prompt and before executing tool calls.
+``SkillPolicy`` is the single authoritative source for which skills a given
+session may access on any turn.  The agent consults it before building the
+system prompt and before executing tool calls.
 """
 
 from typing import Dict, Set, Optional, List
 from .models import Skill
 
 
-class UserSkillPolicy:
-    """Enforces which skills are available to which users and sessions.
+class SkillPolicy:
+    """Enforces which skills are available to which sessions.
 
     Resolution order (highest priority first):
 
-    1. Per-user explicit disable - always blocks the skill.
-    2. Per-user explicit enable ∪ session enable - union of both sets.
+    1. Per-session explicit disable - always blocks the skill.
+    2. Per-session explicit enable - overrides defaults.
     3. Global defaults - skills whose ``enabled_by_default`` flag is ``True``.
+    4. Fixed session grant (``set_session_skills``) - unioned with the above.
     """
 
     def __init__(self) -> None:
-        self._user_enabled: Dict[str, Set[str]] = {}
-        self._user_disabled: Dict[str, Set[str]] = {}
-        self._session_policies: Dict[str, Set[str]] = {}
+        self._session_enabled: Dict[str, Set[str]] = {}
+        self._session_disabled: Dict[str, Set[str]] = {}
+        self._session_fixed: Dict[str, Set[str]] = {}
         self._default_skills: Set[str] = set()
 
     def set_default_skills(self, skills: List[Skill]) -> None:
@@ -35,92 +36,72 @@ class UserSkillPolicy:
 
         Args:
             skills: All discovered skills; those with ``enabled_by_default=True``
-                become the baseline for users with no explicit grants.
+                become the baseline for sessions with no explicit grants.
         """
         self._default_skills = {s.name for s in skills if s.enabled_by_default}
 
-    def enable_skill_for_user(self, user_id: str, skill_name: str) -> None:
-        """Grant a skill to a specific user, overriding any previous disable.
+    def enable_skill(self, session_id: str, skill_name: str) -> None:
+        """Grant a skill for a session, overriding any previous disable.
 
         Args:
-            user_id: Opaque user identifier (matches the ``user_id`` in AgentState).
+            session_id: Session identifier (matches the ``thread_id`` passed to invoke).
             skill_name: Exact skill name as declared in its SKILL.MD frontmatter.
         """
-        self._user_enabled.setdefault(user_id, set()).add(skill_name)
-        self._user_disabled.get(user_id, set()).discard(skill_name)
+        self._session_enabled.setdefault(session_id, set()).add(skill_name)
+        self._session_disabled.get(session_id, set()).discard(skill_name)
 
-    def disable_skill_for_user(self, user_id: str, skill_name: str) -> None:
-        """Block a skill for a specific user, even if it is a global default.
+    def disable_skill(self, session_id: str, skill_name: str) -> None:
+        """Block a skill for a session, even if it is a global default.
 
         Args:
-            user_id: Opaque user identifier.
+            session_id: Session identifier.
             skill_name: Exact skill name to block.
         """
-        self._user_disabled.setdefault(user_id, set()).add(skill_name)
-        self._user_enabled.get(user_id, set()).discard(skill_name)
-
-    def get_allowed_skills_for_user(self, user_id: str) -> Set[str]:
-        """Return the set of skill names allowed for a user (ignoring session grants).
-
-        Args:
-            user_id: Opaque user identifier.
-
-        Returns:
-            Union of the user's explicit enables and global defaults, minus any
-            explicit disables.
-        """
-        enabled = self._user_enabled.get(user_id, set()) | self._default_skills
-        disabled = self._user_disabled.get(user_id, set())
-        return enabled - disabled
+        self._session_disabled.setdefault(session_id, set()).add(skill_name)
+        self._session_enabled.get(session_id, set()).discard(skill_name)
 
     def enable_skills_for_session(self, session_id: str, skill_names: List[str]) -> None:
         """Grant a fixed set of skills for the duration of a session.
 
-        Session grants are additive with user grants when both are provided to
-        ``get_allowed_skills``.  They are not affected by user-level disables.
+        Fixed grants are additive with per-session enables and are not affected
+        by per-session disables.
 
         Args:
-            session_id: Opaque session identifier (matches ``session_id`` in AgentState).
-            skill_names: Skills to enable for this session (replaces any prior session grant).
+            session_id: Session identifier.
+            skill_names: Skills to enable for this session (replaces any prior fixed grant).
         """
-        self._session_policies[session_id] = set(skill_names)
+        self._session_fixed[session_id] = set(skill_names)
 
     def get_allowed_skills_for_session(self, session_id: str) -> Set[str]:
-        """Return the set of skill names granted to a session.
+        """Return the full set of skill names allowed for a session.
+
+        Merges per-session incremental grants/blocks with the global defaults
+        and any fixed grant set via ``enable_skills_for_session``.
 
         Args:
-            session_id: Opaque session identifier.
+            session_id: Session identifier.
 
         Returns:
-            The session's skill grant set, or an empty set if none was registered.
+            Set of skill names the session is permitted to use.
         """
-        return self._session_policies.get(session_id, set())
+        enabled = self._session_enabled.get(session_id, set()) | self._default_skills
+        disabled = self._session_disabled.get(session_id, set())
+        base = enabled - disabled
+        fixed = self._session_fixed.get(session_id, set())
+        return base | fixed
 
-    def get_allowed_skills(
-        self,
-        user_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> Set[str]:
-        """Return the full set of skill names allowed for a user/session combination.
+    def get_allowed_skills(self, session_id: Optional[str] = None) -> Set[str]:
+        """Return the full set of skill names allowed for a session.
 
-        This is the method called by the agent on every turn.  It applies the
-        priority rules described in the class docstring.
+        This is the method called by the agent on every turn.
 
         Args:
-            user_id: Optional user identifier.  ``None`` means anonymous - only
-                global defaults apply.
-            session_id: Optional session identifier.  Session grants are unioned
-                with user grants when both are provided.
+            session_id: Session identifier.  ``None`` means no session context -
+                only global defaults apply.
 
         Returns:
-            Set of skill names the user/session is permitted to use this turn.
+            Set of skill names the session is permitted to use this turn.
         """
-        if not user_id and not session_id:
+        if not session_id:
             return set(self._default_skills)
-
-        allowed: Set[str] = set()
-        if user_id:
-            allowed.update(self.get_allowed_skills_for_user(user_id))
-        if session_id:
-            allowed.update(self.get_allowed_skills_for_session(session_id))
-        return allowed
+        return self.get_allowed_skills_for_session(session_id)

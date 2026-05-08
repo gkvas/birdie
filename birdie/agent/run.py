@@ -14,7 +14,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from ..core.registry import SkillRegistry
 from ..core.loader import discover_skills_from_directory
-from ..core.policy import UserSkillPolicy
+from ..core.policy import SkillPolicy
 from ..core.mcp_client import MCPClientManager
 from ..core.llm_provider import (
     LLMProvider,
@@ -77,7 +77,7 @@ class DynamicAgent:
 
         self.skills_dir = skills_dir
         self.registry = SkillRegistry()
-        self.policy = UserSkillPolicy()
+        self.policy = SkillPolicy()
         self.mcp_manager = MCPClientManager()
 
         self._load_skills()
@@ -153,19 +153,23 @@ class DynamicAgent:
         """Release resources - call when the agent is no longer needed."""
         pass  # MCPClientManager uses per-call sessions; nothing to tear down
 
-    def enable_skill_for_user(self, user_id: str, skill_name: str) -> None:
-        """Grant a skill for a session (``user_id`` is the ``thread_id`` / session ID).
+    def enable_skill(self, session_id: str, skill_name: str) -> None:
+        """Grant a skill for a session. Takes effect on the next turn.
 
-        Takes effect on the next turn.
+        Args:
+            session_id: The ``thread_id`` used when invoking the agent.
+            skill_name: Exact skill name as declared in its SKILL.MD frontmatter.
         """
-        self.policy.enable_skill_for_user(user_id, skill_name)
+        self.policy.enable_skill(session_id, skill_name)
 
-    def disable_skill_for_user(self, user_id: str, skill_name: str) -> None:
-        """Block a skill for a session (``user_id`` is the ``thread_id`` / session ID).
+    def disable_skill(self, session_id: str, skill_name: str) -> None:
+        """Block a skill for a session, overriding global defaults.
 
-        Overrides global defaults.
+        Args:
+            session_id: The ``thread_id`` used when invoking the agent.
+            skill_name: Exact skill name to block.
         """
-        self.policy.disable_skill_for_user(user_id, skill_name)
+        self.policy.disable_skill(session_id, skill_name)
 
     def enable_skills_for_session(self, session_id: str, skill_names: List[str]) -> None:
         """Grant a fixed skill set for the lifetime of a session."""

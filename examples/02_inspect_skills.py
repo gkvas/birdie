@@ -63,24 +63,24 @@ def main() -> None:
         print()
 
     # ── 4. Default policy — which skills are on without explicit grants ───────
-    default_allowed = agent.policy.get_allowed_skills_for_user("any-user")
+    default_allowed = agent.policy.get_allowed_skills()
     print("=== Default Allowed Skills ===")
-    print(f"  {sorted(default_allowed) or '(none — all skills are disabled by default)'}")
+    print(f"  {sorted(default_allowed) or '(none - all skills are disabled by default)'}")
     print()
 
     # ── 5. Enable skills for a session ───────────────────────────────────────
     SESSION = "demo-session"
-    agent.enable_skill_for_user(SESSION, "Shell")
-    agent.enable_skill_for_user(SESSION, "DuckDuckGo")
+    agent.enable_skill(SESSION, "Shell")
+    agent.enable_skill(SESSION, "DuckDuckGo")
 
-    session_allowed = agent.policy.get_allowed_skills(user_id=SESSION)
+    session_allowed = agent.policy.get_allowed_skills(session_id=SESSION)
     print(f"=== Allowed for session '{SESSION}' (after enables) ===")
     print(f"  {sorted(session_allowed)}")
     print()
 
     # ── 6. Disable one of the enabled skills ─────────────────────────────────
-    agent.disable_skill_for_user(SESSION, "DuckDuckGo")
-    after_disable = agent.policy.get_allowed_skills(user_id=SESSION)
+    agent.disable_skill(SESSION, "DuckDuckGo")
+    after_disable = agent.policy.get_allowed_skills(session_id=SESSION)
     print(f"=== After disabling DuckDuckGo ===")
     print(f"  {sorted(after_disable)}")
     print()

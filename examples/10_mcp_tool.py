@@ -70,7 +70,7 @@ async def main() -> None:
         ),
     )
 
-    agent.enable_skill_for_user(SESSION_ID, "mcp_demo")
+    agent.enable_skill(SESSION_ID, "mcp_demo")
 
     # ── Discover tools from the MCP server ───────────────────────────────────
     print("=== Discovering MCP tools ===")

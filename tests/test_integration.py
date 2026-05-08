@@ -91,7 +91,7 @@ async def test_agent_integration(temp_skills_dir):
 
 @pytest.mark.asyncio
 async def test_dynamic_tool_binding():
-    """Tools are filtered to only those allowed for the current user/session."""
+    """Tools are filtered to only those allowed for the current session."""
 
     class MockLLM:
         def __init__(self):
@@ -144,7 +144,7 @@ schema:
         assert llm.bound_tools[0].name == "publicskill_tool"
 
         # Enable PrivateSkill for thread user123 — both should be visible
-        agent.enable_skill_for_user("user123", "PrivateSkill")
+        agent.enable_skill("user123", "PrivateSkill")
         await agent.invoke("Test message", thread_id="user123")
         assert len(llm.bound_tools) == 2
         tool_names = {t.name for t in llm.bound_tools}
@@ -187,7 +187,7 @@ def test_load_skills_registers_all_skills():
         assert "SkillB" in names
 
         # Policy seeded: SkillA enabled by default, SkillB not
-        allowed = agent.policy.get_allowed_skills_for_user("default")
+        allowed = agent.policy.get_allowed_skills_for_session("default")
         assert "SkillA" in allowed
         assert "SkillB" not in allowed
 
