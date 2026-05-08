@@ -3,8 +3,8 @@ Interactive REPL for Birdie.
 
 Presents a prompt-toolkit prompt with:
 
-- Streaming output rendered via Rich (tool calls in yellow panels, AI text
-  in green Markdown panels).
+- Streaming output rendered via Rich (tool calls with 🐦 prefix, AI text
+  indented as plain text, tool output indented with ⎿).
 - A bottom status bar showing vendor, model, session ID, and token counters.
 - Slash commands for session management, skill control, and navigation.
 - Ctrl+C to quit; Ctrl+J to insert a newline for multi-line input.
@@ -36,7 +36,6 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 
 from rich.console import Console
-from rich.markdown import Markdown
 
 from .agent.run import DynamicAgent
 from .core.models import Skill
@@ -316,9 +315,8 @@ class BirdieCLI:
         n = len(lines)
 
         if self._tool_output_mode == "off":
-            self.console.print(
-                f"  [dim]⎿  {n} line{'s' if n != 1 else ''}[/dim]"
-            )
+            self.console.print(f"[dim]   {n} line{'s' if n != 1 else ''}[/dim]")
+            self.console.print()
             return
 
         if self._tool_output_mode == "short":
@@ -330,13 +328,13 @@ class BirdieCLI:
             display_lines = lines
             remaining = 0
 
-        for i, line in enumerate(display_lines):
-            prefix = "  ⎿  " if i == 0 else "     "
-            self.console.print(f"[dim]{prefix}{line}[/dim]", highlight=False)
+        for line in display_lines:
+            self.console.print(f"[dim]   {line}[/dim]", highlight=False)
         if remaining > 0:
             self.console.print(
-                f"  [dim]... {remaining} more character{'s' if remaining != 1 else ''}[/dim]"
+                f"[dim]   ... {remaining} more character{'s' if remaining != 1 else ''}[/dim]"
             )
+        self.console.print()
 
     # -- logging --------------------------------------------------------------
 
@@ -711,7 +709,7 @@ class BirdieCLI:
                                         f"{k}={v!r}" for k, v in tc["args"].items()
                                     )
                                     self.console.print(
-                                        f"[bold cyan]●[/bold cyan] [bold]{tc['name']}[/bold]({args_str})"
+                                        f"🐦 [bold]{tc['name']}[/bold]({args_str})"
                                     )
                                 if getattr(msg, "tool_calls", None):
                                     status.update("[dim]running tools…[/dim]")
@@ -723,7 +721,11 @@ class BirdieCLI:
                                             b.get("text", "") if isinstance(b, dict) else str(b)
                                             for b in content
                                         )
-                                    self.console.print(Markdown(str(content)))
+                                    lines = str(content).splitlines()
+                                    for i, line in enumerate(lines):
+                                        prefix = "🐦 " if i == 0 else "   "
+                                        self.console.print(f"{prefix}{line}", highlight=False)
+                                    self.console.print()
                                     printed_any = True
         finally:
             status.stop()
