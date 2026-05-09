@@ -2,6 +2,31 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.11] - 2026-05-09
+
+### Added
+- `max_tool_repetitions` guard: blocks any tool call that appears more than N
+  times consecutively with identical parameters; injects an error `ToolMessage`
+  so the LLM can recover instead of looping forever; configurable per sub-agent
+  via `max_tool_repetitions` in AGENT.MD (default 3)
+- `/agent output off|short|full` command to control sub-agent transcript
+  verbosity independently from `/tool output`; default is `off` (transcript
+  hidden, only the final reply shown as a tool result)
+- Sub-agent output rendered as a buffered, indented transcript block printed
+  after the agent completes: `[AgentName#xxxx]` header at 3-space indent,
+  tool calls and AI messages at 6-space indent, args/results at 9-space indent
+
+### Fixed
+- `recursion_limit` was not forwarded on the streaming path (`astream()`
+  lacked a `config` parameter, so the inner agent always used the LangGraph
+  default of 25); now forwarded correctly via the same config-merging logic
+  used in `invoke()`
+
+### Changed
+- README split into focused documentation files under `doc/`: `cli.md`,
+  `skills.md`, `agents.md`, `mcp.md`, `architecture.md`; README is now a
+  concise entry point with links to each file
+
 ## [0.2.10] - 2026-05-08
 
 ### Changed
