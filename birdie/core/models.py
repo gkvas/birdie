@@ -40,6 +40,33 @@ class SkillTool(BaseModel):
     tags: List[str] = []
     
 
+class AgentParam(BaseModel):
+    """A single input or output parameter declared in an AGENTS.MD file."""
+    name: str
+    type: str = "string"
+    description: str = ""
+    required: bool = True
+
+
+class AgentDef(BaseModel):
+    """A sub-agent defined by an AGENTS.MD file.
+
+    Each AgentDef surfaces as an async tool to the calling agent.  At
+    invocation time the prompt template is rendered with the input params,
+    then an ephemeral DynamicAgent is run and its final reply is returned.
+    """
+    name: str
+    version: str = "1.0.0"
+    description: str
+    enabled_by_default: bool = False
+    vendor: Optional[str] = None
+    model: Optional[str] = None
+    allowed_skills: List[str] = []
+    input_params: List[AgentParam] = []
+    output_params: List[AgentParam] = []
+    prompt: str
+
+
 class Skill(BaseModel):
     """
     A self-contained capability bundle.

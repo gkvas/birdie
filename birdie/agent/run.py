@@ -16,6 +16,9 @@ from ..core.registry import SkillRegistry
 from ..core.loader import discover_skills_from_directory
 from ..core.policy import SkillPolicy
 from ..core.mcp_client import MCPClientManager
+from ..core.agent_loader import discover_agents_from_directory
+from ..core.agent_registry import AgentRegistry
+from ..core.agent_runner import agentdef_to_langchain_tool
 from ..core.llm_provider import (
     LLMProvider,
     LangChainProvider,
@@ -79,11 +82,14 @@ class DynamicAgent:
         self.registry = SkillRegistry()
         self.policy = SkillPolicy()
         self.mcp_manager = MCPClientManager()
+        self.agent_registry = AgentRegistry()
 
         self._load_skills()
+        self._load_agents()
 
         graph = create_agent_graph(
-            self.provider, self.registry, self.policy, self.mcp_manager
+            self.provider, self.registry, self.policy, self.mcp_manager,
+            self.agent_registry,
         )
         self.app = graph.compile(checkpointer=checkpointer or MemorySaver())
 
@@ -148,6 +154,24 @@ class DynamicAgent:
                 if skill.mcp_server is not None:
                     self.mcp_manager.register_server(skill.name, skill.mcp_server)
         self.policy.set_default_skills(self.registry.list_skills())
+
+    def _load_agents(self) -> None:
+        """Discover AGENTS.MD files from ~/.birdie/agents/ and register them."""
+        user_agents_dir = Path.home() / ".birdie" / "agents"
+        if not user_agents_dir.is_dir():
+            return
+
+        vendor = getattr(self.provider, 'vendor_name', None)
+        model = getattr(self.provider, 'model_name', None)
+
+        for agent_def in discover_agents_from_directory(str(user_agents_dir)):
+            tool = agentdef_to_langchain_tool(
+                agent_def,
+                skills_dir=self.skills_dir,
+                fallback_vendor=vendor,
+                fallback_model=model,
+            )
+            self.agent_registry.register(agent_def, tool)
 
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""
