@@ -85,7 +85,11 @@ def agentdef_to_langchain_tool(
         )
         sub_agent.enable_skills_for_session("_run", agent_def.allowed_skills)
 
-        result = await sub_agent.invoke(prompt, thread_id="_run")
+        result = await sub_agent.invoke(
+            prompt,
+            thread_id="_run",
+            config={"recursion_limit": agent_def.recursion_limit},
+        )
         last = result["messages"][-1]
         content = last.content
         if isinstance(content, list):

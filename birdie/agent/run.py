@@ -278,9 +278,11 @@ class DynamicAgent:
             "long_term_memory": long_term_memory or [],
         }}
         if config:
-            run_config.setdefault("configurable", {}).update(
-                config.get("configurable", {})
-            )
+            for k, v in config.items():
+                if k == "configurable":
+                    run_config.setdefault("configurable", {}).update(v)
+                else:
+                    run_config[k] = v
         return await self.app.ainvoke(initial_state, run_config)
 
     async def astream(
