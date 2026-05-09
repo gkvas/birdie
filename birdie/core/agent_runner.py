@@ -126,7 +126,7 @@ def agentdef_to_langchain_tool(
         # Streaming path: print each node update with the run_id prefix.
         prefix = f"[dim]\\[{run_id}][/dim]"
         final_content = ""
-        async for update in sub_agent.astream(prompt, thread_id="_run"):
+        async for update in sub_agent.astream(prompt, thread_id="_run", config=invoke_config):
             for _node, data in update.items():
                 for msg in data.get("messages", []):
                     if isinstance(msg, AIMessage):

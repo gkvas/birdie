@@ -295,6 +295,7 @@ class DynamicAgent:
         message: str,
         thread_id: str = "default",
         long_term_memory: Optional[List[str]] = None,
+        config: Optional[Dict[str, Any]] = None,
         # Legacy keyword-only aliases
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -305,6 +306,7 @@ class DynamicAgent:
             message: The user's input text for this turn.
             thread_id: Session identifier (see ``invoke`` for full semantics).
             long_term_memory: LTM strings injected into the system prompt.
+            config: Optional extra LangGraph run config (e.g. recursion_limit).
         """
         effective_thread = thread_id
         if effective_thread == "default" and (user_id or session_id):
@@ -317,5 +319,11 @@ class DynamicAgent:
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
         }}
+        if config:
+            for k, v in config.items():
+                if k == "configurable":
+                    run_config.setdefault("configurable", {}).update(v)
+                else:
+                    run_config[k] = v
         async for update in self.app.astream(initial_state, run_config, stream_mode="updates"):
             yield update
