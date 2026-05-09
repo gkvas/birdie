@@ -83,7 +83,7 @@ class DynamicAgent:
         self.skills_dir = skills_dir
         self.agents_dir = agents_dir
         self._agent_console = agent_console
-        self.tool_output_mode: str = "short"
+        self.agent_output_mode: str = "off"
         self.registry = SkillRegistry()
         self.policy = SkillPolicy()
         self.mcp_manager = MCPClientManager()
@@ -190,7 +190,7 @@ class DynamicAgent:
                     fallback_vendor=vendor,
                     fallback_model=model,
                     console=self._agent_console,
-                    get_tool_output_mode=lambda: self.tool_output_mode,
+                    get_tool_output_mode=lambda: self.agent_output_mode,
                 )
                 self.agent_registry.register(agent_def, tool)
 

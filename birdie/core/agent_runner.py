@@ -210,7 +210,7 @@ def agentdef_to_langchain_tool(
             return _extract_text(last.content)
 
         # Streaming path: collect messages, then print as one block.
-        mode = get_tool_output_mode() if get_tool_output_mode else "short"
+        mode = get_tool_output_mode() if get_tool_output_mode else "off"
         final_content = ""
         transcript: List[Tuple[str, Any]] = []
 
