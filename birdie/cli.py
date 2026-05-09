@@ -919,7 +919,7 @@ def main() -> None:
         or "default"
     )
     skills_dir = args.skills_dir or os.path.join(os.path.dirname(__file__), "skills")
-    agents_dir = args.agents_dir or None
+    agents_dir = args.agents_dir or os.path.join(os.path.dirname(__file__), "agents")
     provider_config = Path(args.config) if args.config else None
 
     asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config))
