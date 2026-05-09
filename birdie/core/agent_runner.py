@@ -9,8 +9,10 @@ At call time:
 """
 
 import re
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, Callable, Dict, List, Optional
 
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
 from .models import AgentDef, AgentParam
@@ -45,12 +47,34 @@ def _input_schema(params: List[AgentParam]) -> dict:
     return schema
 
 
+def _extract_text(content: Any) -> str:
+    """Normalise AIMessage/ToolMessage content to a plain string."""
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") if isinstance(b, dict) else str(b)
+            for b in content
+        )
+    return str(content)
+
+
+def _args_preview(args: Dict[str, Any], max_val: int = 60) -> str:
+    """Format tool-call args dict for one-line display, truncating long values."""
+    parts = []
+    for k, v in args.items():
+        s = repr(v)
+        if len(s) > max_val:
+            s = s[:max_val] + "…'"
+        parts.append(f"{k}={s}")
+    return ", ".join(parts)
+
+
 def agentdef_to_langchain_tool(
     agent_def: AgentDef,
     skills_dir: str,
     agents_dir: Optional[str] = None,
     fallback_vendor: Optional[str] = None,
     fallback_model: Optional[str] = None,
+    console: Optional[Any] = None,
 ) -> StructuredTool:
     """Wrap an AgentDef as an async LangChain StructuredTool.
 
@@ -60,6 +84,9 @@ def agentdef_to_langchain_tool(
         agents_dir: Agents directory passed to the ephemeral DynamicAgent.
         fallback_vendor: Vendor to use if agent_def.vendor is unset.
         fallback_model: Model to use if agent_def.model is unset.
+        console: Optional rich Console. When provided the sub-agent streams its
+            work to the console with a unique ``[Name#xxxx]`` prefix so multiple
+            agents can be distinguished.
 
     Returns:
         An async StructuredTool the calling agent can invoke as a regular tool.
@@ -85,19 +112,44 @@ def agentdef_to_langchain_tool(
         )
         sub_agent.enable_skills_for_session("_run", agent_def.allowed_skills)
 
-        result = await sub_agent.invoke(
-            prompt,
-            thread_id="_run",
-            config={"recursion_limit": agent_def.recursion_limit},
-        )
-        last = result["messages"][-1]
-        content = last.content
-        if isinstance(content, list):
-            content = "\n".join(
-                b.get("text", "") if isinstance(b, dict) else str(b)
-                for b in content
+        run_id = f"{agent_def.name}#{uuid.uuid4().hex[:4]}"
+        invoke_config = {"recursion_limit": agent_def.recursion_limit}
+
+        if console is None:
+            # Silent path: run to completion and return the last message.
+            result = await sub_agent.invoke(
+                prompt, thread_id="_run", config=invoke_config,
             )
-        return str(content)
+            last = result["messages"][-1]
+            return _extract_text(last.content)
+
+        # Streaming path: print each node update with the run_id prefix.
+        prefix = f"[dim]\\[{run_id}][/dim]"
+        final_content = ""
+        async for update in sub_agent.astream(prompt, thread_id="_run"):
+            for _node, data in update.items():
+                for msg in data.get("messages", []):
+                    if isinstance(msg, AIMessage):
+                        if getattr(msg, "tool_calls", None):
+                            for tc in msg.tool_calls:
+                                preview = _args_preview(tc["args"])
+                                console.print(
+                                    f"{prefix} 🐦 [bold]{tc['name']}[/bold]({preview})"
+                                )
+                        elif msg.content:
+                            text = _extract_text(msg.content)
+                            final_content = text
+                            lines = text.splitlines()
+                            if lines:
+                                console.print(f"{prefix} 🐦 {lines[0]}")
+                            for line in lines[1:]:
+                                console.print(f"{prefix}    {line}")
+                    elif isinstance(msg, ToolMessage):
+                        text = _extract_text(msg.content)
+                        first = text.splitlines()[0][:200] if text else ""
+                        console.print(f"{prefix}    {first}")
+
+        return final_content
 
     from .adapter import create_args_schema
     schema = _input_schema(agent_def.input_params)

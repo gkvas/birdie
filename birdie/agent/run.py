@@ -71,6 +71,7 @@ class DynamicAgent:
         llm_or_provider: Any,
         skills_dir: str = "skills",
         agents_dir: Optional[str] = None,
+        agent_console=None,
         checkpointer=None,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
@@ -81,6 +82,7 @@ class DynamicAgent:
 
         self.skills_dir = skills_dir
         self.agents_dir = agents_dir
+        self._agent_console = agent_console
         self.registry = SkillRegistry()
         self.policy = SkillPolicy()
         self.mcp_manager = MCPClientManager()
@@ -101,6 +103,7 @@ class DynamicAgent:
         provider_config: "Dict[str, Any] | str | Path | ProviderConfig | None" = None,
         skills_dir: str = "skills",
         agents_dir: Optional[str] = None,
+        agent_console=None,
         checkpointer=None,
     ) -> "DynamicAgent":
         """
@@ -140,7 +143,8 @@ class DynamicAgent:
                     provider_config["model"] = os.environ["LLM_MODEL"]
 
         provider = get_llm_provider(provider_config)
-        return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir, checkpointer=checkpointer)
+        return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir,
+                   agent_console=agent_console, checkpointer=checkpointer)
 
     # -- skill management ---------------------------------------------------
 
@@ -184,6 +188,7 @@ class DynamicAgent:
                     agents_dir=self.agents_dir,
                     fallback_vendor=vendor,
                     fallback_model=model,
+                    console=self._agent_console,
                 )
                 self.agent_registry.register(agent_def, tool)
 

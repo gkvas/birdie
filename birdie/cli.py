@@ -1005,7 +1005,7 @@ async def _async_main(
         try:
             agent = DynamicAgent.from_config(
                 provider_config, skills_dir=skills_dir, agents_dir=agents_dir,
-                checkpointer=checkpointer,
+                agent_console=console, checkpointer=checkpointer,
             )
         except ValueError as exc:
             _abort(console, f"[bold red]Configuration error:[/bold red] {exc}\n\n{_PROVIDER_HELP}")
