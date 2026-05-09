@@ -80,6 +80,8 @@ def parse_agent_markdown(content: str) -> AgentDef:
         vendor=frontmatter.get('vendor'),
         model=frontmatter.get('model'),
         allowed_skills=frontmatter.get('allowed_skills', []),
+        recursion_limit=int(frontmatter.get('recursion_limit', 25)),
+        max_tool_repetitions=int(frontmatter.get('max_tool_repetitions', 3)),
         input_params=input_params,
         output_params=output_params,
         prompt=prompt,

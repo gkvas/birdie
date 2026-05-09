@@ -62,6 +62,8 @@ class AgentDef(BaseModel):
     vendor: Optional[str] = None
     model: Optional[str] = None
     allowed_skills: List[str] = []
+    recursion_limit: int = 25
+    max_tool_repetitions: int = 3
     input_params: List[AgentParam] = []
     output_params: List[AgentParam] = []
     prompt: str

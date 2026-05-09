@@ -71,6 +71,7 @@ class DynamicAgent:
         llm_or_provider: Any,
         skills_dir: str = "skills",
         agents_dir: Optional[str] = None,
+        agent_console=None,
         checkpointer=None,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
@@ -81,6 +82,8 @@ class DynamicAgent:
 
         self.skills_dir = skills_dir
         self.agents_dir = agents_dir
+        self._agent_console = agent_console
+        self.agent_output_mode: str = "off"
         self.registry = SkillRegistry()
         self.policy = SkillPolicy()
         self.mcp_manager = MCPClientManager()
@@ -101,6 +104,7 @@ class DynamicAgent:
         provider_config: "Dict[str, Any] | str | Path | ProviderConfig | None" = None,
         skills_dir: str = "skills",
         agents_dir: Optional[str] = None,
+        agent_console=None,
         checkpointer=None,
     ) -> "DynamicAgent":
         """
@@ -140,7 +144,8 @@ class DynamicAgent:
                     provider_config["model"] = os.environ["LLM_MODEL"]
 
         provider = get_llm_provider(provider_config)
-        return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir, checkpointer=checkpointer)
+        return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir,
+                   agent_console=agent_console, checkpointer=checkpointer)
 
     # -- skill management ---------------------------------------------------
 
@@ -184,6 +189,8 @@ class DynamicAgent:
                     agents_dir=self.agents_dir,
                     fallback_vendor=vendor,
                     fallback_model=model,
+                    console=self._agent_console,
+                    get_tool_output_mode=lambda: self.agent_output_mode,
                 )
                 self.agent_registry.register(agent_def, tool)
 
@@ -278,9 +285,11 @@ class DynamicAgent:
             "long_term_memory": long_term_memory or [],
         }}
         if config:
-            run_config.setdefault("configurable", {}).update(
-                config.get("configurable", {})
-            )
+            for k, v in config.items():
+                if k == "configurable":
+                    run_config.setdefault("configurable", {}).update(v)
+                else:
+                    run_config[k] = v
         return await self.app.ainvoke(initial_state, run_config)
 
     async def astream(
@@ -288,6 +297,7 @@ class DynamicAgent:
         message: str,
         thread_id: str = "default",
         long_term_memory: Optional[List[str]] = None,
+        config: Optional[Dict[str, Any]] = None,
         # Legacy keyword-only aliases
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
@@ -298,6 +308,7 @@ class DynamicAgent:
             message: The user's input text for this turn.
             thread_id: Session identifier (see ``invoke`` for full semantics).
             long_term_memory: LTM strings injected into the system prompt.
+            config: Optional extra LangGraph run config (e.g. recursion_limit).
         """
         effective_thread = thread_id
         if effective_thread == "default" and (user_id or session_id):
@@ -310,5 +321,11 @@ class DynamicAgent:
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
         }}
+        if config:
+            for k, v in config.items():
+                if k == "configurable":
+                    run_config.setdefault("configurable", {}).update(v)
+                else:
+                    run_config[k] = v
         async for update in self.app.astream(initial_state, run_config, stream_mode="updates"):
             yield update

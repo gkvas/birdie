@@ -72,6 +72,9 @@ HELP_TEXT = """
   [yellow]/agent list[/yellow]                   List all loaded agents with status
   [yellow]/agent enable <name>[/yellow]          Enable an agent (persists to session)
   [yellow]/agent disable <name>[/yellow]         Disable an agent (persists to session)
+  [yellow]/agent output full[/yellow]            Show complete sub-agent transcript
+  [yellow]/agent output short[/yellow]           Show sub-agent transcript truncated to 1000 chars
+  [yellow]/agent output off[/yellow]             Hide sub-agent transcript (default)
 
   [bold]Logging commands[/bold]
   [yellow]/log llm on[/yellow]                  Enable LLM request/response logging to ~/.birdie/llm.log
@@ -88,6 +91,7 @@ HELP_TEXT = """
 """
 
 _TOOL_OUTPUT_MODES = ("full", "short", "off")
+_AGENT_OUTPUT_MODES = ("full", "short", "off")
 
 
 
@@ -99,18 +103,20 @@ class BirdieCLI:
         session: Session,
         user_id: str,
         user_memory: UserMemory,
+        console: Optional[Console] = None,
     ) -> None:
         self.agent = agent
         self.session_manager = session_manager
         self.session = session
         self.user_id = user_id
         self.user_memory = user_memory
-        self.console = Console()
+        self.console = console or Console()
 
         self._total_in: int = 0
         self._total_out: int = 0
         self._last_context: int = 0
         self._tool_output_mode: str = "short"
+        self._agent_output_mode: str = "off"
         self._llm_log_handler: Optional[logging.FileHandler] = None
         self._orig_async_send = None
         self._orig_sync_send = None
@@ -614,9 +620,19 @@ class BirdieCLI:
                     self.session_manager.save(self.session)
                     self.console.print(f"[red]Disabled[/red] {resolved}")
 
+        elif subcmd == "output":
+            if subarg.lower() not in _AGENT_OUTPUT_MODES:
+                self.console.print(
+                    "[red]Usage: /agent output full|short|off[/red]"
+                )
+            else:
+                self._agent_output_mode = subarg.lower()
+                self.agent.agent_output_mode = subarg.lower()
+                self.console.print(f"[dim]Agent output mode: [bold]{subarg.lower()}[/bold][/dim]")
+
         else:
             self.console.print(
-                "[red]Usage: /agent list | enable <name> | disable <name>[/red]"
+                "[red]Usage: /agent list | enable <name> | disable <name> | output full|short|off[/red]"
             )
 
     def _handle_session(self, arg: str) -> None:
@@ -785,7 +801,15 @@ class BirdieCLI:
                     if node_name == "tools":
                         for msg in msgs:
                             if isinstance(msg, ToolMessage):
-                                self._render_tool_output(msg.name or "", str(msg.content))
+                                name = msg.name or ""
+                                # Sub-agents print their own transcript; skip
+                                # _render_tool_output unless mode is "off" (no
+                                # transcript shown) or it's a regular skill tool.
+                                is_agent = self.agent.agent_registry.get_agent(name) is not None
+                                if is_agent and self._agent_output_mode != "off":
+                                    pass  # transcript already printed by the tool
+                                else:
+                                    self._render_tool_output(name, str(msg.content))
                         status.update("[dim]thinking…[/dim]")
 
                     elif node_name == "agent":
@@ -1005,7 +1029,7 @@ async def _async_main(
         try:
             agent = DynamicAgent.from_config(
                 provider_config, skills_dir=skills_dir, agents_dir=agents_dir,
-                checkpointer=checkpointer,
+                agent_console=console, checkpointer=checkpointer,
             )
         except ValueError as exc:
             _abort(console, f"[bold red]Configuration error:[/bold red] {exc}\n\n{_PROVIDER_HELP}")
@@ -1018,6 +1042,7 @@ async def _async_main(
             session=session,
             user_id=user_id,
             user_memory=user_memory,
+            console=console,
         )
         await cli.run()
 
