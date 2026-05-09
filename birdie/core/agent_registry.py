@@ -56,6 +56,10 @@ class AgentRegistry:
         """Remove an agent from a session's allowed set."""
         self._session(session_id).discard(name)
 
+    def enable_agents_for_session(self, session_id: str, agent_names: List[str]) -> None:
+        """Replace a session's allowed set with an explicit list."""
+        self._session_agents[session_id] = set(agent_names)
+
     def get_allowed_agents(self, session_id: Optional[str] = None) -> Set[str]:
         """Return allowed agent names for a session (defaults if no session)."""
         if not session_id:

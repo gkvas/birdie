@@ -210,6 +210,30 @@ class DynamicAgent:
         """Grant a fixed skill set for the lifetime of a session."""
         self.policy.enable_skills_for_session(session_id, skill_names)
 
+    # -- agent management ---------------------------------------------------
+
+    def enable_agent(self, session_id: str, agent_name: str) -> None:
+        """Grant an agent for a session. Takes effect on the next turn.
+
+        Args:
+            session_id: The ``thread_id`` used when invoking the agent.
+            agent_name: Exact agent name as declared in its AGENTS.MD frontmatter.
+        """
+        self.agent_registry.enable_agent(session_id, agent_name)
+
+    def disable_agent(self, session_id: str, agent_name: str) -> None:
+        """Block an agent for a session, overriding global defaults.
+
+        Args:
+            session_id: The ``thread_id`` used when invoking the agent.
+            agent_name: Exact agent name to block.
+        """
+        self.agent_registry.disable_agent(session_id, agent_name)
+
+    def enable_agents_for_session(self, session_id: str, agent_names: List[str]) -> None:
+        """Grant a fixed agent set for the lifetime of a session."""
+        self.agent_registry.enable_agents_for_session(session_id, agent_names)
+
     # -- invocation ---------------------------------------------------------
 
     async def invoke(

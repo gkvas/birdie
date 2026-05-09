@@ -90,6 +90,21 @@ class TestAgentRegistrySessionPolicy:
         reg.enable_agent("s1", "ghost")
         assert "ghost" in reg.get_allowed_agents("s1")
 
+    def test_enable_agents_for_session_replaces_set(self):
+        reg = AgentRegistry()
+        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
+        reg.register(_make_def("B", enabled_by_default=False), _make_tool("B"))
+        reg.enable_agents_for_session("s1", ["B"])
+        assert "B" in reg.get_allowed_agents("s1")
+        assert "A" not in reg.get_allowed_agents("s1")
+
+    def test_enable_agents_for_session_isolates_sessions(self):
+        reg = AgentRegistry()
+        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
+        reg.enable_agents_for_session("s1", [])
+        assert "A" not in reg.get_allowed_agents("s1")
+        assert "A" in reg.get_allowed_agents("s2")
+
 
 class TestAgentRegistryGetTools:
     def test_returns_tools_for_allowed(self):
