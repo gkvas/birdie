@@ -41,7 +41,7 @@ class SkillTool(BaseModel):
     
 
 class AgentParam(BaseModel):
-    """A single input or output parameter declared in an AGENTS.MD file."""
+    """A single input or output parameter declared in an AGENT.MD file."""
     name: str
     type: str = "string"
     description: str = ""
@@ -49,7 +49,7 @@ class AgentParam(BaseModel):
 
 
 class AgentDef(BaseModel):
-    """A sub-agent defined by an AGENTS.MD file.
+    """A sub-agent defined by an AGENT.MD file.
 
     Each AgentDef surfaces as an async tool to the calling agent.  At
     invocation time the prompt template is rendered with the input params,

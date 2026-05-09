@@ -159,7 +159,7 @@ class DynamicAgent:
         self.policy.set_default_skills(self.registry.list_skills())
 
     def _load_agents(self) -> None:
-        """Discover AGENTS.MD files from all agent dirs and register them."""
+        """Discover AGENT.MD files from all agent dirs and register them."""
         _bundled = Path(__file__).parent.parent / "agents"
         primary = self.agents_dir or (str(_bundled) if _bundled.is_dir() else None)
 
@@ -220,7 +220,7 @@ class DynamicAgent:
 
         Args:
             session_id: The ``thread_id`` used when invoking the agent.
-            agent_name: Exact agent name as declared in its AGENTS.MD frontmatter.
+            agent_name: Exact agent name as declared in its AGENT.MD frontmatter.
         """
         self.agent_registry.enable_agent(session_id, agent_name)
 

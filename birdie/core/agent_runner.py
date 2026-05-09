@@ -55,7 +55,7 @@ def agentdef_to_langchain_tool(
     """Wrap an AgentDef as an async LangChain StructuredTool.
 
     Args:
-        agent_def: The parsed AGENTS.MD definition.
+        agent_def: The parsed AGENT.MD definition.
         skills_dir: Skills directory passed to the ephemeral DynamicAgent.
         agents_dir: Agents directory passed to the ephemeral DynamicAgent.
         fallback_vendor: Vendor to use if agent_def.vendor is unset.

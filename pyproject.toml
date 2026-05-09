@@ -53,7 +53,7 @@ where = ["."]
 include = ["birdie*"]
 
 [tool.setuptools.package-data]
-"birdie" = ["skills/*/SKILL.MD", "skills/mcp_demo/server.py", "agents/*/AGENTS.MD"]
+"birdie" = ["skills/*/SKILL.MD", "skills/mcp_demo/server.py", "agents/*/AGENT.MD"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -1,4 +1,4 @@
-"""Tests for AGENTS.MD parsing and agent discovery."""
+"""Tests for AGENT.MD parsing and agent discovery."""
 
 import os
 import tempfile
@@ -152,7 +152,7 @@ do {{ thing }}
 
 class TestLoadAgentFromMarkdown:
     def test_loads_from_file(self, tmp_path):
-        f = tmp_path / "AGENTS.MD"
+        f = tmp_path / "AGENT.MD"
         f.write_text(MINIMAL_AGENTS_MD)
         agent = load_agent_from_markdown(str(f))
         assert agent.name == "TestAgent"
@@ -161,20 +161,20 @@ class TestLoadAgentFromMarkdown:
 class TestDiscoverAgentsFromDirectory:
     def test_discovers_in_subdirs(self, tmp_path):
         (tmp_path / "my_agent").mkdir()
-        (tmp_path / "my_agent" / "AGENTS.MD").write_text(MINIMAL_AGENTS_MD)
+        (tmp_path / "my_agent" / "AGENT.MD").write_text(MINIMAL_AGENTS_MD)
 
         agents = discover_agents_from_directory(str(tmp_path))
         assert len(agents) == 1
         assert agents[0].name == "TestAgent"
 
     def test_ignores_non_dirs(self, tmp_path):
-        (tmp_path / "AGENTS.MD").write_text(MINIMAL_AGENTS_MD)
+        (tmp_path / "AGENT.MD").write_text(MINIMAL_AGENTS_MD)
         agents = discover_agents_from_directory(str(tmp_path))
         assert agents == []
 
     def test_skips_broken_files(self, tmp_path):
         (tmp_path / "bad_agent").mkdir()
-        (tmp_path / "bad_agent" / "AGENTS.MD").write_text("not yaml at all ### broken")
+        (tmp_path / "bad_agent" / "AGENT.MD").write_text("not yaml at all ### broken")
 
         agents = discover_agents_from_directory(str(tmp_path))
         assert agents == []
@@ -184,7 +184,7 @@ class TestDiscoverAgentsFromDirectory:
             d = tmp_path / f"agent_{i}"
             d.mkdir()
             content = MINIMAL_AGENTS_MD.replace("TestAgent", f"Agent{i}")
-            (d / "AGENTS.MD").write_text(content)
+            (d / "AGENT.MD").write_text(content)
 
         agents = discover_agents_from_directory(str(tmp_path))
         assert len(agents) == 3

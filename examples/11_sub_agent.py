@@ -1,7 +1,7 @@
 """
-Example 11 - Sub-agents via AGENTS.MD
+Example 11 - Sub-agents via AGENT.MD
 
-Shows how to define a sub-agent at runtime using an AGENTS.MD file written to
+Shows how to define a sub-agent at runtime using an AGENT.MD file written to
 a temporary directory.  The main agent discovers the sub-agent and can call it
 as a regular tool.
 
@@ -88,15 +88,15 @@ applications like chatbots, code assistants, and content generation tools.\
 
 async def main() -> None:
     with tempfile.TemporaryDirectory() as agents_dir:
-        # Write the AGENTS.MD to a subdirectory (one subdirectory = one agent).
+        # Write the AGENT.MD to a subdirectory (one subdirectory = one agent).
         agent_dir = Path(agents_dir) / "Summarizer"
         agent_dir.mkdir()
-        (agent_dir / "AGENTS.MD").write_text(SUMMARIZER_AGENTS_MD)
+        (agent_dir / "AGENT.MD").write_text(SUMMARIZER_AGENTS_MD)
 
         # Parse and inspect the agent definition before wiring it in.
         agent_defs = discover_agents_from_directory(agents_dir)
         summarizer = agent_defs[0]
-        print("=== Sub-agent parsed from AGENTS.MD ===")
+        print("=== Sub-agent parsed from AGENT.MD ===")
         print(f"  name        : {summarizer.name}")
         print(f"  description : {summarizer.description}")
         print(f"  input params: {[p.name for p in summarizer.input_params]}")

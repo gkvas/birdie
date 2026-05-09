@@ -1,7 +1,7 @@
 """
-AGENTS.MD parser and agent discovery.
+AGENT.MD parser and agent discovery.
 
-An AGENTS.MD file defines a sub-agent with structured input/output and a
+An AGENT.MD file defines a sub-agent with structured input/output and a
 prompt template.  Each agent surfaces to the calling LLM as a regular async
 tool whose arguments are the declared input parameters.
 
@@ -58,10 +58,10 @@ from .models import AgentDef, AgentParam
 
 
 def parse_agent_markdown(content: str) -> AgentDef:
-    """Parse an AGENTS.MD file into an AgentDef object."""
+    """Parse an AGENT.MD file into an AgentDef object."""
     fm_match = re.search(r'^---(.*?)---', content, re.DOTALL)
     if not fm_match:
-        raise ValueError("No YAML frontmatter found in AGENTS.MD")
+        raise ValueError("No YAML frontmatter found in AGENT.MD")
     frontmatter = yaml.safe_load(fm_match.group(1))
 
     input_params = _parse_params_section(content, "Input")
@@ -69,7 +69,7 @@ def parse_agent_markdown(content: str) -> AgentDef:
 
     prompt_match = re.search(r'## Prompt\s*\n(.*?)(?=\n## |\Z)', content, re.DOTALL)
     if not prompt_match:
-        raise ValueError("No ## Prompt section found in AGENTS.MD")
+        raise ValueError("No ## Prompt section found in AGENT.MD")
     prompt = prompt_match.group(1).strip()
 
     return AgentDef(
@@ -115,22 +115,22 @@ def _parse_params_section(content: str, section: str) -> List[AgentParam]:
 
 
 def load_agent_from_markdown(path: str) -> AgentDef:
-    """Parse a single AGENTS.MD file from disk."""
+    """Parse a single AGENT.MD file from disk."""
     with open(path, "r") as f:
         content = f.read()
     return parse_agent_markdown(content)
 
 
 def discover_agents_from_directory(directory: str) -> List[AgentDef]:
-    """Scan a directory tree for AGENTS.MD files and return parsed AgentDefs.
+    """Scan a directory tree for AGENT.MD files and return parsed AgentDefs.
 
-    Each immediate subdirectory of *directory* is checked for an ``AGENTS.MD``
+    Each immediate subdirectory of *directory* is checked for an ``AGENT.MD``
     file.  Parse errors are printed and skipped.
     """
     agents: List[AgentDef] = []
     for agent_dir in Path(directory).iterdir():
         if agent_dir.is_dir():
-            agents_md = agent_dir / "AGENTS.MD"
+            agents_md = agent_dir / "AGENT.MD"
             if agents_md.exists():
                 try:
                     agents.append(load_agent_from_markdown(str(agents_md)))
