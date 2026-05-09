@@ -1,40 +1,80 @@
 """
-Example 11: Sub-agents via AGENTS.MD
+Example 11 - Sub-agents via AGENTS.MD
 
-Sub-agents are independent agents defined in AGENTS.MD files that the main
-agent can call as tools.  Each sub-agent runs in an ephemeral DynamicAgent
-with its own skills and LLM config, then returns its result as a tool response.
+Shows how to define a sub-agent at runtime using an AGENTS.MD file written to
+a temporary directory.  The main agent discovers the sub-agent and can call it
+as a regular tool.
 
-Directory layout
-----------------
-~/.birdie/agents/
-    summarizer/
-        AGENTS.MD       # defines the Summarizer sub-agent
-    translator/
-        AGENTS.MD       # defines a Translator sub-agent
-    ...
+A custom "Summarizer" sub-agent is created in a temp directory, loaded via
+agents_dir, and the main agent is asked to summarize a passage - triggering
+the sub-agent tool call automatically.
 
-The main agent discovers all AGENTS.MD files under ~/.birdie/agents/ and
-registers each one as an async tool.  The calling LLM sees these tools
-alongside regular skills and decides when to use them.
+Agent defined in this example
+──────────────────────────────
+  name: Summarizer
+  input: text (string), max_points (integer, optional)
+  prompt: summarize {{ text }} in at most {{ max_points }} bullet points
 
-Running this example
---------------------
-1. Copy the example agent definition to your user agents directory:
+Prerequisites
+─────────────
+    export LLM_VENDOR=mistral
+    export LLM_MODEL=mistral-large-latest
+    export MISTRAL_API_KEY=...
 
-       mkdir -p ~/.birdie/agents/summarizer
-       cp examples/agents/summarizer/AGENTS.MD ~/.birdie/agents/summarizer/
+    # Or point at a JSON config file:
+    export LLM_PROVIDER_CONFIG='{"vendor":"mistral","model":"mistral-large-latest",...}'
 
-2. Set your LLM credentials (e.g. ANTHROPIC_API_KEY) and run:
-
-       python examples/11_sub_agent.py
+Run
+───
+    python examples/11_sub_agent.py
 """
 
 import asyncio
+import tempfile
+from pathlib import Path
+
 from birdie.agent.run import DynamicAgent
+from birdie.core.agent_loader import discover_agents_from_directory
 
+SKILLS_DIR = Path(__file__).parent.parent / "birdie" / "skills"
 
-TEXT = """
+SUMMARIZER_AGENTS_MD = """\
+---
+name: Summarizer
+version: 1.0.0
+description: Summarize a piece of text into concise bullet points
+enabled_by_default: true
+allowed_skills: []
+---
+
+## Input
+
+### text
+type: string
+description: The text to summarize
+required: true
+
+### max_points
+type: integer
+description: Maximum number of bullet points (default 5)
+required: false
+
+## Output
+
+### summary
+type: string
+description: Bullet-point summary of the text
+
+## Prompt
+
+Summarize the following text concisely. Return at most {{ max_points }} bullet points (default to 5 if not specified). Use plain bullet points starting with "- ".
+
+Text to summarize:
+
+{{ text }}
+"""
+
+TEXT = """\
 Large language models (LLMs) are a type of artificial intelligence that can
 understand and generate human language. They are trained on vast amounts of
 text data using a technique called self-supervised learning, where the model
@@ -42,30 +82,52 @@ learns to predict missing or next words in a sequence. The resulting models
 can perform a wide range of tasks, including answering questions, writing code,
 translating languages, and summarizing documents. Recent advances have made
 LLMs significantly more capable, leading to their widespread adoption in
-applications like chatbots, code assistants, and content generation tools.
+applications like chatbots, code assistants, and content generation tools.\
 """
 
 
 async def main() -> None:
-    agent = DynamicAgent.from_config(skills_dir="skills")
+    with tempfile.TemporaryDirectory() as agents_dir:
+        # Write the AGENTS.MD to a subdirectory (one subdirectory = one agent).
+        agent_dir = Path(agents_dir) / "Summarizer"
+        agent_dir.mkdir()
+        (agent_dir / "AGENTS.MD").write_text(SUMMARIZER_AGENTS_MD)
 
-    print("Asking the agent to summarize a passage (will call the Summarizer sub-agent):")
-    print("-" * 60)
+        # Parse and inspect the agent definition before wiring it in.
+        agent_defs = discover_agents_from_directory(agents_dir)
+        summarizer = agent_defs[0]
+        print("=== Sub-agent parsed from AGENTS.MD ===")
+        print(f"  name        : {summarizer.name}")
+        print(f"  description : {summarizer.description}")
+        print(f"  input params: {[p.name for p in summarizer.input_params]}")
+        print(f"  enabled     : {summarizer.enabled_by_default}\n")
 
-    async for update in agent.astream(
-        f"Please summarize this text in 3 bullet points:\n\n{TEXT.strip()}",
-        thread_id="example-11",
-    ):
-        for node, data in update.items():
-            for msg in data.get("messages", []):
-                if hasattr(msg, "content") and msg.content:
-                    content = msg.content
-                    if isinstance(content, list):
-                        content = "\n".join(
-                            b.get("text", "") if isinstance(b, dict) else str(b)
-                            for b in content
-                        )
-                    print(f"[{node}] {content}")
+        # Build the agent with the temp agents dir.
+        agent = DynamicAgent.from_config(
+            skills_dir=str(SKILLS_DIR),
+            agents_dir=agents_dir,
+        )
+
+        # Confirm the sub-agent is in the allowed set.
+        allowed = agent.agent_registry.get_allowed_agents("default")
+        print(f"=== Summarizer in default allowed set: {'Summarizer' in allowed} ===\n")
+
+        # Ask the main agent to summarize - it should delegate to the Summarizer.
+        query = f"Please summarize this text in 3 bullet points:\n\n{TEXT}"
+        print(f"User: {query[:80]}...\n")
+
+        result = await agent.invoke(query)
+
+        for msg in result["messages"][1:]:
+            kind = type(msg).__name__
+            if kind == "AIMessage" and getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    preview = str(tc["args"].get("text", ""))[:60].replace("\n", " ")
+                    print(f"  -> {tc['name']}(text=\"{preview}...\", max_points={tc['args'].get('max_points', '?')})")
+            elif kind == "ToolMessage":
+                print(f"  <- {msg.content.strip()}")
+            elif kind == "AIMessage" and msg.content:
+                print(f"Agent: {msg.content}")
 
 
 if __name__ == "__main__":
