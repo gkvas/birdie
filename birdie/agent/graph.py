@@ -235,32 +235,27 @@ def create_agent_graph(
     async def call_model(state: AgentState, config: RunnableConfig) -> dict:
         all_messages = list(state["messages"])
 
-        # Apply rolling context window: send only the last N messages to the LLM.
-        # The checkpointer retains the full history for time-travel and repair.
-        context_msgs = (
-            all_messages[-MAX_CONTEXT_MESSAGES:]
-            if len(all_messages) > MAX_CONTEXT_MESSAGES
-            else all_messages
-        )
-
-        # Ensure the context starts at a HumanMessage (Mistral rejects "tool" or
-        # "assistant" as the first role after "system").  The window boundary can
-        # fall inside a tool-call chain, leaving ToolMessages at the head.
-        # If the window has no HumanMessage at all (e.g. 10+ tool calls in one
-        # turn exceed MAX_CONTEXT_MESSAGES), fall back to the last HumanMessage
-        # in the full history so the current turn is always included.
-        for i, msg in enumerate(context_msgs):
-            if isinstance(msg, HumanMessage):
-                context_msgs = context_msgs[i:]
-                break
+        # Build a context window that never splits a turn.  Walk backward
+        # through HumanMessage boundaries, accumulating complete turns until
+        # the window contains at least MAX_CONTEXT_MESSAGES messages.  This
+        # guarantees the context always starts at a HumanMessage (required by
+        # Mistral) and that a long tool chain in the previous turn is never
+        # evicted mid-sequence, which would cause the LLM to lose its own
+        # prior response on a follow-up.
+        human_indices = [
+            i for i, m in enumerate(all_messages)
+            if isinstance(m, HumanMessage)
+        ]
+        if not human_indices:
+            # No HumanMessage at all - fall back to a plain tail slice.
+            context_msgs = all_messages[-MAX_CONTEXT_MESSAGES:]
         else:
-            # No HumanMessage in the trimmed window - walk back through all messages.
-            for i in range(len(all_messages) - 1, -1, -1):
-                if isinstance(all_messages[i], HumanMessage):
-                    context_msgs = all_messages[i:]
+            anchor = human_indices[-1]
+            for j in range(len(human_indices) - 2, -1, -1):
+                if len(all_messages) - anchor >= MAX_CONTEXT_MESSAGES:
                     break
-            else:
-                context_msgs = []
+                anchor = human_indices[j]
+            context_msgs = list(all_messages[anchor:])
 
         # Repair any dangling tool calls within the context window.
         # Repairs are returned to state so the checkpoint heals permanently.
