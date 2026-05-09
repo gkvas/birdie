@@ -934,6 +934,12 @@ def main() -> None:
         default=None,
         help="Path to a JSON provider config file (overrides LLM_VENDOR / LLM_MODEL env vars)",
     )
+    parser.add_argument(
+        "--script",
+        metavar="FILE",
+        default=None,
+        help="Path to script file to execute Birdie non-interactive.",
+    )
     args = parser.parse_args()
 
     user_id = (
@@ -945,8 +951,9 @@ def main() -> None:
     skills_dir = args.skills_dir or os.path.join(os.path.dirname(__file__), "skills")
     agents_dir = args.agents_dir or os.path.join(os.path.dirname(__file__), "agents")
     provider_config = Path(args.config) if args.config else None
+    script_file = Path(args.script) if args.script else None
 
-    asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config))
+    asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config, script_file))
 
 
 _PROVIDER_HELP = """
@@ -994,6 +1001,7 @@ async def _async_main(
     skills_dir: str,
     agents_dir: Optional[str],
     provider_config,
+    script_config
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
