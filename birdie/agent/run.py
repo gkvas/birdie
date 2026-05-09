@@ -70,6 +70,7 @@ class DynamicAgent:
         self,
         llm_or_provider: Any,
         skills_dir: str = "skills",
+        agents_dir: Optional[str] = None,
         checkpointer=None,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
@@ -79,6 +80,7 @@ class DynamicAgent:
             self.provider = LangChainProvider(llm_or_provider)
 
         self.skills_dir = skills_dir
+        self.agents_dir = agents_dir
         self.registry = SkillRegistry()
         self.policy = SkillPolicy()
         self.mcp_manager = MCPClientManager()
@@ -98,6 +100,7 @@ class DynamicAgent:
         cls,
         provider_config: "Dict[str, Any] | str | Path | ProviderConfig | None" = None,
         skills_dir: str = "skills",
+        agents_dir: Optional[str] = None,
         checkpointer=None,
     ) -> "DynamicAgent":
         """
@@ -137,7 +140,7 @@ class DynamicAgent:
                     provider_config["model"] = os.environ["LLM_MODEL"]
 
         provider = get_llm_provider(provider_config)
-        return cls(provider, skills_dir=skills_dir, checkpointer=checkpointer)
+        return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir, checkpointer=checkpointer)
 
     # -- skill management ---------------------------------------------------
 
@@ -156,22 +159,30 @@ class DynamicAgent:
         self.policy.set_default_skills(self.registry.list_skills())
 
     def _load_agents(self) -> None:
-        """Discover AGENTS.MD files from ~/.birdie/agents/ and register them."""
+        """Discover AGENTS.MD files from all agent dirs and register them."""
+        dirs = []
+        if self.agents_dir:
+            dirs.append(self.agents_dir)
         user_agents_dir = Path.home() / ".birdie" / "agents"
-        if not user_agents_dir.is_dir():
+        if user_agents_dir.is_dir():
+            dirs.append(str(user_agents_dir))
+
+        if not dirs:
             return
 
         vendor = getattr(self.provider, 'vendor_name', None)
         model = getattr(self.provider, 'model_name', None)
 
-        for agent_def in discover_agents_from_directory(str(user_agents_dir)):
-            tool = agentdef_to_langchain_tool(
-                agent_def,
-                skills_dir=self.skills_dir,
-                fallback_vendor=vendor,
-                fallback_model=model,
-            )
-            self.agent_registry.register(agent_def, tool)
+        for d in dirs:
+            for agent_def in discover_agents_from_directory(d):
+                tool = agentdef_to_langchain_tool(
+                    agent_def,
+                    skills_dir=self.skills_dir,
+                    agents_dir=self.agents_dir,
+                    fallback_vendor=vendor,
+                    fallback_model=model,
+                )
+                self.agent_registry.register(agent_def, tool)
 
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""

@@ -48,6 +48,7 @@ def _input_schema(params: List[AgentParam]) -> dict:
 def agentdef_to_langchain_tool(
     agent_def: AgentDef,
     skills_dir: str,
+    agents_dir: Optional[str] = None,
     fallback_vendor: Optional[str] = None,
     fallback_model: Optional[str] = None,
 ) -> StructuredTool:
@@ -56,6 +57,7 @@ def agentdef_to_langchain_tool(
     Args:
         agent_def: The parsed AGENTS.MD definition.
         skills_dir: Skills directory passed to the ephemeral DynamicAgent.
+        agents_dir: Agents directory passed to the ephemeral DynamicAgent.
         fallback_vendor: Vendor to use if agent_def.vendor is unset.
         fallback_model: Model to use if agent_def.model is unset.
 
@@ -79,6 +81,7 @@ def agentdef_to_langchain_tool(
         sub_agent = DynamicAgent.from_config(
             provider_config=config or None,
             skills_dir=skills_dir,
+            agents_dir=agents_dir,
         )
         sub_agent.enable_skills_for_session("_run", agent_def.allowed_skills)
 

@@ -807,6 +807,11 @@ def main() -> None:
              "Additional skills are always loaded from ~/.birdie/skills/ if it exists.",
     )
     parser.add_argument(
+        "--agents-dir",
+        default=None,
+        help="Load sub-agents from this directory in addition to ~/.birdie/agents/.",
+    )
+    parser.add_argument(
         "--config",
         metavar="FILE",
         default=None,
@@ -821,9 +826,10 @@ def main() -> None:
         or "default"
     )
     skills_dir = args.skills_dir or os.path.join(os.path.dirname(__file__), "skills")
+    agents_dir = args.agents_dir or None
     provider_config = Path(args.config) if args.config else None
 
-    asyncio.run(_async_main(args.session_id, user_id, skills_dir, provider_config))
+    asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config))
 
 
 _PROVIDER_HELP = """
@@ -869,6 +875,7 @@ async def _async_main(
     session_id_arg: Optional[str],
     user_id: str,
     skills_dir: str,
+    agents_dir: Optional[str],
     provider_config,
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -904,7 +911,8 @@ async def _async_main(
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         try:
             agent = DynamicAgent.from_config(
-                provider_config, skills_dir=skills_dir, checkpointer=checkpointer
+                provider_config, skills_dir=skills_dir, agents_dir=agents_dir,
+                checkpointer=checkpointer,
             )
         except ValueError as exc:
             _abort(console, f"[bold red]Configuration error:[/bold red] {exc}\n\n{_PROVIDER_HELP}")
