@@ -901,7 +901,8 @@ def main() -> None:
     parser.add_argument(
         "--agents-dir",
         default=None,
-        help="Load sub-agents from this directory in addition to ~/.birdie/agents/.",
+        help="Override the built-in agents directory (default: bundled birdie/agents). "
+             "Additional agents are always loaded from ~/.birdie/agents/ if it exists.",
     )
     parser.add_argument(
         "--config",

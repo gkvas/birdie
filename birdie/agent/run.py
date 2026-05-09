@@ -160,9 +160,12 @@ class DynamicAgent:
 
     def _load_agents(self) -> None:
         """Discover AGENTS.MD files from all agent dirs and register them."""
+        _bundled = Path(__file__).parent.parent / "agents"
+        primary = self.agents_dir or (str(_bundled) if _bundled.is_dir() else None)
+
         dirs = []
-        if self.agents_dir:
-            dirs.append(self.agents_dir)
+        if primary:
+            dirs.append(primary)
         user_agents_dir = Path.home() / ".birdie" / "agents"
         if user_agents_dir.is_dir():
             dirs.append(str(user_agents_dir))
