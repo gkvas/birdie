@@ -99,13 +99,14 @@ class BirdieCLI:
         session: Session,
         user_id: str,
         user_memory: UserMemory,
+        console: Optional[Console] = None,
     ) -> None:
         self.agent = agent
         self.session_manager = session_manager
         self.session = session
         self.user_id = user_id
         self.user_memory = user_memory
-        self.console = Console()
+        self.console = console or Console()
 
         self._total_in: int = 0
         self._total_out: int = 0
@@ -486,6 +487,7 @@ class BirdieCLI:
                 )
             else:
                 self._tool_output_mode = subarg
+                self.agent.tool_output_mode = subarg
                 self.console.print(f"[dim]Tool output mode: [bold]{subarg}[/bold][/dim]")
 
         else:
@@ -785,7 +787,15 @@ class BirdieCLI:
                     if node_name == "tools":
                         for msg in msgs:
                             if isinstance(msg, ToolMessage):
-                                self._render_tool_output(msg.name or "", str(msg.content))
+                                name = msg.name or ""
+                                # Sub-agents print their own transcript; skip
+                                # _render_tool_output unless mode is "off" (no
+                                # transcript shown) or it's a regular skill tool.
+                                is_agent = self.agent.agent_registry.get_agent(name) is not None
+                                if is_agent and self._tool_output_mode != "off":
+                                    pass  # transcript already printed by the tool
+                                else:
+                                    self._render_tool_output(name, str(msg.content))
                         status.update("[dim]thinking…[/dim]")
 
                     elif node_name == "agent":
@@ -1018,6 +1028,7 @@ async def _async_main(
             session=session,
             user_id=user_id,
             user_memory=user_memory,
+            console=console,
         )
         await cli.run()
 

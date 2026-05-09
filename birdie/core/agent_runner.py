@@ -10,12 +10,20 @@ At call time:
 
 import re
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
 from .models import AgentDef, AgentParam
+
+# Indentation levels mirror the CLI's tool output conventions:
+#   _IH  = 3 spaces  = same level as regular tool output
+#   _IC  = 6 spaces  = sub-agent content (tool output + 3)
+#   _IC2 = 9 spaces  = sub-agent arg/result content (sub-agent content + 3)
+_IH  = "   "
+_IC  = "      "
+_IC2 = "         "
 
 
 def _substitute(template: str, params: Dict[str, Any]) -> str:
@@ -57,15 +65,90 @@ def _extract_text(content: Any) -> str:
     return str(content)
 
 
-def _args_preview(args: Dict[str, Any], max_val: int = 60) -> str:
-    """Format tool-call args dict for one-line display, truncating long values."""
-    parts = []
-    for k, v in args.items():
-        s = repr(v)
-        if len(s) > max_val:
-            s = s[:max_val] + "…'"
-        parts.append(f"{k}={s}")
-    return ", ".join(parts)
+def _render_block_content(console: Any, text: str, mode: str) -> None:
+    """Render body text at _IC2 indent following off|short|full rules."""
+    lines = text.splitlines() or [""]
+    n = len(lines)
+
+    if mode == "off":
+        console.print(f"{_IC2}[dim]{n} line{'s' if n != 1 else ''}[/dim]")
+        return
+
+    if mode == "short":
+        limit = 1000
+        display = text[:limit]
+        remaining = len(text) - limit
+        display_lines = display.splitlines() or [""]
+    else:  # full
+        display_lines = lines
+        remaining = 0
+
+    for line in display_lines:
+        console.print(f"{_IC2}[dim]{line}[/dim]", highlight=False)
+    if remaining > 0:
+        console.print(
+            f"{_IC2}[dim]... {remaining} more character{'s' if remaining != 1 else ''}[/dim]"
+        )
+
+
+def _render_tool_call(console: Any, tc: dict, mode: str) -> None:
+    """Render a sub-agent tool call at _IC indent."""
+    console.print(f"{_IC}[bold cyan]→[/bold cyan] [bold]{tc['name']}[/bold]")
+    if mode == "off":
+        n = len(tc["args"])
+        console.print(f"{_IC2}[dim]{n} arg{'s' if n != 1 else ''}[/dim]")
+        return
+    for k, v in tc["args"].items():
+        v_str = v if isinstance(v, str) else repr(v)
+        if mode == "short":
+            flat = v_str.replace("\n", "↵ ")
+            if len(flat) > 120:
+                flat = flat[:120] + "…"
+            console.print(f"{_IC2}[dim]{k}:[/dim] {flat}", highlight=False)
+        else:  # full
+            lines = v_str.splitlines()
+            if len(lines) > 1:
+                console.print(f"{_IC2}[dim]{k}:[/dim]", highlight=False)
+                for line in lines:
+                    console.print(f"{_IC2}  {line}", highlight=False)
+            else:
+                console.print(f"{_IC2}[dim]{k}:[/dim] {v_str}", highlight=False)
+
+
+def _render_tool_result(console: Any, text: str, mode: str) -> None:
+    """Render a sub-agent tool result at _IC indent."""
+    console.print(f"{_IC}[dim cyan]←[/dim cyan]")
+    _render_block_content(console, text, mode)
+
+
+def _render_ai_message(console: Any, text: str, mode: str) -> None:
+    """Render a sub-agent AI message at _IC indent."""
+    lines = text.splitlines() or [""]
+    console.print(f"{_IC}🐦 {lines[0]}")
+    if len(lines) > 1:
+        _render_block_content(console, "\n".join(lines[1:]), mode)
+
+
+def _print_agent_transcript(
+    console: Any,
+    run_id: str,
+    transcript: List[Tuple[str, Any]],
+    mode: str,
+) -> None:
+    """Print the full buffered sub-agent transcript as one block.
+
+    Prints a single header line at the tool-output indent level (_IH), then
+    all tool calls, tool results, and AI messages at _IC indent.
+    """
+    console.print(f"{_IH}[dim]\\[{run_id}][/dim]")
+    for kind, payload in transcript:
+        if kind == "tc":
+            _render_tool_call(console, payload, mode)
+        elif kind == "tr":
+            _render_tool_result(console, payload, mode)
+        elif kind == "ai":
+            _render_ai_message(console, payload, mode)
+    console.print()
 
 
 def agentdef_to_langchain_tool(
@@ -75,6 +158,7 @@ def agentdef_to_langchain_tool(
     fallback_vendor: Optional[str] = None,
     fallback_model: Optional[str] = None,
     console: Optional[Any] = None,
+    get_tool_output_mode: Optional[Callable[[], str]] = None,
 ) -> StructuredTool:
     """Wrap an AgentDef as an async LangChain StructuredTool.
 
@@ -84,9 +168,11 @@ def agentdef_to_langchain_tool(
         agents_dir: Agents directory passed to the ephemeral DynamicAgent.
         fallback_vendor: Vendor to use if agent_def.vendor is unset.
         fallback_model: Model to use if agent_def.model is unset.
-        console: Optional rich Console. When provided the sub-agent streams its
-            work to the console with a unique ``[Name#xxxx]`` prefix so multiple
-            agents can be distinguished.
+        console: Optional rich Console. When provided the sub-agent transcript
+            is printed as a single block after the sub-agent completes.
+        get_tool_output_mode: Callable returning the current output mode
+            (``"off"``, ``"short"``, or ``"full"``). Called at invocation time
+            so live mode changes take effect. Defaults to ``"short"``.
 
     Returns:
         An async StructuredTool the calling agent can invoke as a regular tool.
@@ -123,31 +209,27 @@ def agentdef_to_langchain_tool(
             last = result["messages"][-1]
             return _extract_text(last.content)
 
-        # Streaming path: print each node update with the run_id prefix.
-        prefix = f"[dim]\\[{run_id}][/dim]"
+        # Streaming path: collect messages, then print as one block.
+        mode = get_tool_output_mode() if get_tool_output_mode else "short"
         final_content = ""
+        transcript: List[Tuple[str, Any]] = []
+
         async for update in sub_agent.astream(prompt, thread_id="_run", config=invoke_config):
             for _node, data in update.items():
                 for msg in data.get("messages", []):
                     if isinstance(msg, AIMessage):
                         if getattr(msg, "tool_calls", None):
                             for tc in msg.tool_calls:
-                                preview = _args_preview(tc["args"])
-                                console.print(
-                                    f"{prefix} 🐦 [bold]{tc['name']}[/bold]({preview})"
-                                )
+                                transcript.append(("tc", tc))
                         elif msg.content:
                             text = _extract_text(msg.content)
                             final_content = text
-                            lines = text.splitlines()
-                            if lines:
-                                console.print(f"{prefix} 🐦 {lines[0]}")
-                            for line in lines[1:]:
-                                console.print(f"{prefix}    {line}")
+                            transcript.append(("ai", text))
                     elif isinstance(msg, ToolMessage):
-                        text = _extract_text(msg.content)
-                        first = text.splitlines()[0][:200] if text else ""
-                        console.print(f"{prefix}    {first}")
+                        transcript.append(("tr", _extract_text(msg.content)))
+
+        if transcript:
+            _print_agent_transcript(console, run_id, transcript, mode)
 
         return final_content
 
