@@ -228,7 +228,7 @@ def agentdef_to_langchain_tool(
                     elif isinstance(msg, ToolMessage):
                         transcript.append(("tr", _extract_text(msg.content)))
 
-        if transcript:
+        if transcript and mode != "off":
             _print_agent_transcript(console, run_id, transcript, mode)
 
         return final_content
