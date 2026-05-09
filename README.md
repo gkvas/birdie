@@ -75,6 +75,13 @@ export LLM_VENDOR=mistral
 export LLM_MODEL=mistral-large-latest
 export MISTRAL_API_KEY=your-key-here
 birdie
+
+#Azure OpenAI
+export  LLM_VENDOR=azure
+export LLM_MODEL=your-deployment-name
+export AZURE_OPENAI_API_KEY=your-key-here
+export AZURE_OPENAI_ENDPOINT=your-base-url
+birdie
 ```
 
 **JSON config file**
@@ -97,12 +104,14 @@ See [doc/cli.md](doc/cli.md) for all supported vendors, config fields, and envir
 
 ## Built-in skills
 
-All skills are **disabled by default**. Enable them for the current session:
+Skills extend Birdie and are defined in **SKILL.MD** files. All skills are **disabled by default**. Enable them for the current session:
 
 ```
 /skill enable Shell
 /skill enable DuckDuckGo
 ```
+
+Birdie ships with the following default skills:
 
 | Skill | Description |
 |---|---|
@@ -113,6 +122,8 @@ All skills are **disabled by default**. Enable them for the current session:
 | `Weather` | Weather lookup via external API |
 | `DuckDuckGo` | Web search - no API key required |
 | `mcp_demo` | Demo MCP server (echo and reverse_string) |
+
+See [doc/skills.md](doc/skills.md) for the full SKILL.MD format and how to write skills.
 
 ---
 
