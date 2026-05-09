@@ -34,6 +34,7 @@ from ..core.adapter import skilltool_to_langchain_tool
 from ..core.policy import SkillPolicy
 from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def, lc_tool_to_normalized_def
 from ..core.mcp_client import MCPClientManager
+from ..core.agent_registry import AgentRegistry
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ def create_agent_graph(
     registry: SkillRegistry,
     policy: SkillPolicy,
     mcp_manager: MCPClientManager | None = None,
+    agent_registry: AgentRegistry | None = None,
 ) -> StateGraph:
     """
     Build a LangGraph workflow that routes through the LLMProvider.
@@ -76,6 +78,12 @@ def create_agent_graph(
     def _get_allowed(config: RunnableConfig) -> set:
         """Resolve the allowed skill name set for the current session."""
         return policy.get_allowed_skills(session_id=_session_id(config))
+
+    def _get_allowed_agents(config: RunnableConfig) -> set:
+        """Resolve the allowed agent name set for the current session."""
+        if agent_registry is None:
+            return set()
+        return agent_registry.get_allowed_agents(session_id=_session_id(config))
 
     def _last_user_text(state: AgentState) -> str:
         """Return the content of the most recent HumanMessage in state."""
@@ -236,11 +244,13 @@ def create_agent_graph(
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
         mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
+        # intersection point: agent tools join skill/mcp tools only here
+        agent_tools = agent_registry.get_tools(_get_allowed_agents(config)) if agent_registry else []
 
-        if provider.supports_tools() and (skill_tools or mcp_tools):
+        if provider.supports_tools() and (skill_tools or mcp_tools or agent_tools):
             normalized_tools = (
                 [skilltool_to_normalized_def(t) for t in skill_tools]
-                + [lc_tool_to_normalized_def(t) for t in mcp_tools]
+                + [lc_tool_to_normalized_def(t) for t in mcp_tools + agent_tools]
             )
         else:
             normalized_tools = None
@@ -275,8 +285,10 @@ def create_agent_graph(
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
         mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
+        # intersection point: agent tools added here for execution
+        agent_tools = agent_registry.get_tools(_get_allowed_agents(config)) if agent_registry else []
         langchain_tools = (
-            [skilltool_to_langchain_tool(t) for t in skill_tools] + mcp_tools
+            [skilltool_to_langchain_tool(t) for t in skill_tools] + mcp_tools + agent_tools
         )
         tool_node = ToolNode(langchain_tools)
         try:

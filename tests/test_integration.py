@@ -136,20 +136,23 @@ schema:
                 f.write(skill_content)
 
         llm = MockLLM()
-        agent = DynamicAgent(llm, skills_dir=temp_dir)
+        # Use an empty temp dir for agents_dir so bundled and user agents don't
+        # interfere with the skill-policy assertions below.
+        with tempfile.TemporaryDirectory() as empty_agents_dir:
+            agent = DynamicAgent(llm, skills_dir=temp_dir, agents_dir=empty_agents_dir)
 
-        # No user — only PublicSkill (enabled_by_default=true)
-        await agent.invoke("Test message")
-        assert len(llm.bound_tools) == 1
-        assert llm.bound_tools[0].name == "publicskill_tool"
+            # No user — only PublicSkill (enabled_by_default=true)
+            await agent.invoke("Test message")
+            skill_tool_names = {t.name for t in llm.bound_tools}
+            assert "publicskill_tool" in skill_tool_names
+            assert "privateskill_tool" not in skill_tool_names
 
-        # Enable PrivateSkill for thread user123 — both should be visible
-        agent.enable_skill("user123", "PrivateSkill")
-        await agent.invoke("Test message", thread_id="user123")
-        assert len(llm.bound_tools) == 2
-        tool_names = {t.name for t in llm.bound_tools}
-        assert "publicskill_tool" in tool_names
-        assert "privateskill_tool" in tool_names
+            # Enable PrivateSkill for thread user123 — both should be visible
+            agent.enable_skill("user123", "PrivateSkill")
+            await agent.invoke("Test message", thread_id="user123")
+            tool_names = {t.name for t in llm.bound_tools}
+            assert "publicskill_tool" in tool_names
+            assert "privateskill_tool" in tool_names
 
 
 def _write_skill(directory: str, name: str, enabled_by_default: bool = False) -> None:

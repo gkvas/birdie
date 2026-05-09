@@ -68,6 +68,11 @@ HELP_TEXT = """
   [yellow]/skill enable <name>[/yellow]          Enable a skill (persists to session)
   [yellow]/skill disable <name>[/yellow]         Disable a skill (persists to session)
 
+  [bold]Agent commands[/bold]
+  [yellow]/agent list[/yellow]                   List all loaded agents with status
+  [yellow]/agent enable <name>[/yellow]          Enable an agent (persists to session)
+  [yellow]/agent disable <name>[/yellow]         Disable an agent (persists to session)
+
   [bold]Logging commands[/bold]
   [yellow]/log llm on[/yellow]                  Enable LLM request/response logging to ~/.birdie/llm.log
   [yellow]/log llm off[/yellow]                 Disable LLM logging
@@ -192,11 +197,15 @@ class BirdieCLI:
     # -- policy helpers -------------------------------------------------------
 
     def _apply_session_policy(self, session: Session) -> None:
-        """Apply stored skill grants from session to the policy."""
+        """Apply stored skill and agent grants from session to the policy."""
         for skill in session.enabled_skills:
             self.agent.enable_skill(session.id, skill)
         for skill in session.disabled_skills:
             self.agent.disable_skill(session.id, skill)
+        for agent in session.enabled_agents:
+            self.agent.enable_agent(session.id, agent)
+        for agent in session.disabled_agents:
+            self.agent.disable_agent(session.id, agent)
 
     def _get_prompt(self):
         if self._ctrl_c_warned:
@@ -256,13 +265,15 @@ class BirdieCLI:
         except PackageNotFoundError:
             v = "dev"
         skill_count = len(self.agent.registry.list_skills())
+        agent_count = len(self.agent.agent_registry.list_agents())
         vendor = type(self.agent.provider).__name__.replace("Provider", "").lower()
         self.console.print(
             f"[bold green]Birdie[/bold green] [dim]v{v}[/dim]  "
             f"vendor: [cyan]{vendor}[/cyan]  "
             f"user: [cyan]{self.user_id}[/cyan]  "
             f"session: [cyan]{self.session.id}[/cyan]  "
-            f"skills: [yellow]{skill_count}[/yellow]"
+            f"skills: [yellow]{skill_count}[/yellow]  "
+            f"agents: [yellow]{agent_count}[/yellow]"
         )
         self.console.print("[dim]Type /help for commands, /quit to exit.[/dim]")
 
@@ -281,6 +292,20 @@ class BirdieCLI:
             status = "[green]enabled[/green]" if skill.name in allowed else "[red]disabled[/red]"
             self.console.print(
                 f"  [bold]{skill.name}[/bold] v{skill.version}  {status}  - {skill.description}"
+            )
+
+    def _show_agents(self) -> None:
+        """List all loaded agents with their enabled/disabled status."""
+        from .core.models import AgentDef
+        agents: list[AgentDef] = self.agent.agent_registry.list_agents()
+        if not agents:
+            self.console.print("[dim]No agents loaded.[/dim]")
+            return
+        allowed = self.agent.agent_registry.get_allowed_agents(self.session.id)
+        for agent_def in agents:
+            status = "[green]enabled[/green]" if agent_def.name in allowed else "[red]disabled[/red]"
+            self.console.print(
+                f"  [bold]{agent_def.name}[/bold] v{agent_def.version}  {status}  - {agent_def.description}"
             )
 
     def _show_tools(self) -> None:
@@ -531,6 +556,69 @@ class BirdieCLI:
                 "[red]Usage: /skill list | enable <name> | disable <name>[/red]"
             )
 
+    def _resolve_agent_name(self, name: str) -> Optional[str]:
+        """Return the exact agent name if found, else None. Prints a suggestion on miss."""
+        import difflib
+        known = [a.name for a in self.agent.agent_registry.list_agents()]
+        if name in known:
+            return name
+        matches = difflib.get_close_matches(name, known, n=1, cutoff=0.5)
+        if matches:
+            self.console.print(
+                f"[red]Agent [bold]{name}[/bold] not found.[/red] "
+                f"Did you mean [bold]{matches[0]}[/bold]?"
+            )
+        else:
+            self.console.print(
+                f"[red]Agent [bold]{name}[/bold] not found.[/red] "
+                f"Use [bold]/agent list[/bold] to see available agents."
+            )
+        return None
+
+    def _handle_agent(self, arg: str) -> None:
+        """Handle /agent sub-commands."""
+        parts = arg.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        subarg = parts[1] if len(parts) > 1 else ""
+
+        if subcmd == "list":
+            self._show_agents()
+
+        elif subcmd == "enable":
+            if not subarg:
+                self.console.print("[red]Usage: /agent enable <AgentName>[/red]")
+            else:
+                resolved = self._resolve_agent_name(subarg)
+                if resolved:
+                    self.agent.enable_agent(self.session.id, resolved)
+                    if resolved not in self.session.enabled_agents:
+                        self.session.enabled_agents.append(resolved)
+                    self.session.disabled_agents = [
+                        a for a in self.session.disabled_agents if a != resolved
+                    ]
+                    self.session_manager.save(self.session)
+                    self.console.print(f"[green]Enabled[/green] {resolved}")
+
+        elif subcmd == "disable":
+            if not subarg:
+                self.console.print("[red]Usage: /agent disable <AgentName>[/red]")
+            else:
+                resolved = self._resolve_agent_name(subarg)
+                if resolved:
+                    self.agent.disable_agent(self.session.id, resolved)
+                    if resolved not in self.session.disabled_agents:
+                        self.session.disabled_agents.append(resolved)
+                    self.session.enabled_agents = [
+                        a for a in self.session.enabled_agents if a != resolved
+                    ]
+                    self.session_manager.save(self.session)
+                    self.console.print(f"[red]Disabled[/red] {resolved}")
+
+        else:
+            self.console.print(
+                "[red]Usage: /agent list | enable <name> | disable <name>[/red]"
+            )
+
     def _handle_session(self, arg: str) -> None:
         """Handle /session sub-commands."""
         parts = arg.strip().split(maxsplit=1)
@@ -585,6 +673,7 @@ class BirdieCLI:
                 f"  [dim]updated:[/dim]  {s.updated_at}\n"
                 f"  [dim]turns:[/dim]    {s.turns}\n"
                 f"  [dim]skills:[/dim]   {', '.join(s.enabled_skills) or 'defaults'}\n"
+                f"  [dim]agents:[/dim]   {', '.join(s.enabled_agents) or 'none'}\n"
                 f"  [dim]memory:[/dim]   {has_ltm}"
             )
 
@@ -635,6 +724,9 @@ class BirdieCLI:
 
         elif cmd == "/skill":
             self._handle_skill(arg)
+
+        elif cmd == "/agent":
+            self._handle_agent(arg)
 
         elif cmd == "/remember":
             if not arg:
@@ -807,6 +899,12 @@ def main() -> None:
              "Additional skills are always loaded from ~/.birdie/skills/ if it exists.",
     )
     parser.add_argument(
+        "--agents-dir",
+        default=None,
+        help="Override the built-in agents directory (default: bundled birdie/agents). "
+             "Additional agents are always loaded from ~/.birdie/agents/ if it exists.",
+    )
+    parser.add_argument(
         "--config",
         metavar="FILE",
         default=None,
@@ -821,9 +919,10 @@ def main() -> None:
         or "default"
     )
     skills_dir = args.skills_dir or os.path.join(os.path.dirname(__file__), "skills")
+    agents_dir = args.agents_dir or os.path.join(os.path.dirname(__file__), "agents")
     provider_config = Path(args.config) if args.config else None
 
-    asyncio.run(_async_main(args.session_id, user_id, skills_dir, provider_config))
+    asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config))
 
 
 _PROVIDER_HELP = """
@@ -869,6 +968,7 @@ async def _async_main(
     session_id_arg: Optional[str],
     user_id: str,
     skills_dir: str,
+    agents_dir: Optional[str],
     provider_config,
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -904,7 +1004,8 @@ async def _async_main(
     async with AsyncSqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         try:
             agent = DynamicAgent.from_config(
-                provider_config, skills_dir=skills_dir, checkpointer=checkpointer
+                provider_config, skills_dir=skills_dir, agents_dir=agents_dir,
+                checkpointer=checkpointer,
             )
         except ValueError as exc:
             _abort(console, f"[bold red]Configuration error:[/bold red] {exc}\n\n{_PROVIDER_HELP}")

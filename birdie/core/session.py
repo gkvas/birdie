@@ -71,7 +71,7 @@ class Session:
 
     Does **not** store conversation history - that is owned by LangGraph's
     SqliteSaver checkpointer.  The session file stores only what LangGraph
-    cannot represent: skill grants and housekeeping metadata.
+    cannot represent: skill/agent grants and housekeeping metadata.
     """
     id: str
     user_id: str
@@ -80,6 +80,8 @@ class Session:
     turns: int
     enabled_skills: List[str]
     disabled_skills: List[str]
+    enabled_agents: List[str]
+    disabled_agents: List[str]
 
     def touch(self) -> None:
         """Increment turn counter and update the last-modified timestamp."""
@@ -145,6 +147,8 @@ class SessionManager:
             turns=0,
             enabled_skills=[],
             disabled_skills=[],
+            enabled_agents=[],
+            disabled_agents=[],
         )
         self.save(session)
         return session
@@ -167,6 +171,8 @@ class SessionManager:
             turns=data["turns"],
             enabled_skills=data.get("enabled_skills", []),
             disabled_skills=data.get("disabled_skills", []),
+            enabled_agents=data.get("enabled_agents", []),
+            disabled_agents=data.get("disabled_agents", []),
         )
 
     def save(self, session: Session) -> None:
@@ -181,6 +187,8 @@ class SessionManager:
             "turns": session.turns,
             "enabled_skills": session.enabled_skills,
             "disabled_skills": session.disabled_skills,
+            "enabled_agents": session.enabled_agents,
+            "disabled_agents": session.disabled_agents,
         }
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")

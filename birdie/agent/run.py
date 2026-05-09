@@ -16,6 +16,9 @@ from ..core.registry import SkillRegistry
 from ..core.loader import discover_skills_from_directory
 from ..core.policy import SkillPolicy
 from ..core.mcp_client import MCPClientManager
+from ..core.agent_loader import discover_agents_from_directory
+from ..core.agent_registry import AgentRegistry
+from ..core.agent_runner import agentdef_to_langchain_tool
 from ..core.llm_provider import (
     LLMProvider,
     LangChainProvider,
@@ -67,6 +70,7 @@ class DynamicAgent:
         self,
         llm_or_provider: Any,
         skills_dir: str = "skills",
+        agents_dir: Optional[str] = None,
         checkpointer=None,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
@@ -76,14 +80,18 @@ class DynamicAgent:
             self.provider = LangChainProvider(llm_or_provider)
 
         self.skills_dir = skills_dir
+        self.agents_dir = agents_dir
         self.registry = SkillRegistry()
         self.policy = SkillPolicy()
         self.mcp_manager = MCPClientManager()
+        self.agent_registry = AgentRegistry()
 
         self._load_skills()
+        self._load_agents()
 
         graph = create_agent_graph(
-            self.provider, self.registry, self.policy, self.mcp_manager
+            self.provider, self.registry, self.policy, self.mcp_manager,
+            self.agent_registry,
         )
         self.app = graph.compile(checkpointer=checkpointer or MemorySaver())
 
@@ -92,6 +100,7 @@ class DynamicAgent:
         cls,
         provider_config: "Dict[str, Any] | str | Path | ProviderConfig | None" = None,
         skills_dir: str = "skills",
+        agents_dir: Optional[str] = None,
         checkpointer=None,
     ) -> "DynamicAgent":
         """
@@ -131,7 +140,7 @@ class DynamicAgent:
                     provider_config["model"] = os.environ["LLM_MODEL"]
 
         provider = get_llm_provider(provider_config)
-        return cls(provider, skills_dir=skills_dir, checkpointer=checkpointer)
+        return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir, checkpointer=checkpointer)
 
     # -- skill management ---------------------------------------------------
 
@@ -148,6 +157,35 @@ class DynamicAgent:
                 if skill.mcp_server is not None:
                     self.mcp_manager.register_server(skill.name, skill.mcp_server)
         self.policy.set_default_skills(self.registry.list_skills())
+
+    def _load_agents(self) -> None:
+        """Discover AGENT.MD files from all agent dirs and register them."""
+        _bundled = Path(__file__).parent.parent / "agents"
+        primary = self.agents_dir or (str(_bundled) if _bundled.is_dir() else None)
+
+        dirs = []
+        if primary:
+            dirs.append(primary)
+        user_agents_dir = Path.home() / ".birdie" / "agents"
+        if user_agents_dir.is_dir():
+            dirs.append(str(user_agents_dir))
+
+        if not dirs:
+            return
+
+        vendor = getattr(self.provider, 'vendor_name', None)
+        model = getattr(self.provider, 'model_name', None)
+
+        for d in dirs:
+            for agent_def in discover_agents_from_directory(d):
+                tool = agentdef_to_langchain_tool(
+                    agent_def,
+                    skills_dir=self.skills_dir,
+                    agents_dir=self.agents_dir,
+                    fallback_vendor=vendor,
+                    fallback_model=model,
+                )
+                self.agent_registry.register(agent_def, tool)
 
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""
@@ -174,6 +212,30 @@ class DynamicAgent:
     def enable_skills_for_session(self, session_id: str, skill_names: List[str]) -> None:
         """Grant a fixed skill set for the lifetime of a session."""
         self.policy.enable_skills_for_session(session_id, skill_names)
+
+    # -- agent management ---------------------------------------------------
+
+    def enable_agent(self, session_id: str, agent_name: str) -> None:
+        """Grant an agent for a session. Takes effect on the next turn.
+
+        Args:
+            session_id: The ``thread_id`` used when invoking the agent.
+            agent_name: Exact agent name as declared in its AGENT.MD frontmatter.
+        """
+        self.agent_registry.enable_agent(session_id, agent_name)
+
+    def disable_agent(self, session_id: str, agent_name: str) -> None:
+        """Block an agent for a session, overriding global defaults.
+
+        Args:
+            session_id: The ``thread_id`` used when invoking the agent.
+            agent_name: Exact agent name to block.
+        """
+        self.agent_registry.disable_agent(session_id, agent_name)
+
+    def enable_agents_for_session(self, session_id: str, agent_names: List[str]) -> None:
+        """Grant a fixed agent set for the lifetime of a session."""
+        self.agent_registry.enable_agents_for_session(session_id, agent_names)
 
     # -- invocation ---------------------------------------------------------
 
