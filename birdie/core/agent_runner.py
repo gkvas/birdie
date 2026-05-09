@@ -199,7 +199,10 @@ def agentdef_to_langchain_tool(
         sub_agent.enable_skills_for_session("_run", agent_def.allowed_skills)
 
         run_id = f"{agent_def.name}#{uuid.uuid4().hex[:4]}"
-        invoke_config = {"recursion_limit": agent_def.recursion_limit}
+        invoke_config = {
+            "recursion_limit": agent_def.recursion_limit,
+            "configurable": {"max_tool_repetitions": agent_def.max_tool_repetitions},
+        }
 
         if console is None:
             # Silent path: run to completion and return the last message.

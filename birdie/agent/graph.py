@@ -50,6 +50,31 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
+def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
+    """Count how many consecutive recent agent cycles included (name, args) in their tool calls.
+
+    Walks backward through the message list, counting AIMessages that contain
+    the target (name, args) pair and skipping ToolMessages between them.
+    Stops as soon as an AIMessage without the target call is found.
+    """
+    count = 0
+    i = len(messages) - 1
+    while i >= 0:
+        msg = messages[i]
+        if isinstance(msg, AIMessage):
+            if any(tc["name"] == name and tc["args"] == args
+                   for tc in getattr(msg, "tool_calls", [])):
+                count += 1
+                i -= 1
+            else:
+                break
+        elif isinstance(msg, ToolMessage):
+            i -= 1
+        else:
+            break
+    return count
+
+
 def create_agent_graph(
     provider: LLMProvider,
     registry: SkillRegistry,
@@ -282,6 +307,27 @@ def create_agent_graph(
         return {"messages": repair_msgs + [response]}
 
     async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:
+        # Infinite loop guard: block any tool call that has appeared consecutively
+        # more than max_tool_repetitions times with identical parameters.
+        max_reps = config.get("configurable", {}).get("max_tool_repetitions", 3)
+        all_messages = list(state["messages"])
+        last_ai = all_messages[-1] if all_messages else None
+        if isinstance(last_ai, AIMessage):
+            for tc in getattr(last_ai, "tool_calls", []):
+                if _consecutive_call_count(all_messages, tc["name"], tc["args"]) > max_reps:
+                    return {"messages": [
+                        ToolMessage(
+                            content=(
+                                f"Error: '{tc['name']}' has been called more than {max_reps} "
+                                f"times consecutively with identical parameters. "
+                                f"Breaking the loop to prevent infinite repetition."
+                            ),
+                            tool_call_id=t["id"],
+                            name=t["name"],
+                        )
+                        for t in getattr(last_ai, "tool_calls", [])
+                    ]}
+
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
         mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
