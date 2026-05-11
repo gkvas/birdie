@@ -61,6 +61,8 @@ class AgentDef(BaseModel):
     enabled_by_default: bool = False
     vendor: Optional[str] = None
     model: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
     allowed_skills: List[str] = []
     recursion_limit: int = 25
     max_tool_repetitions: int = 3

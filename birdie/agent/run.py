@@ -73,12 +73,14 @@ class DynamicAgent:
         agents_dir: Optional[str] = None,
         agent_console=None,
         checkpointer=None,
+        provider_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
         if isinstance(llm_or_provider, LLMProvider):
             self.provider = llm_or_provider
         else:
             self.provider = LangChainProvider(llm_or_provider)
+        self._provider_config = provider_config
 
         self.skills_dir = skills_dir
         self.agents_dir = agents_dir
@@ -143,9 +145,22 @@ class DynamicAgent:
                 if os.environ.get("LLM_MODEL"):
                     provider_config["model"] = os.environ["LLM_MODEL"]
 
+        # Normalize to a dict so sub-agents can inherit the full provider config
+        if isinstance(provider_config, ProviderConfig):
+            config_dict: Dict[str, Any] = provider_config.model_dump(exclude_none=True)
+        elif isinstance(provider_config, dict):
+            config_dict = dict(provider_config)
+        elif isinstance(provider_config, str):
+            config_dict = ProviderConfig.model_validate_json(provider_config).model_dump(exclude_none=True)
+        elif isinstance(provider_config, Path):
+            config_dict = ProviderConfig.from_file(provider_config).model_dump(exclude_none=True)
+        else:
+            config_dict = {}
+
         provider = get_llm_provider(provider_config)
         return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir,
-                   agent_console=agent_console, checkpointer=checkpointer)
+                   agent_console=agent_console, checkpointer=checkpointer,
+                   provider_config=config_dict)
 
     # -- skill management ---------------------------------------------------
 
@@ -178,17 +193,13 @@ class DynamicAgent:
         if not dirs:
             return
 
-        vendor = getattr(self.provider, 'vendor_name', None)
-        model = getattr(self.provider, 'model_name', None)
-
         for d in dirs:
             for agent_def in discover_agents_from_directory(d):
                 tool = agentdef_to_langchain_tool(
                     agent_def,
                     skills_dir=self.skills_dir,
                     agents_dir=self.agents_dir,
-                    fallback_vendor=vendor,
-                    fallback_model=model,
+                    fallback_provider_config=self._provider_config,
                     console=self._agent_console,
                     get_tool_output_mode=lambda: self.agent_output_mode,
                 )
