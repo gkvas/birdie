@@ -155,8 +155,6 @@ def agentdef_to_langchain_tool(
     agent_def: AgentDef,
     skills_dir: str,
     agents_dir: Optional[str] = None,
-    fallback_vendor: Optional[str] = None,
-    fallback_model: Optional[str] = None,
     fallback_provider_config: Optional[Dict[str, Any]] = None,
     console: Optional[Any] = None,
     get_tool_output_mode: Optional[Callable[[], str]] = None,
@@ -167,8 +165,9 @@ def agentdef_to_langchain_tool(
         agent_def: The parsed AGENT.MD definition.
         skills_dir: Skills directory passed to the ephemeral DynamicAgent.
         agents_dir: Agents directory passed to the ephemeral DynamicAgent.
-        fallback_vendor: Vendor to use if agent_def.vendor is unset.
-        fallback_model: Model to use if agent_def.model is unset.
+        fallback_provider_config: Full provider config dict from the parent agent
+            (vendor, api_key, base_url, etc.). AGENT.MD may only override model,
+            temperature, and max_tokens.
         console: Optional rich Console. When provided the sub-agent transcript
             is printed as a single block after the sub-agent completes.
         get_tool_output_mode: Callable returning the current output mode
@@ -180,10 +179,10 @@ def agentdef_to_langchain_tool(
     """
     from ..agent.run import DynamicAgent
 
-    # Start with the parent agent's provider configuration
+    # Inherit the full parent provider config; AGENT.MD may only override
+    # model, temperature, and max_tokens - never vendor or api_key.
     config = dict(fallback_provider_config) if fallback_provider_config else {}
 
-    # Override model, temperature, and max_tokens if specified in AGENT.MD
     if agent_def.model:
         config["model"] = agent_def.model
     if agent_def.temperature is not None:
@@ -191,8 +190,7 @@ def agentdef_to_langchain_tool(
     if agent_def.max_tokens is not None:
         config["max_tokens"] = agent_def.max_tokens
 
-    # Ensure vendor is not overridden
-    if "vendor" in config and agent_def.vendor and agent_def.vendor != config["vendor"]:
+    if agent_def.vendor and config.get("vendor") and agent_def.vendor != config["vendor"]:
         raise ValueError(
             f"Vendor cannot be overridden in AGENT.MD. "
             f"Parent vendor: {config['vendor']}, AGENT.MD vendor: {agent_def.vendor}"
