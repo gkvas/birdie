@@ -27,7 +27,8 @@ from ..core.llm_provider import (
     get_llm_provider_from_json,
     get_llm_provider_from_file,
 )
-from .graph import create_agent_graph, AgentState
+from ..core.ltm import LTMStore
+from .graph import create_agent_graph, compact_history, AgentState
 
 
 class DynamicAgent:
@@ -74,6 +75,7 @@ class DynamicAgent:
         agent_console=None,
         checkpointer=None,
         provider_config: Optional[Dict[str, Any]] = None,
+        ltm_store_factory=None,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
         if isinstance(llm_or_provider, LLMProvider):
@@ -81,6 +83,7 @@ class DynamicAgent:
         else:
             self.provider = LangChainProvider(llm_or_provider)
         self._provider_config = provider_config
+        self._ltm_store_factory = ltm_store_factory
 
         self.skills_dir = skills_dir
         self.agents_dir = agents_dir
@@ -97,6 +100,7 @@ class DynamicAgent:
         graph = create_agent_graph(
             self.provider, self.registry, self.policy, self.mcp_manager,
             self.agent_registry,
+            ltm_factory=self._ltm_store_factory,
         )
         self.app = graph.compile(checkpointer=checkpointer or MemorySaver())
 
@@ -108,6 +112,7 @@ class DynamicAgent:
         agents_dir: Optional[str] = None,
         agent_console=None,
         checkpointer=None,
+        ltm_store_factory=None,
     ) -> "DynamicAgent":
         """
         Create a DynamicAgent from a provider configuration.
@@ -158,9 +163,12 @@ class DynamicAgent:
             config_dict = {}
 
         provider = get_llm_provider(provider_config)
+        if ltm_store_factory is None:
+            def ltm_store_factory(uid: str) -> LTMStore:
+                return LTMStore(uid)
         return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir,
                    agent_console=agent_console, checkpointer=checkpointer,
-                   provider_config=config_dict)
+                   provider_config=config_dict, ltm_store_factory=ltm_store_factory)
 
     # -- skill management ---------------------------------------------------
 
@@ -263,7 +271,6 @@ class DynamicAgent:
         thread_id: str = "default",
         long_term_memory: Optional[List[str]] = None,
         config: Optional[Dict[str, Any]] = None,
-        # Legacy keyword-only aliases kept for backward compatibility
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ) -> AgentState:
@@ -279,11 +286,14 @@ class DynamicAgent:
                 stored in the checkpoint.
             config: Optional extra LangGraph run config merged into the
                 ``configurable`` dict.
+            user_id: User identity for LTM lookup.  When provided it is put
+                into ``configurable["user_id"]``.  If ``thread_id`` is
+                ``"default"`` this also becomes the ``thread_id`` (legacy
+                behaviour).
 
         Returns:
             The final ``AgentState`` dict (``messages`` key holds full history).
         """
-        # Legacy: if only user_id/session_id is supplied, use it as thread_id
         effective_thread = thread_id
         if effective_thread == "default" and (user_id or session_id):
             effective_thread = user_id or session_id or "default"
@@ -295,6 +305,8 @@ class DynamicAgent:
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
         }}
+        if user_id:
+            run_config["configurable"]["user_id"] = user_id
         if config:
             for k, v in config.items():
                 if k == "configurable":
@@ -309,7 +321,6 @@ class DynamicAgent:
         thread_id: str = "default",
         long_term_memory: Optional[List[str]] = None,
         config: Optional[Dict[str, Any]] = None,
-        # Legacy keyword-only aliases
         user_id: Optional[str] = None,
         session_id: Optional[str] = None,
     ):
@@ -320,6 +331,7 @@ class DynamicAgent:
             thread_id: Session identifier (see ``invoke`` for full semantics).
             long_term_memory: LTM strings injected into the system prompt.
             config: Optional extra LangGraph run config (e.g. recursion_limit).
+            user_id: User identity for LTM lookup (see ``invoke``).
         """
         effective_thread = thread_id
         if effective_thread == "default" and (user_id or session_id):
@@ -332,6 +344,8 @@ class DynamicAgent:
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
         }}
+        if user_id:
+            run_config["configurable"]["user_id"] = user_id
         if config:
             for k, v in config.items():
                 if k == "configurable":
@@ -340,3 +354,34 @@ class DynamicAgent:
                     run_config[k] = v
         async for update in self.app.astream(initial_state, run_config, stream_mode="updates"):
             yield update
+
+    async def compact_session(
+        self,
+        thread_id: str,
+        user_id: str = "",
+    ) -> tuple[int, str]:
+        """Force-compact the stored history for the given session.
+
+        Reads the checkpoint, runs compaction regardless of history length,
+        stores the result in LTM (when a factory and user_id are available),
+        and writes the RemoveMessage deletions back to the checkpoint.
+
+        Returns ``(messages_removed, summary_text)``.
+        ``messages_removed == 0`` means there was nothing to compact.
+        """
+        run_config: Dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+        snapshot = await self.app.aget_state(run_config)
+        all_messages = list((snapshot.values or {}).get("messages", []))
+
+        ltm_store = None
+        if self._ltm_store_factory and user_id:
+            ltm_store = self._ltm_store_factory(user_id)
+
+        summary, removes = await compact_history(
+            all_messages, self.provider, ltm_store=ltm_store, force=True,
+        )
+
+        if removes:
+            await self.app.aupdate_state(run_config, {"messages": removes})
+
+        return len(removes), summary

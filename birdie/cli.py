@@ -55,6 +55,7 @@ HELP_TEXT = """
   [yellow]/new[/yellow]                          Start a fresh conversation (new thread)
   [yellow]/cd <path>[/yellow]                    Change working directory (default: home)
   [yellow]/remember <text>[/yellow]              Save a note to long-term memory
+  [yellow]/compact[/yellow]                      Force-compact conversation history into LTM now
   [yellow]/info[/yellow]                         Show session info (user, session, provider)
 
   [bold]Tool commands[/bold]
@@ -771,6 +772,29 @@ class BirdieCLI:
 
     # -- streaming turn -------------------------------------------------------
 
+    async def _compact(self) -> None:
+        """Force-compact the current session's history into LTM."""
+        status = self.console.status("[dim]Compacting…[/dim]", spinner="dots")
+        status.start()
+        try:
+            n_removed, summary = await self.agent.compact_session(
+                self.session.id, user_id=self.user_id,
+            )
+        finally:
+            status.stop()
+
+        if n_removed == 0:
+            self.console.print(
+                "[dim]Nothing to compact - history is too short.[/dim]"
+            )
+        else:
+            self.console.print(
+                f"[dim]Compacted {n_removed} messages into LTM.[/dim]"
+            )
+            if summary:
+                for line in summary.splitlines():
+                    self.console.print(f"[dim]{line}[/dim]", highlight=False)
+
     async def _stream_turn(self, message: str) -> None:
         """Send *message* to the agent and render the streamed response.
 
@@ -793,6 +817,7 @@ class BirdieCLI:
             async for update in self.agent.astream(
                 message,
                 thread_id=self.session.id,
+                user_id=self.user_id,
                 long_term_memory=ltm if ltm else None,
             ):
                 for node_name, node_output in update.items():
@@ -881,7 +906,10 @@ class BirdieCLI:
                 continue
 
             if user_input.startswith("/"):
-                self._handle_slash(user_input)
+                if user_input.strip().lower() == "/compact":
+                    await self._compact()
+                else:
+                    self._handle_slash(user_input)
                 continue
 
             loop = asyncio.get_running_loop()

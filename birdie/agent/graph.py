@@ -12,18 +12,18 @@ Per-invocation context (session identity, long-term memory) is passed via
 ``config["configurable"]`` rather than stored in AgentState:
 
 * ``config["configurable"]["thread_id"]``  - session ID, used as policy key
-* ``config["configurable"]["long_term_memory"]``  - list of LTM strings
-
-This keeps AgentState minimal (just ``messages``) so LangGraph's checkpointer
-owns and reconstructs it without any application-level serialization.
+* ``config["configurable"]["user_id"]``    - user ID for LTM lookup
+* ``config["configurable"]["long_term_memory"]``  - list of manual LTM strings
 """
 
 import asyncio
+import json
 import logging
+import re
 from pathlib import Path
-from typing import TypedDict, List, Annotated, Sequence, Tuple
+from typing import TypedDict, List, Annotated, Sequence, Tuple, Optional, Callable
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
@@ -35,19 +35,170 @@ from ..core.policy import SkillPolicy
 from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def, lc_tool_to_normalized_def
 from ..core.mcp_client import MCPClientManager
 from ..core.agent_registry import AgentRegistry
+from ..core.ltm import LTMStore
 
 log = logging.getLogger(__name__)
 
 # Maximum number of messages forwarded to the LLM per turn.
-# The full history is stored by the checkpointer; this window controls cost.
 MAX_CONTEXT_MESSAGES = 20
+
+# Compaction thresholds.
+MIN_MESSAGES = 40       # minimum messages to retain after compaction
+MAX_MESSAGES = 100      # trigger compaction when stored history reaches this
+COMPRESSION_WINDOW = 60  # maximum number of oldest messages to compress per run
 
 # Delays (seconds) between successive retries when the provider returns 429.
 _RATE_LIMIT_RETRY_DELAYS = (5, 15, 45)
 
+_COMPACTION_PROMPT = """\
+You are a memory compaction system. Analyse the following conversation \
+transcript and extract structured information for long-term storage.
+
+Output a single JSON object with exactly these six fields:
+{{
+  "summary": "<2-4 sentence narrative of what happened in this segment>",
+  "extracted_facts": ["<specific fact, decision, or named value>", ...],
+  "user_preferences": ["<how the user likes things done or styled>", ...],
+  "world_facts": ["<factual observation about the external world>", ...],
+  "tool_results": ["<key finding or outcome from a tool call>", ...],
+  "open_tasks": ["<task mentioned but not yet completed>", ...]
+}}
+
+Rules:
+- summary: plain narrative, 2-4 sentences, no bullet points.
+- Lists may be empty ([]) when nothing fits that category.
+- Output ONLY the JSON object, no other text.
+
+<conversation>
+{history}
+</conversation>"""
+
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+
+
+def _msg_text(msg: BaseMessage) -> str:
+    """Extract plain text from a message whose content may be a list of blocks."""
+    content = msg.content
+    if isinstance(content, list):
+        return "\n".join(
+            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
+        )
+    return str(content)
+
+
+def _parse_compaction_json(text: str) -> dict:
+    """Parse the structured JSON produced by the compaction prompt.
+
+    Falls back gracefully when the model includes surrounding prose.
+    """
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    return {
+        "summary": text,
+        "extracted_facts": [],
+        "user_preferences": [],
+        "world_facts": [],
+        "tool_results": [],
+        "open_tasks": [],
+    }
+
+
+async def compact_history(
+    all_messages: List[BaseMessage],
+    provider: LLMProvider,
+    ltm_store: Optional[LTMStore] = None,
+    force: bool = False,
+) -> Tuple[str, List[RemoveMessage]]:
+    """Summarize the oldest conversation segment and store it in LTM.
+
+    Finds the largest HumanMessage-aligned split point within
+    COMPRESSION_WINDOW messages from the start, such that at least
+    MIN_MESSAGES messages remain after the split.  The messages before
+    the split are summarised with a structured JSON prompt; the result is
+    stored in ``ltm_store`` (when provided) and the old messages are
+    returned as RemoveMessage deletions for the LangGraph checkpointer.
+
+    When ``force`` is ``True`` the MAX_MESSAGES threshold is bypassed so
+    compaction runs regardless of history length (used by ``/compact``).
+
+    Returns ``("", [])`` when there is nothing worth compacting.
+    """
+    if not force and len(all_messages) < MAX_MESSAGES:
+        return "", []
+
+    human_indices = [i for i, m in enumerate(all_messages) if isinstance(m, HumanMessage)]
+    if len(human_indices) < 2:
+        return "", []
+
+    # Find the largest HumanMessage index that:
+    #   - is at least 1 (don't compress zero messages)
+    #   - keeps at least MIN_MESSAGES messages after the split
+    #   - does not exceed COMPRESSION_WINDOW (don't over-compress)
+    max_split = min(COMPRESSION_WINDOW, len(all_messages) - MIN_MESSAGES)
+    split_at = None
+    for idx in reversed(human_indices):
+        if 0 < idx <= max_split:
+            split_at = idx
+            break
+
+    if split_at is None:
+        return "", []
+
+    old_msgs = all_messages[:split_at]
+    if len(old_msgs) < MIN_MESSAGES // 2:
+        return "", []
+
+    # Build a readable transcript of the messages to be summarised.
+    lines: List[str] = []
+    for msg in old_msgs:
+        if isinstance(msg, HumanMessage):
+            lines.append(f"User: {_msg_text(msg)}")
+        elif isinstance(msg, AIMessage):
+            if getattr(msg, "tool_calls", None):
+                names = ", ".join(tc["name"] for tc in msg.tool_calls)
+                prefix = f"Assistant (used tools: {names})"
+                text = _msg_text(msg)
+                lines.append(f"{prefix}: {text}" if text else prefix)
+            else:
+                lines.append(f"Assistant: {_msg_text(msg)}")
+        elif isinstance(msg, ToolMessage):
+            excerpt = _msg_text(msg)
+            if len(excerpt) > 300:
+                excerpt = excerpt[:300] + "..."
+            lines.append(f"Tool result ({msg.name}): {excerpt}")
+
+    history_text = "\n".join(lines)
+    prompt = _COMPACTION_PROMPT.format(history=history_text)
+
+    response = await provider.achat(messages=[HumanMessage(content=prompt)])
+    compaction_result = _parse_compaction_json(_msg_text(response))
+    summary_text = compaction_result.get("summary", "")
+
+    if ltm_store is not None:
+        ltm_store.add(compaction_result)
+
+    remove_msgs: List[RemoveMessage] = [
+        RemoveMessage(id=m.id)  # type: ignore[misc]
+        for m in old_msgs
+        if m.id is not None
+    ]
+
+    log.info(
+        "Compaction: summarised %d messages into LTM, kept %d (threshold=%d)",
+        len(old_msgs), len(all_messages) - len(old_msgs), MAX_MESSAGES,
+    )
+    return summary_text, remove_msgs
 
 
 def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
@@ -81,21 +232,35 @@ def create_agent_graph(
     policy: SkillPolicy,
     mcp_manager: MCPClientManager | None = None,
     agent_registry: AgentRegistry | None = None,
+    ltm_factory: Optional[Callable[[str], LTMStore]] = None,
 ) -> StateGraph:
     """
     Build a LangGraph workflow that routes through the LLMProvider.
 
     On every agent-node invocation:
-      1. The full message history is trimmed to MAX_CONTEXT_MESSAGES.
-      2. Any dangling tool calls (interrupted prior turn) are repaired.
-      3. The currently-allowed SkillTools are fetched from the registry.
-      4. provider.achat() is called with the clean context window.
-      5. The response (an AIMessage) is appended to state.
+      1. LTM is queried with the current user message and injected into the
+         system prompt (when ``ltm_factory`` is provided and a user_id is known).
+      2. The full message history is compacted when it exceeds MAX_MESSAGES.
+      3. The history is trimmed to MAX_CONTEXT_MESSAGES for the LLM call.
+      4. Any dangling tool calls (interrupted prior turn) are repaired.
+      5. The currently-allowed SkillTools are fetched from the registry.
+      6. provider.achat() is called with the clean context window.
+      7. The response (an AIMessage) is appended to state.
 
     On every tool-node invocation:
       1. A fresh ToolNode is created with LangChain-executable tools.
       2. Tool results are appended to state and the loop continues.
     """
+    # LTM store cache: one LTMStore instance per user_id for the lifetime of
+    # this agent graph so we avoid reloading the JSON file on every turn.
+    _ltm_cache: dict[str, LTMStore] = {}
+
+    def _get_ltm_store(user_id: str) -> Optional[LTMStore]:
+        if not ltm_factory or not user_id:
+            return None
+        if user_id not in _ltm_cache:
+            _ltm_cache[user_id] = ltm_factory(user_id)
+        return _ltm_cache[user_id]
 
     def _session_id(config: RunnableConfig) -> str:
         return config.get("configurable", {}).get("thread_id", "") or ""
@@ -133,57 +298,64 @@ def create_agent_graph(
             return text if text else None
         return None
 
-    def _build_system_prompt(state: AgentState, config: RunnableConfig) -> str | None:
+    def _build_system_prompt(
+        state: AgentState,
+        config: RunnableConfig,
+        ltm_context: str = "",
+    ) -> str | None:
         """Assemble the system prompt for this turn from in-memory skill objects.
 
-        Four tiers:
+        Five tiers, joined with double newlines:
 
-        - **Tier 0** - custom instructions from ``.birdie/system_prompt.md`` (if present).
-        - **Tier 1** - compact bullet list of all allowed skills (always sent).
-        - **Tier 2a** - full prose body for ``always_inject`` skills (always sent).
+        - **Tier 0** - custom instructions from ``.birdie/system_prompt.md``.
+        - **Tier 1** - compact bullet list of all allowed skills.
+        - **Tier 2a** - full prose body for ``always_inject`` skills.
         - **Tier 2b** - full prose body for freetext skills whose triggers fired.
-        - **Tier 3** - long-term memory strings from the user's memory store.
+        - **Tier 3** - long-term memory: manual entries from config plus
+          semantically retrieved compaction entries (``ltm_context``).
 
-        Returns ``None`` when no skills are allowed and no custom prompt exists.
+        Returns ``None`` when nothing would be included.
         """
         custom = _load_custom_system_prompt()
-
         allowed = _get_allowed(config)
         all_skills = [s for s in registry.list_skills() if s.name in allowed]
-        if not all_skills:
-            return custom  # may be None
+        manual_ltm = config.get("configurable", {}).get("long_term_memory") or []
 
-        # Tier 0 - custom project/user instructions
-        system = ""
+        parts: List[str] = []
+
+        # Tier 0
         if custom:
-            system = custom + "\n\n"
+            parts.append(custom)
 
-        # Tier 1 - compact skill catalog (always included)
-        lines = ["You have access to the following skills:\n"]
-        for skill in all_skills:
-            trigger_hint = (
-                f"  triggers: {', '.join(skill.triggers)}" if skill.triggers else ""
-            )
-            lines.append(f"- **{skill.name}**: {skill.description}{trigger_hint}")
-        system += "\n".join(lines)
+        # Tiers 1 + 2
+        if all_skills:
+            lines = ["You have access to the following skills:\n"]
+            for skill in all_skills:
+                trigger_hint = (
+                    f"  triggers: {', '.join(skill.triggers)}" if skill.triggers else ""
+                )
+                lines.append(f"- **{skill.name}**: {skill.description}{trigger_hint}")
+            skill_block = "\n".join(lines)
 
-        # Tier 2a - always-inject skill bodies (e.g. planning/meta skills)
-        for skill in all_skills:
-            if skill.always_inject and skill.body:
-                system += f"\n\n--- {skill.name} instructions ---\n{skill.body}"
+            for skill in all_skills:
+                if skill.always_inject and skill.body:
+                    skill_block += f"\n\n--- {skill.name} instructions ---\n{skill.body}"
+            for skill in _triggered_freetext(state, allowed):
+                if skill.body:
+                    skill_block += f"\n\n--- {skill.name} skill context ---\n{skill.body}"
 
-        # Tier 2b - full body for triggered freetext skills
-        for skill in _triggered_freetext(state, allowed):
-            if skill.body:
-                system += f"\n\n--- {skill.name} skill context ---\n{skill.body}"
+            parts.append(skill_block)
 
-        # Tier 3 - user long-term memory injected via config
-        ltm = config.get("configurable", {}).get("long_term_memory") or []
-        if ltm:
-            system += "\n\n--- Long-term memory ---\n"
-            system += "\n".join(f"- {entry}" for entry in ltm)
+        # Tier 3
+        if manual_ltm or ltm_context:
+            ltm_lines = ["--- Long-term memory ---"]
+            if manual_ltm:
+                ltm_lines.append("\n".join(f"- {entry}" for entry in manual_ltm))
+            if ltm_context:
+                ltm_lines.append(ltm_context)
+            parts.append("\n".join(ltm_lines))
 
-        return system
+        return "\n\n".join(parts) or None
 
     def _repair_dangling_tool_calls(
         messages: List[BaseMessage],
@@ -234,20 +406,40 @@ def create_agent_graph(
 
     async def call_model(state: AgentState, config: RunnableConfig) -> dict:
         all_messages = list(state["messages"])
+        user_id = config.get("configurable", {}).get("user_id") or ""
+
+        # Retrieve semantically relevant LTM entries for the current user message.
+        ltm_context = ""
+        ltm_store = _get_ltm_store(user_id)
+        if ltm_store is not None:
+            user_text = _last_user_text(state)
+            if user_text:
+                entries = ltm_store.query(user_text, k=5)
+                if entries:
+                    ltm_context = ltm_store.format_for_prompt(entries)
+
+        # Compact history when it has grown beyond the threshold.
+        compaction_removes: List[BaseMessage] = []
+        if len(all_messages) >= MAX_MESSAGES:
+            _, compaction_removes = await compact_history(
+                all_messages, provider, ltm_store=ltm_store,
+            )
+            if compaction_removes:
+                # Remove compacted messages from the local working copy.
+                remove_ids = {r.id for r in compaction_removes}
+                all_messages = [m for m in all_messages if m.id not in remove_ids]
 
         # Build a context window that never splits a turn.  Walk backward
         # through HumanMessage boundaries, accumulating complete turns until
         # the window contains at least MAX_CONTEXT_MESSAGES messages.  This
         # guarantees the context always starts at a HumanMessage (required by
         # Mistral) and that a long tool chain in the previous turn is never
-        # evicted mid-sequence, which would cause the LLM to lose its own
-        # prior response on a follow-up.
+        # evicted mid-sequence.
         human_indices = [
             i for i, m in enumerate(all_messages)
             if isinstance(m, HumanMessage)
         ]
         if not human_indices:
-            # No HumanMessage at all - fall back to a plain tail slice.
             context_msgs = all_messages[-MAX_CONTEXT_MESSAGES:]
         else:
             anchor = human_indices[-1]
@@ -258,13 +450,11 @@ def create_agent_graph(
             context_msgs = list(all_messages[anchor:])
 
         # Repair any dangling tool calls within the context window.
-        # Repairs are returned to state so the checkpoint heals permanently.
         repair_msgs, clean_messages = _repair_dangling_tool_calls(context_msgs)
 
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
         mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
-        # intersection point: agent tools join skill/mcp tools only here
         agent_tools = agent_registry.get_tools(_get_allowed_agents(config)) if agent_registry else []
 
         if provider.supports_tools() and (skill_tools or mcp_tools or agent_tools):
@@ -275,7 +465,7 @@ def create_agent_graph(
         else:
             normalized_tools = None
 
-        system_prompt = _build_system_prompt(state, config)
+        system_prompt = _build_system_prompt(state, config, ltm_context=ltm_context)
 
         # Retry on HTTP 429 (rate limit) with exponential back-off.
         response: BaseMessage | None = None
@@ -299,7 +489,7 @@ def create_agent_graph(
                     continue
                 raise
 
-        return {"messages": repair_msgs + [response]}
+        return {"messages": compaction_removes + repair_msgs + [response]}
 
     async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:
         # Infinite loop guard: block any tool call that has appeared consecutively
@@ -326,7 +516,6 @@ def create_agent_graph(
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
         mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
-        # intersection point: agent tools added here for execution
         agent_tools = agent_registry.get_tools(_get_allowed_agents(config)) if agent_registry else []
         langchain_tools = (
             [skilltool_to_langchain_tool(t) for t in skill_tools] + mcp_tools + agent_tools
@@ -335,9 +524,6 @@ def create_agent_graph(
         try:
             return await tool_node.ainvoke(state, config)
         except Exception as exc:
-            # If the ToolNode itself raises before producing output, synthesize
-            # error ToolMessages so the state stays balanced and the LLM can
-            # respond to the failure.
             last = state["messages"][-1]
             return {"messages": [
                 ToolMessage(
