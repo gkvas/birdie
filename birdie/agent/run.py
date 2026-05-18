@@ -28,7 +28,10 @@ from ..core.llm_provider import (
     get_llm_provider_from_file,
 )
 from ..core.ltm import LTMStore
-from .graph import create_agent_graph, compact_history, AgentState
+from .graph import (
+    create_agent_graph, compact_history, AgentState,
+    MIN_MESSAGES, MAX_MESSAGES, COMPRESSION_WINDOW,
+)
 
 
 class DynamicAgent:
@@ -76,6 +79,9 @@ class DynamicAgent:
         checkpointer=None,
         provider_config: Optional[Dict[str, Any]] = None,
         ltm_store_factory=None,
+        min_messages: int = MIN_MESSAGES,
+        max_messages: int = MAX_MESSAGES,
+        compression_window: int = COMPRESSION_WINDOW,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
         if isinstance(llm_or_provider, LLMProvider):
@@ -84,6 +90,9 @@ class DynamicAgent:
             self.provider = LangChainProvider(llm_or_provider)
         self._provider_config = provider_config
         self._ltm_store_factory = ltm_store_factory
+        self._min_messages = min_messages
+        self._max_messages = max_messages
+        self._compression_window = compression_window
 
         self.skills_dir = skills_dir
         self.agents_dir = agents_dir
@@ -101,6 +110,9 @@ class DynamicAgent:
             self.provider, self.registry, self.policy, self.mcp_manager,
             self.agent_registry,
             ltm_factory=self._ltm_store_factory,
+            min_messages=self._min_messages,
+            max_messages=self._max_messages,
+            compression_window=self._compression_window,
         )
         self.app = graph.compile(checkpointer=checkpointer or MemorySaver())
 
@@ -162,13 +174,23 @@ class DynamicAgent:
         else:
             config_dict = {}
 
-        provider = get_llm_provider(provider_config)
+        # Extract compaction thresholds from config before creating the provider.
+        # These are agent-level settings and must not be forwarded to vendor SDKs.
+        _AGENT_FIELDS = {"min_messages", "max_messages", "compression_window"}
+        min_messages = int(config_dict.get("min_messages") or MIN_MESSAGES)
+        max_messages = int(config_dict.get("max_messages") or MAX_MESSAGES)
+        compression_window = int(config_dict.get("compression_window") or COMPRESSION_WINDOW)
+        provider_config_clean = {k: v for k, v in config_dict.items() if k not in _AGENT_FIELDS}
+
+        provider = get_llm_provider(provider_config_clean)
         if ltm_store_factory is None:
             def ltm_store_factory(uid: str) -> LTMStore:
                 return LTMStore(uid)
         return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir,
                    agent_console=agent_console, checkpointer=checkpointer,
-                   provider_config=config_dict, ltm_store_factory=ltm_store_factory)
+                   provider_config=config_dict, ltm_store_factory=ltm_store_factory,
+                   min_messages=min_messages, max_messages=max_messages,
+                   compression_window=compression_window)
 
     # -- skill management ---------------------------------------------------
 
@@ -379,6 +401,9 @@ class DynamicAgent:
 
         summary, removes = await compact_history(
             all_messages, self.provider, ltm_store=ltm_store, force=True,
+            min_messages=self._min_messages,
+            max_messages=self._max_messages,
+            compression_window=self._compression_window,
         )
 
         if removes:

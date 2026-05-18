@@ -134,6 +134,30 @@ class ProviderConfig(BaseModel):
         gt=0,
         description="Maximum tokens per completion.  None means vendor default.",
     )
+    min_messages: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Minimum messages to retain in the checkpoint after compaction.  "
+            "None uses the built-in default (20)."
+        ),
+    )
+    max_messages: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Trigger compaction when stored history reaches this many messages.  "
+            "None uses the built-in default (100)."
+        ),
+    )
+    compression_window: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Maximum number of oldest messages to compress per compaction run.  "
+            "None uses the built-in default (60)."
+        ),
+    )
 
     @classmethod
     def from_json(cls, json_str: str) -> "ProviderConfig":

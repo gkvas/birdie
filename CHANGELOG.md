@@ -2,6 +2,27 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.13] - 2026-05-18
+
+### Added
+- Configurable compaction thresholds: `min_messages`, `max_messages`, and
+  `compression_window` can now be set in the JSON provider config file
+  (e.g. `{"vendor": "anthropic", "model": "...", "min_messages": 10,
+  "max_messages": 40}`); the three fields are extracted before the config is
+  forwarded to the vendor SDK so they are safe to include alongside vendor-
+  specific fields; wired through `ProviderConfig`, `DynamicAgent.from_config()`,
+  `DynamicAgent.__init__()`, `create_agent_graph()`, and `compact_history()`
+  so all compaction paths - automatic and manual - honour the same settings
+
+### Changed
+- `MIN_MESSAGES` lowered from 40 to 20: the previous value left a large dead
+  zone between the compaction floor and the context window; 20 is more
+  aggressive while still leaving enough tail for meaningful context
+- `MAX_CONTEXT_MESSAGES` constant removed: the full non-compacted checkpoint is
+  now forwarded to the LLM on every turn (compaction itself keeps the checkpoint
+  bounded); a Mistral-compatible one-liner ensures the context always starts at
+  a `HumanMessage` boundary
+
 ## [0.2.12] - 2026-05-18
 
 ### Added

@@ -220,7 +220,7 @@ The header line (`[CVulnAnalyst#d67c]`) is at the same indent as regular tool ou
 
 ### How automatic compaction works
 
-Birdie stores every message in a SQLite checkpoint (`~/.birdie/sessions/<user>/checkpoints.db`). As sessions grow long, the checkpoint accumulates messages that will never be sent to the LLM again (the live context window is capped at 20 messages). Automatic compaction fires when the stored history reaches **100 messages** and silently:
+Birdie stores every message in a SQLite checkpoint (`~/.birdie/sessions/<user>/checkpoints.db`). As sessions grow long, the checkpoint accumulates messages that are loaded and forwarded to the LLM on every turn, increasing both cost and latency. Automatic compaction fires when the stored history reaches **100 messages** (configurable via `max_messages`) and silently:
 
 1. Finds the largest group of complete turns at the start of the history that can be summarised without leaving fewer than 40 messages behind.
 2. Sends that group to the LLM with a structured prompt that extracts six categories: a narrative summary, specific facts, user preferences, world knowledge, tool outcomes, and open tasks.
@@ -273,3 +273,27 @@ Each entry also stores a 512-dimensional embedding vector (computed by `birdie/c
 ### Viewing and managing LTM
 
 The LTM file for your user is at `~/.birdie/ltm/<user>.json`. It is plain JSON and can be inspected or manually edited if needed. There is currently no CLI command to list or delete individual LTM entries.
+
+### Configuring compaction thresholds
+
+The three thresholds that control when and how much is compacted can be set in the provider JSON config file (see [Provider configuration](#provider-configuration)):
+
+| Field | Default | Description |
+|---|---|---|
+| `min_messages` | `20` | Minimum messages to keep in the checkpoint after any compaction run |
+| `max_messages` | `100` | Trigger automatic compaction when stored history reaches this count |
+| `compression_window` | `60` | Maximum number of oldest messages to compress per run |
+
+Example - a config that compacts more aggressively:
+
+```json
+{
+  "vendor": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "min_messages": 10,
+  "max_messages": 40,
+  "compression_window": 25
+}
+```
+
+These fields are stripped from the config before it is forwarded to the vendor SDK, so they are safe to include alongside vendor-specific fields like `api_key` and `temperature`.

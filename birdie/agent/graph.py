@@ -116,22 +116,25 @@ async def compact_history(
     provider: LLMProvider,
     ltm_store: Optional[LTMStore] = None,
     force: bool = False,
+    min_messages: int = MIN_MESSAGES,
+    max_messages: int = MAX_MESSAGES,
+    compression_window: int = COMPRESSION_WINDOW,
 ) -> Tuple[str, List[RemoveMessage]]:
     """Summarize the oldest conversation segment and store it in LTM.
 
     Finds the largest HumanMessage-aligned split point within
-    COMPRESSION_WINDOW messages from the start, such that at least
-    MIN_MESSAGES messages remain after the split.  The messages before
+    ``compression_window`` messages from the start, such that at least
+    ``min_messages`` messages remain after the split.  The messages before
     the split are summarised with a structured JSON prompt; the result is
     stored in ``ltm_store`` (when provided) and the old messages are
     returned as RemoveMessage deletions for the LangGraph checkpointer.
 
-    When ``force`` is ``True`` the MAX_MESSAGES threshold is bypassed so
+    When ``force`` is ``True`` the ``max_messages`` threshold is bypassed so
     compaction runs regardless of history length (used by ``/compact``).
 
     Returns ``("", [])`` when there is nothing worth compacting.
     """
-    if not force and len(all_messages) < MAX_MESSAGES:
+    if not force and len(all_messages) < max_messages:
         return "", []
 
     human_indices = [i for i, m in enumerate(all_messages) if isinstance(m, HumanMessage)]
@@ -140,9 +143,9 @@ async def compact_history(
 
     # Find the largest HumanMessage index that:
     #   - is at least 1 (don't compress zero messages)
-    #   - keeps at least MIN_MESSAGES messages after the split
-    #   - does not exceed COMPRESSION_WINDOW (don't over-compress)
-    max_split = min(COMPRESSION_WINDOW, len(all_messages) - MIN_MESSAGES)
+    #   - keeps at least min_messages messages after the split
+    #   - does not exceed compression_window (don't over-compress)
+    max_split = min(compression_window, len(all_messages) - min_messages)
     split_at = None
     for idx in reversed(human_indices):
         if 0 < idx <= max_split:
@@ -153,7 +156,7 @@ async def compact_history(
         return "", []
 
     old_msgs = all_messages[:split_at]
-    if len(old_msgs) < MIN_MESSAGES // 2:
+    if len(old_msgs) < min_messages // 2:
         return "", []
 
     # Build a readable transcript of the messages to be summarised.
@@ -193,7 +196,7 @@ async def compact_history(
 
     log.info(
         "Compaction: summarised %d messages into LTM, kept %d (threshold=%d)",
-        len(old_msgs), len(all_messages) - len(old_msgs), MAX_MESSAGES,
+        len(old_msgs), len(all_messages) - len(old_msgs), max_messages,
     )
     return summary_text, remove_msgs
 
@@ -230,6 +233,9 @@ def create_agent_graph(
     mcp_manager: MCPClientManager | None = None,
     agent_registry: AgentRegistry | None = None,
     ltm_factory: Optional[Callable[[str], LTMStore]] = None,
+    min_messages: int = MIN_MESSAGES,
+    max_messages: int = MAX_MESSAGES,
+    compression_window: int = COMPRESSION_WINDOW,
 ) -> StateGraph:
     """
     Build a LangGraph workflow that routes through the LLMProvider.
@@ -418,9 +424,12 @@ def create_agent_graph(
 
         # Compact history when it has grown beyond the threshold.
         compaction_removes: List[BaseMessage] = []
-        if len(all_messages) >= MAX_MESSAGES:
+        if len(all_messages) >= max_messages:
             _, compaction_removes = await compact_history(
                 all_messages, provider, ltm_store=ltm_store,
+                min_messages=min_messages,
+                max_messages=max_messages,
+                compression_window=compression_window,
             )
             if compaction_removes:
                 # Remove compacted messages from the local working copy.
