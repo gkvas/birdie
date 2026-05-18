@@ -16,7 +16,7 @@
 
 A LangGraph-based agent that discovers capabilities at runtime from **SKILL.MD** and **AGENT.MD** files. Skills, tools, and sub-agents are all declared in plain Markdown - no code changes required to add new capabilities.
 
-Birdie is a minimal yet fully functional implementation. The design goal is simplicity and transparency: the codebase is intended to be readable, hackable, and easy to extend.
+Birdie is a minimal yet fully functional implementation. The design goal is simplicity and transparency: the codebase is intended to be readable, hackable, and easy to extend. Every major feature - the agent loop, skill loading, session persistence, conversation compaction, long-term memory - is implemented in a small number of well-commented Python files that you can read from top to bottom in an afternoon.
 
 > **Security notice:** Birdie has no guardrails against local tool misuse. Skills such as `Shell` and `Filesystem` can read, write, and execute anything the running user is permitted to do. Only enable skills you trust and run Birdie under an account with appropriate restrictions.
 
@@ -143,6 +143,37 @@ See [doc/agents.md](doc/agents.md) for the full AGENT.MD format and how to write
 
 ---
 
+## Conversation memory
+
+Birdie maintains three separate memory stores that work together to give the agent context across turns and sessions.
+
+**Short-term memory** is handled automatically by LangGraph's SQLite checkpointer. Every message is stored in `~/.birdie/sessions/<user>/checkpoints.db` and loaded at the start of each turn. The agent trims the loaded history to a 20-message context window before calling the LLM, so cost stays bounded even in very long sessions.
+
+**Manual long-term memory** is written by you, explicitly. Use `/remember` to save any fact you want the agent to recall in future sessions:
+
+```
+/remember I prefer compact, direct answers without preamble
+/remember The project uses Python 3.12 and pytest for tests
+```
+
+Notes are stored in `~/.birdie/sessions/<user>/memory.json` and injected into the system prompt at the start of every turn, across all sessions.
+
+**Automatic long-term memory** is written by the compaction pipeline. When a session grows beyond 100 messages, Birdie automatically summarises the oldest segment using the LLM, extracts structured facts, preferences, tool outcomes, and open tasks, and stores them in `~/.birdie/ltm/<user>.json`. On future turns, the top-5 most semantically relevant entries are retrieved and injected alongside your manual `/remember` notes.
+
+You can trigger compaction at any time with:
+
+```
+/compact
+```
+
+This is useful at the end of a long working session to capture everything important before starting fresh. The command displays the summary that was generated and how many messages were removed from the checkpoint.
+
+The retrieval uses a lightweight hash-trick embedding (`birdie/core/retrieval.py`) that requires no model downloads or extra dependencies - just SHA-256 and a dot product.
+
+See [doc/architecture.md](doc/architecture.md) for a detailed explanation of how all three stores interact, how the compaction algorithm picks the split point, and how the LTM store is queried each turn.
+
+---
+
 ## Key commands
 
 | Command | Description |
@@ -154,6 +185,7 @@ See [doc/agents.md](doc/agents.md) for the full AGENT.MD format and how to write
 | `/agent output short\|full\|off` | Control sub-agent transcript verbosity |
 | `/tool output short\|full\|off` | Control tool result verbosity |
 | `/remember <text>` | Save a note to long-term memory |
+| `/compact` | Summarise old messages into long-term memory now |
 | `/session new` | Start a new session |
 | `/session list` | List all sessions |
 | `/help` | Show all commands |
@@ -168,7 +200,7 @@ See [doc/agents.md](doc/agents.md) for the full AGENT.MD format and how to write
 | [doc/skills.md](doc/skills.md) | SKILL.MD format, entrypoints, tool and knowledge skills, skill loading |
 | [doc/agents.md](doc/agents.md) | AGENT.MD format, sub-agent system, runtime controls, custom agents |
 | [doc/mcp.md](doc/mcp.md) | MCP integration, declaring MCP servers, writing MCP servers |
-| [doc/architecture.md](doc/architecture.md) | Project layout, agent loop, system prompt, providers, memory and sessions |
+| [doc/architecture.md](doc/architecture.md) | Project layout, agent loop, system prompt, providers, conversation compaction, long-term memory store, sessions |
 
 ---
 
