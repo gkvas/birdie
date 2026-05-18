@@ -39,11 +39,8 @@ from ..core.ltm import LTMStore
 
 log = logging.getLogger(__name__)
 
-# Maximum number of messages forwarded to the LLM per turn.
-MAX_CONTEXT_MESSAGES = 20
-
 # Compaction thresholds.
-MIN_MESSAGES = 40       # minimum messages to retain after compaction
+MIN_MESSAGES = 20       # minimum messages to retain after compaction
 MAX_MESSAGES = 100      # trigger compaction when stored history reaches this
 COMPRESSION_WINDOW = 60  # maximum number of oldest messages to compress per run
 
@@ -241,7 +238,8 @@ def create_agent_graph(
       1. LTM is queried with the current user message and injected into the
          system prompt (when ``ltm_factory`` is provided and a user_id is known).
       2. The full message history is compacted when it exceeds MAX_MESSAGES.
-      3. The history is trimmed to MAX_CONTEXT_MESSAGES for the LLM call.
+      3. The full non-compacted history is sent to the LLM, starting from
+         the first HumanMessage (required by some providers, e.g. Mistral).
       4. Any dangling tool calls (interrupted prior turn) are repaired.
       5. The currently-allowed SkillTools are fetched from the registry.
       6. provider.achat() is called with the clean context window.
@@ -429,25 +427,18 @@ def create_agent_graph(
                 remove_ids = {r.id for r in compaction_removes}
                 all_messages = [m for m in all_messages if m.id not in remove_ids]
 
-        # Build a context window that never splits a turn.  Walk backward
-        # through HumanMessage boundaries, accumulating complete turns until
-        # the window contains at least MAX_CONTEXT_MESSAGES messages.  This
-        # guarantees the context always starts at a HumanMessage (required by
-        # Mistral) and that a long tool chain in the previous turn is never
-        # evicted mid-sequence.
+        # Send the full non-compacted history to the LLM.  Compaction already
+        # bounds the checkpoint size; trimming further would discard context
+        # that the LTM system deliberately preserved.
+        # Start from the first HumanMessage so providers that require a
+        # HumanMessage-first context (e.g. Mistral) are always satisfied.
         human_indices = [
             i for i, m in enumerate(all_messages)
             if isinstance(m, HumanMessage)
         ]
-        if not human_indices:
-            context_msgs = all_messages[-MAX_CONTEXT_MESSAGES:]
-        else:
-            anchor = human_indices[-1]
-            for j in range(len(human_indices) - 2, -1, -1):
-                if len(all_messages) - anchor >= MAX_CONTEXT_MESSAGES:
-                    break
-                anchor = human_indices[j]
-            context_msgs = list(all_messages[anchor:])
+        context_msgs = (
+            all_messages[human_indices[0]:] if human_indices else all_messages
+        )
 
         # Repair any dangling tool calls within the context window.
         repair_msgs, clean_messages = _repair_dangling_tool_calls(context_msgs)
