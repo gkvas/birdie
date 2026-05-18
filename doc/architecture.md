@@ -76,7 +76,7 @@ START
 │   1. query LTM for semantic context      │
 │   2. compact history (if ≥ MAX_MESSAGES) │
 │   3. build context window                │
-│      (walk back to HumanMessage)         │
+│      (full history, starts at HumanMsg) │
 │   4. repair dangling tool calls          │
 │   5. resolve skill + agent tools         │
 │   6. fetch MCP tools                     │
@@ -177,12 +177,20 @@ included in the node's return value at the end of this function. See *Conversati
 for the full algorithm.
 
 **Step 3 - Build the context window.**
-The agent never sends the entire message history to the LLM. Instead, it walks backward through
-`all_messages` looking for `HumanMessage` boundaries, collecting complete turns until the count
-reaches `MAX_CONTEXT_MESSAGES` (20). Walking backward from the most recent message and stopping
-at a `HumanMessage` boundary ensures two things: (a) the context always starts with a human turn,
-which some providers (notably Mistral) require, and (b) a tool-call chain - an `AIMessage` with
-tool calls plus its one or more `ToolMessage` replies - is never split mid-sequence.
+The full non-compacted checkpoint is forwarded to the LLM. Because compaction already trims old
+messages (see *Conversation compaction* below), the live checkpoint only contains the recent
+history that fits within the active context. One constraint is applied: the context must start at
+a `HumanMessage`. This keeps the sequence well-formed for providers like Mistral that reject
+contexts starting with an `AIMessage` or `ToolMessage`. The one-liner that enforces this is:
+
+```python
+human_indices = [i for i, m in enumerate(all_messages) if isinstance(m, HumanMessage)]
+context_msgs = all_messages[human_indices[0]:] if human_indices else all_messages
+```
+
+In practice this slice is almost always a no-op: compaction always splits at `HumanMessage`
+boundaries, so the first message retained in the checkpoint after any compaction run is already a
+`HumanMessage`.
 
 **Step 4 - Repair dangling tool calls.**
 If the process was killed or crashed after an `AIMessage` with `tool_calls` was written to the
@@ -262,11 +270,12 @@ features in Birdie; understanding it requires following the interaction between 
 LangGraph's SQLite checkpointer stores every message in the conversation history forever. This is
 great for durability but causes two problems as sessions grow long:
 
-1. **Cost**: The `call_model` node trims history to `MAX_CONTEXT_MESSAGES = 20` before each LLM
-   call, so older messages are never actually sent to the LLM. However, they are still loaded from
-   the database on every turn and held in memory.
-2. **Growth**: Without pruning, the checkpoint grows without bound. A long-running session
-   accumulates hundreds or thousands of messages that will never be seen by the LLM again.
+1. **Growth**: Without pruning, the checkpoint grows without bound. A long-running session
+   accumulates hundreds or thousands of messages that are loaded from the database on every turn
+   and forwarded to the LLM, increasing both latency and cost.
+2. **Cost**: Sending the entire unbounded history to the LLM on every turn is expensive.
+   Compaction keeps the checkpoint at a manageable size so that each turn only sends a recent,
+   relevant slice of the conversation.
 
 Compaction solves both problems by replacing old messages with a structured summary, then
 permanently removing them from the checkpoint. The summary is stored in the LTM store so the
@@ -277,7 +286,7 @@ information is not simply discarded - it remains available for semantic retrieva
 Three constants in `birdie/agent/graph.py` control when and how much is compacted:
 
 ```python
-MIN_MESSAGES = 40       # minimum messages to retain after compaction
+MIN_MESSAGES = 20       # minimum messages to retain after compaction
 MAX_MESSAGES = 100      # trigger compaction when stored history reaches this
 COMPRESSION_WINDOW = 60 # maximum number of oldest messages to compress per run
 ```
@@ -291,6 +300,8 @@ remaining_messages >= MIN_MESSAGES
 compressed_messages <= COMPRESSION_WINDOW
 ```
 
+All three constants can be overridden at runtime. See *Configuring compaction thresholds* below.
+
 ### How the split point is found
 
 Compaction must not split in the middle of a tool-call turn. An `AIMessage` with tool calls is
@@ -301,12 +312,12 @@ together. Splitting there would corrupt the LLM's context on the next call. Inst
 The algorithm inside `compact_history()` in `birdie/agent/graph.py`:
 
 1. Collect all indices where a `HumanMessage` appears in `all_messages`.
-2. Compute `max_split = min(COMPRESSION_WINDOW, len(all_messages) - MIN_MESSAGES)`. This ensures
-   that after removing the first `split_at` messages, at least `MIN_MESSAGES` remain.
+2. Compute `max_split = min(compression_window, len(all_messages) - min_messages)`. This ensures
+   that after removing the first `split_at` messages, at least `min_messages` remain.
 3. Walk the `HumanMessage` indices in reverse, finding the largest index that is `> 0` and
    `<= max_split`. This becomes `split_at`.
 4. Take `all_messages[:split_at]` as the segment to compress.
-5. If fewer than `MIN_MESSAGES // 2` (20) messages fall in this segment, skip compaction - the
+5. If fewer than `min_messages // 2` messages fall in this segment, skip compaction - the
    overhead of an extra LLM call is not worth it for a small saving.
 
 ### The compaction prompt
@@ -364,6 +375,45 @@ remove_msgs = [RemoveMessage(id=m.id) for m in old_msgs if m.id is not None]
 3. The node returns `{"messages": compaction_removes + repair_msgs + [response]}`. LangGraph
    processes the `RemoveMessage` entries first (deleting rows from the checkpoint) and then appends
    the new messages. Both operations happen in the same checkpoint write.
+
+### Configuring compaction thresholds
+
+The three thresholds (`min_messages`, `max_messages`, `compression_window`) can be set in the
+JSON provider config file passed to `DynamicAgent.from_config()`:
+
+```json
+{
+  "vendor": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "min_messages": 10,
+  "max_messages": 50,
+  "compression_window": 30
+}
+```
+
+They are extracted from the config dict in `DynamicAgent.from_config()` before the remaining
+config is forwarded to the vendor SDK (see `birdie/agent/run.py`), so they never pollute the LLM
+provider:
+
+```python
+_AGENT_FIELDS = {"min_messages", "max_messages", "compression_window"}
+min_messages = int(config_dict.get("min_messages") or MIN_MESSAGES)
+max_messages = int(config_dict.get("max_messages") or MAX_MESSAGES)
+compression_window = int(config_dict.get("compression_window") or COMPRESSION_WINDOW)
+provider_config_clean = {k: v for k, v in config_dict.items() if k not in _AGENT_FIELDS}
+```
+
+The values are also wired through `DynamicAgent.__init__()`, `create_agent_graph()`, and
+`compact_history()` so all compaction paths - automatic and manual - honour the same settings.
+
+| Field | Default | Effect |
+|---|---|---|
+| `min_messages` | `20` | Minimum messages to retain in the checkpoint after any compaction run |
+| `max_messages` | `100` | Trigger automatic compaction when stored history reaches this count |
+| `compression_window` | `60` | Maximum number of oldest messages to compress in a single run |
+
+A low `max_messages` (e.g. 30) is useful for agents that need very tight context budgets.
+A high `min_messages` (close to `max_messages`) reduces how aggressively old context is pruned.
 
 ### Automatic vs manual compaction
 
@@ -747,8 +797,9 @@ methods can be swapped in, including remote databases.
 The context window trim happens inside `call_model()`, not at the storage layer:
 
 ```python
-all_messages = list(state["messages"])            # full history from checkpointer
-context_msgs = all_messages[-MAX_CONTEXT_MESSAGES:]    # last 20 forwarded to LLM
+all_messages = list(state["messages"])              # full history from checkpointer
+human_indices = [i for i, m in enumerate(all_messages) if isinstance(m, HumanMessage)]
+context_msgs = all_messages[human_indices[0]:] if human_indices else all_messages
 ```
 
 The checkpointer stores everything; the trim is a read-time operation that happens inside the
