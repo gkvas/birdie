@@ -129,6 +129,7 @@ The `model` field is the binary name to spawn. Birdie starts it as a child proce
 |---|---|
 | `/help` | Show available commands |
 | `/remember <text>` | Save a note to long-term memory |
+| `/compact` | Force-compact the current session's history into long-term memory now |
 | `/info` | Show user, session ID, turn count, and provider |
 | `/clear` | Clear the screen |
 | `/quit` | Exit |
@@ -212,3 +213,63 @@ The transcript is indented to distinguish it from top-level tool output:
 ```
 
 The header line (`[CVulnAnalyst#d67c]`) is at the same indent as regular tool output (3 spaces). Sub-agent content is at 6 spaces, args/results at 9 spaces.
+
+---
+
+## Conversation compaction
+
+### How automatic compaction works
+
+Birdie stores every message in a SQLite checkpoint (`~/.birdie/sessions/<user>/checkpoints.db`). As sessions grow long, the checkpoint accumulates messages that will never be sent to the LLM again (the live context window is capped at 20 messages). Automatic compaction fires when the stored history reaches **100 messages** and silently:
+
+1. Finds the largest group of complete turns at the start of the history that can be summarised without leaving fewer than 40 messages behind.
+2. Sends that group to the LLM with a structured prompt that extracts six categories: a narrative summary, specific facts, user preferences, world knowledge, tool outcomes, and open tasks.
+3. Stores the result as a new entry in `~/.birdie/ltm/<user>.json`.
+4. Permanently removes the summarised messages from the checkpoint via LangGraph's `RemoveMessage` mechanism.
+
+The result is that very long sessions stay responsive and cheap while key information is preserved in the LTM store, where it can be retrieved by semantic similarity on future turns.
+
+### `/compact` - manual compaction
+
+Run `/compact` at any time to trigger compaction regardless of history length - useful at the natural end of a working session to capture everything before starting fresh:
+
+```
+you> /compact
+```
+
+Example output when compaction succeeds:
+
+```
+Compacted 38 messages into LTM.
+The user spent the session debugging an async Python service that hung on
+startup. Root cause was identified as a blocking call inside the asyncio
+event loop during initialisation. The fix was to move the call to a
+thread pool executor.
+```
+
+Example output when history is too short:
+
+```
+Nothing to compact - history is too short.
+```
+
+`/compact` calls `DynamicAgent.compact_session(thread_id, user_id)` (implemented in `birdie/agent/run.py`), which reads the current checkpoint, calls `compact_history(..., force=True)` to bypass the automatic threshold, and writes the resulting `RemoveMessage` entries back to the checkpoint.
+
+### What gets stored in LTM
+
+Each compaction creates one `LTMEntry` (defined in `birdie/core/ltm.py`) with these fields:
+
+| Field | Contents |
+|---|---|
+| `summary` | 2-4 sentence narrative of the compacted segment |
+| `extracted_facts` | Named values, decisions, configuration details |
+| `user_preferences` | How the user likes things done |
+| `world_facts` | Factual observations about the external environment |
+| `tool_results` | Key findings from tool calls (e.g. strace output, test results) |
+| `open_tasks` | Tasks mentioned but not completed |
+
+Each entry also stores a 512-dimensional embedding vector (computed by `birdie/core/retrieval.py`) so that future turns can retrieve it by semantic similarity.
+
+### Viewing and managing LTM
+
+The LTM file for your user is at `~/.birdie/ltm/<user>.json`. It is plain JSON and can be inspected or manually edited if needed. There is currently no CLI command to list or delete individual LTM entries.

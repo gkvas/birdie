@@ -2,6 +2,68 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.12] - 2026-05-18
+
+### Added
+- Automatic conversation history compaction: when a session's stored message
+  count reaches `MAX_MESSAGES` (100), the oldest segment is summarised by the
+  LLM and the raw messages are permanently removed from the LangGraph checkpoint
+  via `RemoveMessage`; the compaction threshold, minimum retained messages
+  (`MIN_MESSAGES = 40`), and maximum compressed window (`COMPRESSION_WINDOW = 60`)
+  are tunable constants in `birdie/agent/graph.py`
+- `compact_history()` coroutine (`birdie/agent/graph.py`): finds the largest
+  HumanMessage-aligned split point within the compression window, renders the
+  segment as a readable transcript, sends it to the LLM with a structured JSON
+  prompt extracting six categories (summary, facts, preferences, world knowledge,
+  tool outcomes, open tasks), and returns `RemoveMessage` deletions for the
+  checkpointer; `force=True` bypasses the automatic threshold for manual use
+- `/compact` slash command: force-compacts the current session regardless of
+  history length, displays the generated summary and the number of messages
+  removed; implemented in `birdie/cli.py`, backed by `DynamicAgent.compact_session()`
+- `DynamicAgent.compact_session(thread_id, user_id)` method (`birdie/agent/run.py`):
+  reads the checkpoint, runs compaction with `force=True`, writes `RemoveMessage`
+  entries back, returns `(n_removed, summary_text)`
+- Long-term memory (LTM) store (`birdie/core/ltm.py`): per-user JSON file at
+  `~/.birdie/ltm/<user_id>.json`; each compaction appends a structured `LTMEntry`
+  with an embedding vector; `LTMStore` loads lazily, writes atomically
+  (write-then-rename), and exposes `query(text, k=5)` for cosine-similarity
+  retrieval and `format_for_prompt(entries)` for system-prompt injection
+- Retrieval primitives (`birdie/core/retrieval.py`): public API `embed(text)`,
+  `cosine_similarity(a, b)`, `EMBED_DIM`; dependency-free hash-trick
+  bag-of-ngrams embedding (unigrams + bigrams, SHA-256, L2-normalised) so that
+  dot-product equals cosine similarity; no model downloads required
+- Per-turn semantic LTM retrieval: on every `call_model()` invocation the top-5
+  most relevant `LTMEntry` objects are retrieved by cosine similarity on the
+  current user message and injected into system-prompt Tier 3 alongside manual
+  `/remember` entries; the `LTMStore` is cached per `user_id` for the lifetime
+  of the graph to avoid repeated disk reads
+- `ltm_store_factory` parameter on `DynamicAgent` and `DynamicAgent.from_config()`:
+  callable `(user_id: str) -> LTMStore`; defaults to `lambda uid: LTMStore(uid)`;
+  pass `None` to disable the LTM store entirely
+- `user_id` parameter on `DynamicAgent.invoke()` and `DynamicAgent.astream()`:
+  stored in `config["configurable"]["user_id"]` so the graph can look up the
+  correct LTM store; when omitted, LTM retrieval and compaction storage are
+  silently skipped
+
+### Changed
+- System-prompt Tier 3 (long-term memory) now merges two sources: manual entries
+  from `/remember` (forwarded via `config["configurable"]["long_term_memory"]`)
+  and semantically retrieved compaction entries from `LTMStore`; both are rendered
+  under a single `--- Long-term memory ---` block
+
+### Tests
+- `tests/test_compaction.py` (new, 302 lines): 18 async tests covering threshold
+  behaviour, split alignment, `RemoveMessage` shape, LTM integration, JSON
+  parsing edge cases (prose-wrapped JSON), `force=True` mode, and tool messages
+  in history
+- `tests/test_ltm.py` (new, 175 lines): 20 tests covering `LTMStore` persistence,
+  atomic writes, user isolation, `query()` relevance ordering, and
+  `format_for_prompt()` rendering
+- `tests/test_retrieval.py` (new, 116 lines): 18 tests covering `embed()` and
+  `cosine_similarity()` - dimension, normalisation, determinism, case folding,
+  symmetry, range bounds, and semantic discrimination including bigram-specific
+  phrase handling
+
 ## [0.2.11] - 2026-05-09
 
 ### Added
