@@ -1186,21 +1186,34 @@ class ACPProvider(LLMProvider):
     # -- MCP bridge ---------------------------------------------------------
 
     def _mcp_server_entry(self, tools: list[NormalizedToolDef]) -> dict | None:
-        """Build the mcpServers list entry that exposes Birdie skill tools.
+        """Build the mcpServers list entry that exposes Birdie skill tools and agents.
 
-        Only tools that carry an ``entrypoint`` (SkillTool-derived) can be
-        bridged this way.  MCP-backed tools and agent tools are skipped.
+        The ``tools`` list is partitioned into two groups:
+
+        * **Skill tools** – entries that carry an ``entrypoint`` key
+          (SkillTool-derived).  Passed to the subprocess via
+          ``BIRDIE_TOOLS_JSON``.
+        * **Agent tools** – entries that carry a ``_agent_def`` key
+          (produced by :func:`agentdef_to_normalized_def`).  Passed via
+          ``BIRDIE_AGENTS_JSON`` so the MCP server can reconstruct and run
+          each agent in-process.
+
         Returns None when there is nothing to expose.
         """
-        bridgeable = [t for t in tools if "entrypoint" in t]
-        if not bridgeable:
+        bridgeable_tools = [t for t in tools if "entrypoint" in t]
+        bridgeable_agents = [t for t in tools if "_agent_def" in t]
+        if not bridgeable_tools and not bridgeable_agents:
             return None
-        tools_json = json.dumps(bridgeable)
+        tools_json = json.dumps(bridgeable_tools)
+        agents_json = json.dumps(bridgeable_agents)
         return {
             "name": "birdie",
             "command": sys.executable,
             "args": ["-m", "birdie.core.acp_mcp_server"],
-            "env": [{"name": "BIRDIE_TOOLS_JSON", "value": tools_json}],
+            "env": [
+                {"name": "BIRDIE_TOOLS_JSON", "value": tools_json},
+                {"name": "BIRDIE_AGENTS_JSON", "value": agents_json},
+            ],
         }
 
     # -- in-process MCP SSE server (async paths) ----------------------------
@@ -1686,6 +1699,64 @@ def lc_tool_to_normalized_def(tool: Any) -> NormalizedToolDef:
         "description": tool.description or "",
         "parameters": schema,
     }
+
+
+def agentdef_to_normalized_def(
+    agent_def: Any,
+    provider_config: dict | None = None,
+    skills_dir: str = "skills",
+    agents_dir: str | None = None,
+) -> NormalizedToolDef:
+    """Convert an AgentDef to a NormalizedToolDef for use with ACPProvider.
+
+    The returned dict carries an ``"_agent_def"`` key (the serialised AgentDef)
+    plus execution-context keys (``_provider_config``, ``_skills_dir``,
+    ``_agents_dir``) so that ``acp_mcp_server.py`` can reconstruct and run the
+    agent without any extra state.
+
+    The ``parameters`` field is built from the agent's ``input_params`` so the
+    ACP subprocess knows the tool's JSON Schema and can validate arguments.
+
+    Args:
+        agent_def: A parsed ``AgentDef`` Pydantic model.
+        provider_config: Full provider config dict from the parent agent
+            (vendor, api_key, base_url, …).  Forwarded to the ephemeral
+            DynamicAgent so it uses the same LLM backend.
+        skills_dir: Skills directory forwarded to the ephemeral DynamicAgent.
+        agents_dir: Agents directory forwarded to the ephemeral DynamicAgent.
+
+    Returns:
+        A ``NormalizedToolDef`` dict that ``_mcp_server_entry`` can serialise
+        into ``BIRDIE_AGENTS_JSON``.
+    """
+    _TYPE_MAP = {
+        "string": "string", "integer": "integer", "number": "number",
+        "boolean": "boolean", "array": "array", "object": "object",
+    }
+    properties: dict = {}
+    required: list = []
+    for p in agent_def.input_params:
+        properties[p.name] = {
+            "type": _TYPE_MAP.get(p.type, "string"),
+            "description": p.description,
+        }
+        if p.required:
+            required.append(p.name)
+    schema: dict = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+
+    d: NormalizedToolDef = {
+        "name": agent_def.name,
+        "description": agent_def.description,
+        "parameters": schema,
+        # Execution-context metadata consumed by acp_mcp_server._invoke_agent()
+        "_agent_def": agent_def.model_dump(),
+        "_provider_config": provider_config or {},
+        "_skills_dir": skills_dir,
+        "_agents_dir": agents_dir,
+    }
+    return d
 
 
 # ---------------------------------------------------------------------------

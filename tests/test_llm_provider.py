@@ -950,3 +950,354 @@ schema:
             skills_dir=str(tmp_path),
         )
         assert isinstance(agent.provider, LangChainProvider)
+
+
+# ---------------------------------------------------------------------------
+# agentdef_to_normalized_def
+# ---------------------------------------------------------------------------
+
+class TestAgentdefToNormalizedDef:
+    """Unit tests for the agentdef_to_normalized_def() utility."""
+
+    def _make_agent_def(self, name="Summarizer", input_params=None):
+        from birdie.core.models import AgentDef, AgentParam
+        params = input_params or [
+            AgentParam(name="text", type="string", description="Text to summarize", required=True),
+            AgentParam(name="max_points", type="integer", description="Max bullet points", required=False),
+        ]
+        return AgentDef(
+            name=name,
+            description="Summarizes text into bullet points",
+            enabled_by_default=True,
+            prompt="Summarize: {{ text }}",
+            input_params=params,
+        )
+
+    def test_basic_fields(self):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        agent_def = self._make_agent_def()
+        result = agentdef_to_normalized_def(agent_def)
+
+        assert result["name"] == "Summarizer"
+        assert result["description"] == "Summarizes text into bullet points"
+
+    def test_parameters_schema_built_from_input_params(self):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        agent_def = self._make_agent_def()
+        result = agentdef_to_normalized_def(agent_def)
+
+        schema = result["parameters"]
+        assert schema["type"] == "object"
+        assert "text" in schema["properties"]
+        assert schema["properties"]["text"]["type"] == "string"
+        assert "max_points" in schema["properties"]
+        assert schema["properties"]["max_points"]["type"] == "integer"
+        # Only required params appear in the required list
+        assert "text" in schema["required"]
+        assert "max_points" not in schema.get("required", [])
+
+    def test_no_required_params_omits_required_key(self):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        from birdie.core.models import AgentDef, AgentParam
+        agent_def = AgentDef(
+            name="NoReq",
+            description="No required params",
+            prompt="do it",
+            input_params=[AgentParam(name="opt", type="string", description="optional", required=False)],
+        )
+        result = agentdef_to_normalized_def(agent_def)
+        assert "required" not in result["parameters"]
+
+    def test_agent_def_embedded_in_result(self):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        agent_def = self._make_agent_def()
+        result = agentdef_to_normalized_def(agent_def)
+
+        assert "_agent_def" in result
+        assert result["_agent_def"]["name"] == "Summarizer"
+        assert result["_agent_def"]["prompt"] == "Summarize: {{ text }}"
+
+    def test_provider_config_forwarded(self):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        agent_def = self._make_agent_def()
+        cfg = {"vendor": "anthropic", "model": "claude-haiku-4-5-20251001", "api_key": "sk-test"}
+        result = agentdef_to_normalized_def(agent_def, provider_config=cfg)
+
+        assert result["_provider_config"] == cfg
+
+    def test_skills_dir_and_agents_dir_forwarded(self):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        agent_def = self._make_agent_def()
+        result = agentdef_to_normalized_def(
+            agent_def, skills_dir="/custom/skills", agents_dir="/custom/agents"
+        )
+        assert result["_skills_dir"] == "/custom/skills"
+        assert result["_agents_dir"] == "/custom/agents"
+
+    def test_defaults_when_no_provider_config(self):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        agent_def = self._make_agent_def()
+        result = agentdef_to_normalized_def(agent_def)
+
+        assert result["_provider_config"] == {}
+        assert result["_skills_dir"] == "skills"
+        assert result["_agents_dir"] is None
+
+    def test_no_entrypoint_key(self):
+        """Agent defs must NOT have an entrypoint key (that's for skill tools)."""
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        agent_def = self._make_agent_def()
+        result = agentdef_to_normalized_def(agent_def)
+        assert "entrypoint" not in result
+
+    def test_empty_input_params(self):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        from birdie.core.models import AgentDef
+        agent_def = AgentDef(name="Empty", description="No params", prompt="go", input_params=[])
+        result = agentdef_to_normalized_def(agent_def)
+        assert result["parameters"] == {"type": "object", "properties": {}}
+
+
+# ---------------------------------------------------------------------------
+# ACPProvider._mcp_server_entry with agent defs
+# ---------------------------------------------------------------------------
+
+class TestACPProviderMcpServerEntryWithAgents:
+    """Tests for _mcp_server_entry when agent NormalizedToolDefs are present."""
+
+    def _make_agent_normalized(self, name="Summarizer"):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        from birdie.core.models import AgentDef, AgentParam
+        agent_def = AgentDef(
+            name=name,
+            description=f"Agent {name}",
+            prompt="do {{ task }}",
+            input_params=[AgentParam(name="task", type="string", description="task", required=True)],
+        )
+        return agentdef_to_normalized_def(agent_def, provider_config={"vendor": "openai"})
+
+    def _make_skill_tool(self, name="search"):
+        return {
+            "name": name,
+            "description": "Search the web",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            "entrypoint": "python:birdie.skills.duckduckgo.tools.search",
+        }
+
+    def test_agent_only_produces_entry(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        agent_tool = self._make_agent_normalized()
+        entry = provider._mcp_server_entry([agent_tool])
+
+        assert entry is not None
+        assert entry["name"] == "birdie"
+        assert "birdie.core.acp_mcp_server" in entry["args"]
+
+    def test_agent_goes_into_birdie_agents_json(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        agent_tool = self._make_agent_normalized("Summarizer")
+        entry = provider._mcp_server_entry([agent_tool])
+
+        env_dict = {e["name"]: e["value"] for e in entry["env"]}
+        agents = json.loads(env_dict["BIRDIE_AGENTS_JSON"])
+        assert len(agents) == 1
+        assert agents[0]["name"] == "Summarizer"
+        assert "_agent_def" in agents[0]
+        assert agents[0]["_agent_def"]["name"] == "Summarizer"
+
+    def test_agent_not_in_birdie_tools_json(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        agent_tool = self._make_agent_normalized()
+        entry = provider._mcp_server_entry([agent_tool])
+
+        env_dict = {e["name"]: e["value"] for e in entry["env"]}
+        tools = json.loads(env_dict["BIRDIE_TOOLS_JSON"])
+        assert tools == []
+
+    def test_skill_tool_goes_into_birdie_tools_json(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        skill_tool = self._make_skill_tool("search")
+        entry = provider._mcp_server_entry([skill_tool])
+
+        env_dict = {e["name"]: e["value"] for e in entry["env"]}
+        tools = json.loads(env_dict["BIRDIE_TOOLS_JSON"])
+        assert len(tools) == 1
+        assert tools[0]["name"] == "search"
+
+    def test_mixed_tools_and_agents_both_partitioned(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        skill_tool = self._make_skill_tool("search")
+        agent_tool = self._make_agent_normalized("Summarizer")
+        entry = provider._mcp_server_entry([skill_tool, agent_tool])
+
+        assert entry is not None
+        env_dict = {e["name"]: e["value"] for e in entry["env"]}
+
+        tools = json.loads(env_dict["BIRDIE_TOOLS_JSON"])
+        agents = json.loads(env_dict["BIRDIE_AGENTS_JSON"])
+
+        assert len(tools) == 1 and tools[0]["name"] == "search"
+        assert len(agents) == 1 and agents[0]["name"] == "Summarizer"
+
+    def test_multiple_agents_all_included(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        tools = [self._make_agent_normalized(n) for n in ["AgentA", "AgentB", "AgentC"]]
+        entry = provider._mcp_server_entry(tools)
+
+        env_dict = {e["name"]: e["value"] for e in entry["env"]}
+        agents = json.loads(env_dict["BIRDIE_AGENTS_JSON"])
+        names = {a["name"] for a in agents}
+        assert names == {"AgentA", "AgentB", "AgentC"}
+
+    def test_no_tools_no_agents_returns_none(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        # A tool without entrypoint and without _agent_def (e.g. MCP tool) is skipped
+        mcp_tool = {
+            "name": "mcp_tool",
+            "description": "some mcp tool",
+            "parameters": {"type": "object", "properties": {}},
+        }
+        entry = provider._mcp_server_entry([mcp_tool])
+        assert entry is None
+
+    def test_provider_config_embedded_in_agent_entry(self):
+        from birdie.core.llm_provider import ACPProvider, agentdef_to_normalized_def
+        from birdie.core.models import AgentDef
+        provider = ACPProvider(command="claude-agent-acp")
+        agent_def = AgentDef(name="MyAgent", description="test", prompt="go")
+        cfg = {"vendor": "anthropic", "model": "claude-haiku-4-5-20251001"}
+        agent_tool = agentdef_to_normalized_def(agent_def, provider_config=cfg)
+        entry = provider._mcp_server_entry([agent_tool])
+
+        env_dict = {e["name"]: e["value"] for e in entry["env"]}
+        agents = json.loads(env_dict["BIRDIE_AGENTS_JSON"])
+        assert agents[0]["_provider_config"] == cfg
+
+
+# ---------------------------------------------------------------------------
+# acp_mcp_server._build_server with agent defs
+# ---------------------------------------------------------------------------
+
+class TestAcpMcpServerWithAgents:
+    """Unit tests for the MCP server builder with agent definitions."""
+
+    def _make_agent_raw(self, name="Summarizer"):
+        from birdie.core.llm_provider import agentdef_to_normalized_def
+        from birdie.core.models import AgentDef, AgentParam
+        agent_def = AgentDef(
+            name=name,
+            description=f"Agent {name}",
+            prompt="Summarize: {{ text }}",
+            input_params=[AgentParam(name="text", type="string", description="text", required=True)],
+        )
+        return agentdef_to_normalized_def(agent_def)
+
+    async def _list_tools(self, server):
+        """Invoke the list_tools request handler directly."""
+        import mcp.types as types
+        handler = server.request_handlers[types.ListToolsRequest]
+        result = await handler(types.ListToolsRequest(method="tools/list", params=None))
+        return result.root.tools
+
+    async def _call_tool(self, server, name, arguments):
+        """Invoke the call_tool request handler directly."""
+        import mcp.types as types
+        handler = server.request_handlers[types.CallToolRequest]
+        req = types.CallToolRequest(
+            method="tools/call",
+            params=types.CallToolRequestParams(name=name, arguments=arguments),
+        )
+        return await handler(req)
+
+    @pytest.mark.asyncio
+    async def test_list_tools_includes_agents(self):
+        from birdie.core.acp_mcp_server import _build_server
+        agent_raw = self._make_agent_raw("Summarizer")
+        server = _build_server(tool_defs=[], agent_defs=[agent_raw])
+
+        tools = await self._list_tools(server)
+        names = [t.name for t in tools]
+        assert "Summarizer" in names
+
+    @pytest.mark.asyncio
+    async def test_list_tools_includes_both_skill_tools_and_agents(self):
+        from birdie.core.acp_mcp_server import _build_server
+        skill_tool = {
+            "name": "search",
+            "description": "Search",
+            "parameters": {"type": "object", "properties": {}},
+            "entrypoint": "python:birdie.skills.duckduckgo.tools.search",
+        }
+        agent_raw = self._make_agent_raw("Summarizer")
+        server = _build_server(tool_defs=[skill_tool], agent_defs=[agent_raw])
+
+        tools = await self._list_tools(server)
+        names = [t.name for t in tools]
+        assert "search" in names
+        assert "Summarizer" in names
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_input_schema_forwarded(self):
+        from birdie.core.acp_mcp_server import _build_server
+        agent_raw = self._make_agent_raw("Summarizer")
+        server = _build_server(tool_defs=[], agent_defs=[agent_raw])
+
+        tools = await self._list_tools(server)
+        agent_tool = next(t for t in tools if t.name == "Summarizer")
+        assert "text" in agent_tool.inputSchema.get("properties", {})
+
+    @pytest.mark.asyncio
+    async def test_call_unknown_tool_returns_error_result(self):
+        """The MCP framework wraps ValueError into an isError CallToolResult."""
+        from birdie.core.acp_mcp_server import _build_server
+        server = _build_server(tool_defs=[], agent_defs=[])
+        result = await self._call_tool(server, "nonexistent", {})
+        # MCP framework converts the ValueError into an error result
+        assert result.root.isError is True
+        assert any("Unknown tool" in c.text for c in result.root.content)
+
+    @pytest.mark.asyncio
+    async def test_call_agent_tool_invokes_invoke_agent(self):
+        """call_tool for an agent entry delegates to _invoke_agent."""
+        from birdie.core.acp_mcp_server import _build_server
+        from unittest.mock import patch, AsyncMock
+        agent_raw = self._make_agent_raw("Summarizer")
+        server = _build_server(tool_defs=[], agent_defs=[agent_raw])
+
+        with patch("birdie.core.acp_mcp_server._invoke_agent", new=AsyncMock(return_value="bullet summary")) as mock_invoke:
+            result = await self._call_tool(server, "Summarizer", {"text": "hello world"})
+
+        mock_invoke.assert_awaited_once()
+        call_args = mock_invoke.call_args
+        assert call_args[0][0]["name"] == "Summarizer"
+        assert call_args[0][1] == {"text": "hello world"}
+        # Result should contain the mocked return value
+        assert any("bullet summary" in c.text for c in result.root.content)
+
+    @pytest.mark.asyncio
+    async def test_skill_tool_still_uses_entrypoint(self):
+        """Skill tools continue to use resolve_entrypoint, not _invoke_agent."""
+        from birdie.core.acp_mcp_server import _build_server
+        from unittest.mock import patch, AsyncMock
+        skill_tool = {
+            "name": "search",
+            "description": "Search",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            "entrypoint": "python:birdie.skills.duckduckgo.tools.search",
+        }
+        server = _build_server(tool_defs=[skill_tool], agent_defs=[])
+
+        with patch("birdie.core.acp_mcp_server.resolve_entrypoint") as mock_resolve:
+            mock_fn = MagicMock(return_value="search results")
+            mock_resolve.return_value = mock_fn
+            result = await self._call_tool(server, "search", {"query": "python"})
+
+        mock_resolve.assert_called_once_with("python:birdie.skills.duckduckgo.tools.search")
+        mock_fn.assert_called_once_with("python:birdie.skills.duckduckgo.tools.search", query="python")

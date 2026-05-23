@@ -115,6 +115,9 @@ class DynamicAgent:
             min_messages_auto=self._min_messages_auto,
             min_messages_forced=self._min_messages_forced,
             compression_window_size=self._compression_window_size,
+            skills_dir=self.skills_dir,
+            agents_dir=self.agents_dir,
+            provider_config=self._provider_config,
         )
         self.app = graph.compile(checkpointer=checkpointer or MemorySaver())
 
