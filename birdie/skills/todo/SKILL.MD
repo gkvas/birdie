@@ -7,8 +7,6 @@ enabled_by_default: false
 always_inject: true
 ---
 
-# ToDo Planning Skill
-
 For **every** user request, follow this protocol without exception:
 
 1. **Plan first** — Call `todo_create_plan` with a concrete, ordered list of steps you will take.
@@ -21,7 +19,7 @@ Keep steps short and action-oriented (e.g. "Read config file", "List directory",
 ## Tools
 
 ### todo_create_plan
-description: Create and display the step-by-step plan for the current request.
+description: Create and display the step-by-step plan for the current request. Call this before taking any other action. `steps` is an ordered list of short, action-oriented strings describing each step you will execute.
 entrypoint: python:birdie.skills.todo.tools.create_plan
 schema:
   type: object
@@ -34,7 +32,7 @@ schema:
   required: [steps]
 
 ### todo_complete_step
-description: Mark a plan step as complete and record what was done.
+description: Mark a plan step as complete and record what was done. Call this immediately after finishing each step. `step_number` is 1-based and must match a step from the active plan.
 entrypoint: python:birdie.skills.todo.tools.complete_step
 schema:
   type: object
@@ -45,4 +43,4 @@ schema:
     summary:
       type: string
       description: One-line summary of what was done or found
-  required: [step_number]
+  required: [step_number, summary]
