@@ -410,7 +410,7 @@ class TestACPProvider:
         text = blocks[0]["text"]
         assert "Be helpful" in text
 
-    def test_chat_sends_last_human_message(self):
+    def test_chat_sends_full_conversation_history(self):
         from birdie.core.llm_provider import ACPProvider
         mock_proc = self._make_proc(self._prompt_result())
         with patch("subprocess.Popen", return_value=mock_proc):
@@ -425,6 +425,8 @@ class TestACPProvider:
         text = blocks[0]["text"]
         assert "Follow up" in text
         assert "Be helpful" in text
+        assert "Hello" in text
+        assert "Hi" in text
 
     def test_list_models(self):
         from birdie.core.llm_provider import ACPProvider
@@ -446,6 +448,86 @@ class TestACPProvider:
         assert provider._extract_chunk_text({}) is None
         params2 = {"update": {"sessionUpdate": "tool_call_update"}}
         assert provider._extract_chunk_text(params2) is None
+
+    def test_chat_includes_tool_messages_in_history(self):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(self._prompt_result())
+        messages = [
+            HumanMessage(content="List files"),
+            AIMessage(content="", tool_calls=[{"name": "run_bash", "args": {"command": "ls"}, "id": "tc1"}]),
+            ToolMessage(content="file1.py\nfile2.py", tool_call_id="tc1", name="run_bash"),
+            HumanMessage(content="Which is larger?"),
+        ]
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.chat(messages, system_prompt="Be helpful")
+        calls = mock_proc.stdin.write.call_args_list
+        prompt_msg = json.loads(calls[2][0][0].decode())
+        text = prompt_msg["params"]["prompt"][0]["text"]
+        assert "List files" in text
+        assert "Which is larger?" in text
+        assert "run_bash" in text
+        assert "file1.py" in text
+
+    @pytest.mark.asyncio
+    async def test_astream_chat_yields_terminal_call(self):
+        from birdie.core.llm_provider import ACPProvider
+        from langchain_core.messages import AIMessageChunk
+
+        terminal_request = {
+            "jsonrpc": "2.0", "id": 10, "method": "terminal/create",
+            "params": {"command": "ls -la", "cwd": "/tmp"},
+        }
+        terminal_response = {
+            "jsonrpc": "2.0", "id": 10,
+            "result": {"terminalId": "term_001", "output": "file.txt\n"},
+        }
+
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
+        }).encode() + b"\n"
+        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s1"}}).encode() + b"\n"
+        chunk_msg = json.dumps(self._chunk_notification("Here are the files:")).encode() + b"\n"
+        term_req = json.dumps(terminal_request).encode() + b"\n"
+        final = json.dumps(self._prompt_result()).encode() + b"\n"
+
+        mock_stdin = AsyncMock()
+        mock_stdin.write = MagicMock()
+        mock_stdin.drain = AsyncMock()
+
+        read_lines = [init_resp, session_resp, term_req, chunk_msg, final]
+        read_idx = 0
+
+        async def fake_readline():
+            nonlocal read_idx
+            if read_idx < len(read_lines):
+                line = read_lines[read_idx]
+                read_idx += 1
+                return line
+            return b""
+
+        mock_stdout = AsyncMock()
+        mock_stdout.readline = fake_readline
+
+        mock_proc = AsyncMock()
+        mock_proc.stdin = mock_stdin
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc), \
+             patch("asyncio.create_subprocess_shell") as mock_shell:
+            mock_shell_proc = AsyncMock()
+            mock_shell_proc.communicate = AsyncMock(return_value=(b"file.txt\n", b""))
+            mock_shell.return_value = mock_shell_proc
+
+            provider = ACPProvider(command="claude-agent-acp")
+            chunks = [c async for c in provider.astream_chat([HumanMessage(content="List files")])]
+
+        content = "".join(c.content for c in chunks)
+        assert "run_bash" in content
+        assert "ls -la" in content
+        assert "Here are the files:" in content
 
     @patch("birdie.core.llm_provider.ACPProvider.__init__", return_value=None)
     def test_acp_vendor_factory(self, mock_init):

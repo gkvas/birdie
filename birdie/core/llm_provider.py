@@ -1183,28 +1183,48 @@ class ACPProvider(LLMProvider):
 
     # -- message helpers ----------------------------------------------------
 
-    def _last_user_text(
+    def _build_conversation_prompt(
         self,
         messages: list[BaseMessage],
         system_prompt: str | None,
     ) -> str:
-        """Extract the last human message, optionally prefixed with the system prompt."""
+        """Format the full conversation history as a text prompt for the ACP subprocess."""
         effective_system = system_prompt
-        if not effective_system:
-            for msg in messages:
-                if isinstance(msg, SystemMessage):
+        dialogue: list[str] = []
+
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                if not effective_system:
                     effective_system = str(msg.content)
-                    break
+            elif isinstance(msg, HumanMessage):
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                dialogue.append(f"Human: {content}")
+            elif isinstance(msg, AIMessage):
+                if isinstance(msg.content, str):
+                    text = msg.content
+                elif isinstance(msg.content, list):
+                    text = " ".join(
+                        block.get("text", "")
+                        for block in msg.content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                else:
+                    text = str(msg.content)
+                tool_calls = getattr(msg, "tool_calls", [])
+                if text:
+                    dialogue.append(f"Assistant: {text}")
+                elif tool_calls:
+                    tc_strs = [f"[called {tc['name']}({tc['args']})]" for tc in tool_calls]
+                    dialogue.append(f"Assistant: {' '.join(tc_strs)}")
+            elif isinstance(msg, ToolMessage):
+                name = getattr(msg, "name", "tool")
+                content = msg.content if isinstance(msg.content, str) else str(msg.content)
+                dialogue.append(f"[{name} result: {content}]")
 
-        last_human = ""
-        for msg in reversed(messages):
-            if isinstance(msg, HumanMessage):
-                last_human = msg.content if isinstance(msg.content, str) else str(msg.content)
-                break
-
+        result = "\n\n".join(dialogue)
         if effective_system:
-            return f"{effective_system}\n\n{last_human}"
-        return last_human
+            return f"{effective_system}\n\n{result}"
+        return result
 
     def _prompt_blocks(self, text: str) -> list:
         """Build the ACP content blocks array for session/prompt."""
@@ -1312,7 +1332,7 @@ class ACPProvider(LLMProvider):
                 "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
                 "params": {
                     "sessionId": session_id,
-                    "prompt": self._prompt_blocks(self._last_user_text(messages, system_prompt)),
+                    "prompt": self._prompt_blocks(self._build_conversation_prompt(messages, system_prompt)),
                 },
             })
 
@@ -1435,7 +1455,7 @@ class ACPProvider(LLMProvider):
         try:
             session_id = await self._async_initialize_session(proc)
 
-            prompt_text = self._last_user_text(messages, system_prompt)
+            prompt_text = self._build_conversation_prompt(messages, system_prompt)
             log.debug("REQUEST  acp=%s\n  prompt: %s", self._command[0], prompt_text[:2000])
             await self._async_send(proc.stdin, {
                 "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
@@ -1482,7 +1502,7 @@ class ACPProvider(LLMProvider):
                 "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
                 "params": {
                     "sessionId": session_id,
-                    "prompt": self._prompt_blocks(self._last_user_text(messages, system_prompt)),
+                    "prompt": self._prompt_blocks(self._build_conversation_prompt(messages, system_prompt)),
                 },
             })
 
@@ -1491,7 +1511,46 @@ class ACPProvider(LLMProvider):
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
                     break
                 if "id" in msg and "method" in msg:
-                    await self._async_handle_agent_request(proc.stdin, msg)
+                    method = msg.get("method", "")
+                    req_id = msg["id"]
+                    params = msg.get("params", {})
+                    if method == "terminal/create":
+                        cmd = params.get("command", "")
+                        cwd_param = params.get("cwd", self._cwd)
+                        try:
+                            p = await asyncio.create_subprocess_shell(
+                                cmd,
+                                stdout=asyncio.subprocess.PIPE,
+                                stderr=asyncio.subprocess.PIPE,
+                                cwd=cwd_param,
+                            )
+                            out, err = await asyncio.wait_for(p.communicate(), timeout=60)
+                            output = (out or b"").decode() + (err or b"").decode()
+                            await self._async_send(proc.stdin, {
+                                "jsonrpc": "2.0", "id": req_id,
+                                "result": {"terminalId": "term_001", "output": output},
+                            })
+                            yield AIMessageChunk(content=f"run_bash(command={cmd!r})\n{output}\n")
+                        except Exception as exc:
+                            await self._async_send(proc.stdin, {
+                                "jsonrpc": "2.0", "id": req_id,
+                                "error": {"code": -32000, "message": str(exc)},
+                            })
+                    elif method == "fs/read_text_file":
+                        path_str = params.get("path", "")
+                        try:
+                            content = Path(path_str).read_text()
+                            await self._async_send(proc.stdin, {
+                                "jsonrpc": "2.0", "id": req_id, "result": {"content": content},
+                            })
+                            yield AIMessageChunk(content=f"read_file({path_str!r})\n")
+                        except Exception as exc:
+                            await self._async_send(proc.stdin, {
+                                "jsonrpc": "2.0", "id": req_id,
+                                "error": {"code": -32000, "message": str(exc)},
+                            })
+                    else:
+                        await self._async_handle_agent_request(proc.stdin, msg)
                 elif "method" in msg and "id" not in msg:
                     chunk = self._extract_chunk_text(msg.get("params", {}))
                     if chunk:
