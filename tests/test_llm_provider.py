@@ -571,6 +571,7 @@ class TestACPProvider:
         servers = session_new["params"]["mcpServers"]
         assert len(servers) == 1
         assert servers[0]["name"] == "birdie"
+        assert session_new["params"]["_meta"]["disableBuiltInTools"] is True
 
     def test_chat_without_tools_sends_empty_mcp_servers(self):
         from birdie.core.llm_provider import ACPProvider
@@ -581,6 +582,7 @@ class TestACPProvider:
         calls = mock_proc.stdin.write.call_args_list
         session_new = json.loads(calls[1][0][0].decode())
         assert session_new["params"]["mcpServers"] == []
+        assert "_meta" not in session_new["params"]
 
     def test_chat_mcp_mode_rejects_terminal_create(self):
         from birdie.core.llm_provider import ACPProvider

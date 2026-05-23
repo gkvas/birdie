@@ -1356,9 +1356,12 @@ class ACPProvider(LLMProvider):
             self._sync_recv(proc.stdout)  # consume initialize response
 
             # Phase 2: session/new
+            session_params: dict = {"cwd": self._cwd, "mcpServers": mcp_servers}
+            if mcp_servers:
+                session_params["_meta"] = {"disableBuiltInTools": True}
             self._sync_send(proc.stdin, {
                 "jsonrpc": "2.0", "id": 1, "method": "session/new",
-                "params": {"cwd": self._cwd, "mcpServers": mcp_servers},
+                "params": session_params,
             })
             session_resp = self._sync_recv(proc.stdout)
             session_id = session_resp.get("result", {}).get("sessionId", "")
@@ -1478,9 +1481,12 @@ class ACPProvider(LLMProvider):
         })
         await self._async_recv(proc.stdout, timeout=30)
 
+        session_params: dict = {"cwd": self._cwd, "mcpServers": mcp_servers or []}
+        if mcp_servers:
+            session_params["_meta"] = {"disableBuiltInTools": True}
         await self._async_send(proc.stdin, {
             "jsonrpc": "2.0", "id": 1, "method": "session/new",
-            "params": {"cwd": self._cwd, "mcpServers": mcp_servers or []},
+            "params": session_params,
         })
         session_resp = await self._async_recv(proc.stdout, timeout=30)
         return session_resp.get("result", {}).get("sessionId", "")
