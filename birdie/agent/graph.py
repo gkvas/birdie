@@ -87,6 +87,28 @@ def _get_retry_after(exc: Exception) -> float | None:
             pass
     return None
 
+
+async def _achat_with_retry(provider: LLMProvider, **kwargs) -> BaseMessage:
+    """Call provider.achat with exponential back-off on transient rate-limit errors."""
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return await provider.achat(**kwargs)
+        except Exception as exc:
+            if not _is_retryable_error(exc):
+                raise
+            delay = _get_retry_after(exc) or (_RETRY_BASE_DELAY * (2 ** attempt))
+            if attempt >= _MAX_RETRIES:
+                raise BirdieRateLimitError(
+                    f"Provider rate limit hit; retries exhausted after {_MAX_RETRIES} attempts.",
+                    retry_after=delay,
+                ) from exc
+            log.warning(
+                "Provider rate-limited; retrying in %.1fs (attempt %d/%d)",
+                delay, attempt + 1, _MAX_RETRIES,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError("unreachable")
+
 _COMPACTION_PROMPT = """\
 You are a memory compaction system. Analyse the following conversation \
 transcript and extract structured information for long-term storage.
@@ -220,7 +242,7 @@ async def compact_history(
     history_text = "\n".join(lines)
     prompt = _COMPACTION_PROMPT.format(history=history_text)
 
-    response = await provider.achat(messages=[HumanMessage(content=prompt)])
+    response = await _achat_with_retry(provider, messages=[HumanMessage(content=prompt)])
     compaction_result = _parse_compaction_json(_msg_text(response))
     summary_text = compaction_result.get("summary", "")
 
@@ -523,30 +545,12 @@ def create_agent_graph(
 
         system_prompt = _build_system_prompt(state, config, ltm_context=ltm_context)
 
-        # Retry on transient provider errors (429/529) with Retry-After-aware back-off.
-        response: BaseMessage | None = None
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                response = await provider.achat(
-                    messages=clean_messages,
-                    tools=normalized_tools,
-                    system_prompt=system_prompt,
-                )
-                break
-            except Exception as exc:
-                if not _is_retryable_error(exc):
-                    raise
-                delay = _get_retry_after(exc) or (_RETRY_BASE_DELAY * (2 ** attempt))
-                if attempt >= _MAX_RETRIES:
-                    raise BirdieRateLimitError(
-                        f"Provider rate limit hit; retries exhausted after {_MAX_RETRIES} attempts.",
-                        retry_after=delay,
-                    ) from exc
-                log.warning(
-                    "Provider rate-limited; retrying in %.1fs (attempt %d/%d)",
-                    delay, attempt + 1, _MAX_RETRIES,
-                )
-                await asyncio.sleep(delay)
+        response = await _achat_with_retry(
+            provider,
+            messages=clean_messages,
+            tools=normalized_tools,
+            system_prompt=system_prompt,
+        )
 
         return {"messages": compaction_removes + repair_msgs + [response]}
 
