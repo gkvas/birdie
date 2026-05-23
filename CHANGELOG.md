@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.14] - 2026-05-23
+
+### Added
+- ACP provider now exposes enabled Birdie skills to the ACP agent via a
+  stdio MCP server (`birdie.core.acp_mcp_server`). When at least one skill
+  with a local entrypoint is enabled, the MCP server entry is passed in
+  `session/new` so the underlying model (e.g. Claude Code) can call skill
+  tools directly through MCP.
+- Built-in ACP callbacks (`terminal/create`, `fs/read_text_file`,
+  `fs/write_text_file`) are disabled when an MCP server is active, so the
+  model uses Birdie's skill tools exclusively.
+
+### Fixed
+- ACP `session/request_permission` response now uses the correct nested
+  format `{"outcome": {"outcome": "selected", "optionId": "allow"}}`;
+  the previous flat `{"optionId": "allow"}` caused every MCP tool call to
+  be silently denied.
+- Claude Code built-in tools (Read, Bash, Write, etc.) are now suppressed
+  when MCP mode is active by setting `disableBuiltInTools: true` in
+  `session/new`; previously the model could use all built-in tools
+  regardless of which Birdie skills were enabled.
+- ACP provider sends the full conversation history on every turn instead
+  of only the last user message, giving the model the same context as
+  native providers.
+- Tool calls made by the ACP agent are now visible in the CLI output.
+
 ## [0.2.13] - 2026-05-18
 
 ### Added
