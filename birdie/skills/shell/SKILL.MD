@@ -6,12 +6,10 @@ tags: [shell, local, system]
 enabled_by_default: false
 ---
 
-# Skill: Shell
-
 ## Tools
 
 ### run_bash
-description: Run a shell command and return its output.
+description: Run a shell command and return its output. Prefer targeted reads over full-file dumps: use `grep -n "pattern" file` to scan, `head -n 80` or `sed -n '50,120p'` to read specific ranges, `wc -l` to check length first. Use `cat` only for files under ~200 lines. Both stdout and stderr are captured; non-zero exit raises an error.
 entrypoint: bash:{command}
 schema:
   type: object
@@ -20,18 +18,3 @@ schema:
       type: string
       description: The shell command to execute
   required: [command]
-
-## Reading files for analysis
-
-Prefer targeted reads over full-file dumps so output stays within context:
-
-- `grep -n "class\|def " file.py` — scan structure and line numbers
-- `head -n 80 file.py` — read the top of a file
-- `sed -n '50,120p' file.py` — read a specific line range
-- `wc -l file.py` — check file length before deciding how to read it
-
-Use `cat` only for files you know are small (under ~200 lines). For larger
-files, read the relevant sections rather than the whole file.
-
-## Permissions
-- local_shell

@@ -1,53 +1,41 @@
 ---
 name: Weather
 version: 1.0.0
-description: Provides weather lookup capabilities via an external API.
+description: Current weather and forecasts via weatherapi.com.
 tags: [public, http, weather]
 enabled_by_default: false
 ---
 
-# Skill: Weather
-
 ## Tools
 
 ### get_weather
-description: Get current weather for a given city.
+description: Get current weather conditions for a city (temperature, humidity, wind, condition). Requires a free API key from weatherapi.com passed as `key`; omitting it returns an authentication error.
 entrypoint: http:get https://api.weatherapi.com/v1/current.json
 schema:
   type: object
   properties:
     city:
       type: string
-      description: The city name to get weather for
+      description: City name (e.g. "London", "New York", "Graz")
     key:
       type: string
-      description: API key for weatherapi.com (optional)
-  required: [city]
+      description: weatherapi.com API key
+  required: [city, key]
 
 ### get_forecast
-description: Get weather forecast for a given city.
+description: Get a multi-day weather forecast for a city (daily high/low, condition, precipitation chance). `days` must be 1–14, defaults to 3. Requires a weatherapi.com API key passed as `key`.
 entrypoint: http:get https://api.weatherapi.com/v1/forecast.json
 schema:
   type: object
   properties:
     city:
       type: string
-      description: The city name to get forecast for
+      description: City name (e.g. "London", "New York", "Graz")
     days:
       type: integer
-      description: Number of days to forecast (1-14)
+      description: Number of days to forecast (1–14, default 3)
       default: 3
     key:
       type: string
-      description: API key for weatherapi.com (optional)
-  required: [city]
-
-## Permissions
-- outbound_http
-
-## Examples
-User: "What's the weather in Graz?"
-Tool: get_weather(city="Graz")
-
-User: "What's the 5-day forecast for Berlin?"
-Tool: get_forecast(city="Berlin", days=5)
+      description: weatherapi.com API key
+  required: [city, key]
