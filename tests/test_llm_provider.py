@@ -221,6 +221,7 @@ class TestSkillToolNormalization:
         assert normalized["name"] == "read_file"
         assert normalized["description"] == "Read a file"
         assert "properties" in normalized["parameters"]
+        assert normalized["entrypoint"] == "bash:cat {path}"
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +437,7 @@ class TestACPProvider:
     def test_capability_flags(self):
         from birdie.core.llm_provider import ACPProvider
         provider = ACPProvider(command="claude-agent-acp")
-        assert provider.supports_tools() is False
+        assert provider.supports_tools() is True
         assert provider.supports_streaming() is True
         assert provider.supports_json_mode() is False
 
@@ -528,6 +529,141 @@ class TestACPProvider:
         assert "run_bash" in content
         assert "ls -la" in content
         assert "Here are the files:" in content
+
+    def test_mcp_server_entry_with_entrypoint_tools(self):
+        from birdie.core.llm_provider import ACPProvider
+        import sys
+        provider = ACPProvider(command="claude-agent-acp")
+        tools = [
+            {"name": "run_bash", "description": "Run a bash command", "parameters": {}, "entrypoint": "bash:{command}"},
+            {"name": "search", "description": "Search the web", "parameters": {}, "entrypoint": "python:birdie.skills.ddg.run"},
+        ]
+        entry = provider._mcp_server_entry(tools)
+        assert entry is not None
+        assert entry["name"] == "birdie"
+        assert entry["command"] == sys.executable
+        assert "-m" in entry["args"]
+        assert "birdie.core.acp_mcp_server" in entry["args"]
+        env_dict = {e["name"]: e["value"] for e in entry["env"]}
+        decoded = json.loads(env_dict["BIRDIE_TOOLS_JSON"])
+        assert len(decoded) == 2
+        assert decoded[0]["entrypoint"] == "bash:{command}"
+
+    def test_mcp_server_entry_without_entrypoint_tools(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        tools = [
+            {"name": "mcp_tool", "description": "An MCP tool", "parameters": {}},
+        ]
+        entry = provider._mcp_server_entry(tools)
+        assert entry is None
+
+    def test_chat_with_tools_sends_mcp_server_entry(self):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(self._prompt_result())
+        tools = [{"name": "run_bash", "description": "run", "parameters": {}, "entrypoint": "bash:{command}"}]
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.chat([HumanMessage(content="hi")], tools=tools)
+        calls = mock_proc.stdin.write.call_args_list
+        session_new = json.loads(calls[1][0][0].decode())
+        assert session_new["method"] == "session/new"
+        servers = session_new["params"]["mcpServers"]
+        assert len(servers) == 1
+        assert servers[0]["name"] == "birdie"
+
+    def test_chat_without_tools_sends_empty_mcp_servers(self):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(self._prompt_result())
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.chat([HumanMessage(content="hi")])
+        calls = mock_proc.stdin.write.call_args_list
+        session_new = json.loads(calls[1][0][0].decode())
+        assert session_new["params"]["mcpServers"] == []
+
+    def test_chat_mcp_mode_rejects_terminal_create(self):
+        from birdie.core.llm_provider import ACPProvider
+        terminal_req = {
+            "jsonrpc": "2.0", "id": 5, "method": "terminal/create",
+            "params": {"command": "ls"},
+        }
+        mock_proc = self._make_proc(terminal_req, self._prompt_result())
+        tools = [{"name": "run_bash", "description": "run", "parameters": {}, "entrypoint": "bash:{command}"}]
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.chat([HumanMessage(content="hi")], tools=tools)
+        written = [json.loads(c[0][0].decode()) for c in mock_proc.stdin.write.call_args_list]
+        responses = [m for m in written if m.get("id") == 5]
+        assert len(responses) == 1
+        assert "error" in responses[0]
+        assert responses[0]["error"]["code"] == -32601
+
+    def _make_async_proc(self, *response_lines):
+        """Build a mock async ACP subprocess whose stdout yields the given JSON lines."""
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
+        }).encode() + b"\n"
+        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s_async"}}).encode() + b"\n"
+        lines = [init_resp, session_resp] + [(json.dumps(r) + "\n").encode() for r in response_lines]
+        idx = 0
+
+        async def readline():
+            nonlocal idx
+            if idx < len(lines):
+                line = lines[idx]; idx += 1; return line
+            return b""
+
+        mock_stdin = AsyncMock()
+        mock_stdin.write = MagicMock()
+        mock_stdin.drain = AsyncMock()
+        mock_stdout = AsyncMock()
+        mock_stdout.readline = readline
+        mock_proc = AsyncMock()
+        mock_proc.stdin = mock_stdin
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait = AsyncMock(return_value=0)
+        return mock_proc
+
+    @pytest.mark.asyncio
+    async def test_achat_with_tools_sends_mcp_entry(self):
+        import sys
+        from birdie.core.llm_provider import ACPProvider
+        tools = [{"name": "run_bash", "description": "run", "parameters": {}, "entrypoint": "bash:{command}"}]
+        mock_proc = self._make_async_proc(self._prompt_result())
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            await provider.achat([HumanMessage(content="hi")], tools=tools)
+
+        written = [json.loads(c[0][0].decode()) for c in mock_proc.stdin.write.call_args_list]
+        session_new = next(m for m in written if m.get("method") == "session/new")
+        servers = session_new["params"]["mcpServers"]
+        assert len(servers) == 1
+        entry = servers[0]
+        assert entry["name"] == "birdie"
+        assert entry["command"] == sys.executable
+        assert "-m" in entry["args"]
+        assert "birdie.core.acp_mcp_server" in entry["args"]
+        assert any(e["name"] == "BIRDIE_TOOLS_JSON" for e in entry["env"])
+
+    @pytest.mark.asyncio
+    async def test_astream_chat_with_tools_rejects_terminal_create(self):
+        from birdie.core.llm_provider import ACPProvider
+        terminal_req = {"jsonrpc": "2.0", "id": 7, "method": "terminal/create", "params": {"command": "ls"}}
+        tools = [{"name": "run_bash", "description": "run", "parameters": {}, "entrypoint": "bash:{command}"}]
+        mock_proc = self._make_async_proc(terminal_req, self._prompt_result())
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            chunks = [c async for c in provider.astream_chat([HumanMessage(content="hi")], tools=tools)]
+
+        written = [json.loads(c[0][0].decode()) for c in mock_proc.stdin.write.call_args_list]
+        rejection = next((m for m in written if m.get("id") == 7), None)
+        assert rejection is not None
+        assert "error" in rejection
+        assert rejection["error"]["code"] == -32601
 
     @patch("birdie.core.llm_provider.ACPProvider.__init__", return_value=None)
     def test_acp_vendor_factory(self, mock_init):

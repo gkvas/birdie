@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,7 +29,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from pydantic import BaseModel, ConfigDict, Field
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -44,7 +45,8 @@ class NormalizedToolDef(TypedDict):
     """Vendor-agnostic tool definition derived from a SKILL.MD SkillTool."""
     name: str
     description: str
-    parameters: dict  # JSON Schema object
+    parameters: dict   # JSON Schema object
+    entrypoint: NotRequired[str]  # present for SkillTool-derived defs; used by ACPProvider MCP bridge
 
 
 @dataclass
@@ -1173,13 +1175,35 @@ class ACPProvider(LLMProvider):
         self._cwd = cwd or os.getcwd()
 
     def supports_tools(self) -> bool:
-        return False
+        return True
 
     def supports_streaming(self) -> bool:
         return True
 
     def supports_json_mode(self) -> bool:
         return False
+
+    # -- MCP bridge ---------------------------------------------------------
+
+    def _mcp_server_entry(self, tools: list[NormalizedToolDef]) -> dict | None:
+        """Build the mcpServers list entry that exposes Birdie skill tools.
+
+        Only tools that carry an ``entrypoint`` (SkillTool-derived) can be
+        bridged this way.  MCP-backed tools and agent tools are skipped.
+        Returns None when there is nothing to expose.
+        """
+        bridgeable = [t for t in tools if "entrypoint" in t]
+        if not bridgeable:
+            return None
+        tools_json = json.dumps(bridgeable)
+        return {
+            "name": "birdie",
+            "command": sys.executable,
+            "args": ["-m", "birdie.core.acp_mcp_server"],
+            "env": [{"name": "BIRDIE_TOOLS_JSON", "value": tools_json}],
+        }
+
+    # -- in-process MCP SSE server (async paths) ----------------------------
 
     # -- message helpers ----------------------------------------------------
 
@@ -1252,14 +1276,22 @@ class ACPProvider(LLMProvider):
             raise EOFError("ACP subprocess closed stdout unexpectedly")
         return json.loads(line.decode())
 
-    def _sync_handle_agent_request(self, stdin: Any, msg: dict) -> None:
+    def _sync_handle_agent_request(self, stdin: Any, msg: dict, mcp_mode: bool = False) -> None:
         """Respond to an incoming JSON-RPC request from the agent (sync)."""
         method = msg.get("method", "")
         req_id = msg["id"]
         params = msg.get("params", {})
 
+        if mcp_mode and method in ("terminal/create", "fs/read_text_file", "fs/write_text_file"):
+            self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                    "error": {"code": -32601, "message": f"Use MCP tools instead of {method}"}})
+            return
+
         if method == "session/request_permission":
-            self._sync_send(stdin, {"jsonrpc": "2.0", "id": req_id, "result": {"optionId": "allow"}})
+            self._sync_send(stdin, {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}},
+            })
 
         elif method == "fs/read_text_file":
             try:
@@ -1301,6 +1333,10 @@ class ACPProvider(LLMProvider):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> BaseMessage:
+        mcp_entry = self._mcp_server_entry(tools) if tools else None
+        mcp_mode = mcp_entry is not None
+        mcp_servers = [mcp_entry] if mcp_entry else []
+
         proc = subprocess.Popen(
             self._command,
             stdin=subprocess.PIPE,
@@ -1322,7 +1358,7 @@ class ACPProvider(LLMProvider):
             # Phase 2: session/new
             self._sync_send(proc.stdin, {
                 "jsonrpc": "2.0", "id": 1, "method": "session/new",
-                "params": {"cwd": self._cwd, "mcpServers": []},
+                "params": {"cwd": self._cwd, "mcpServers": mcp_servers},
             })
             session_resp = self._sync_recv(proc.stdout)
             session_id = session_resp.get("result", {}).get("sessionId", "")
@@ -1342,7 +1378,7 @@ class ACPProvider(LLMProvider):
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
                     return AIMessage(content="".join(text_parts))
                 if "id" in msg and "method" in msg:
-                    self._sync_handle_agent_request(proc.stdin, msg)
+                    self._sync_handle_agent_request(proc.stdin, msg, mcp_mode=mcp_mode)
                 elif "method" in msg and "id" not in msg:
                     chunk = self._extract_chunk_text(msg.get("params", {}))
                     if chunk:
@@ -1361,7 +1397,7 @@ class ACPProvider(LLMProvider):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> Iterator[BaseMessage]:
-        yield self.chat(messages, system_prompt=system_prompt)
+        yield self.chat(messages, tools=tools, system_prompt=system_prompt)
 
     # -- async low-level ----------------------------------------------------
 
@@ -1375,14 +1411,22 @@ class ACPProvider(LLMProvider):
             raise EOFError("ACP subprocess closed stdout unexpectedly")
         return json.loads(line.decode())
 
-    async def _async_handle_agent_request(self, stdin: Any, msg: dict) -> None:
+    async def _async_handle_agent_request(self, stdin: Any, msg: dict, mcp_mode: bool = False) -> None:
         """Respond to an incoming JSON-RPC request from the agent (async)."""
         method = msg.get("method", "")
         req_id = msg["id"]
         params = msg.get("params", {})
 
+        if mcp_mode and method in ("terminal/create", "fs/read_text_file", "fs/write_text_file"):
+            await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id,
+                                           "error": {"code": -32601, "message": f"Use MCP tools instead of {method}"}})
+            return
+
         if method == "session/request_permission":
-            await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id, "result": {"optionId": "allow"}})
+            await self._async_send(stdin, {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}},
+            })
 
         elif method == "fs/read_text_file":
             try:
@@ -1420,7 +1464,9 @@ class ACPProvider(LLMProvider):
             await self._async_send(stdin, {"jsonrpc": "2.0", "id": req_id,
                                            "error": {"code": -32601, "message": f"Method not found: {method}"}})
 
-    async def _async_initialize_session(self, proc: Any) -> str:
+    async def _async_initialize_session(
+        self, proc: Any, mcp_servers: list[dict] | None = None
+    ) -> str:
         """Run Phase 1 + Phase 2; return the sessionId."""
         await self._async_send(proc.stdin, {
             "jsonrpc": "2.0", "id": 0, "method": "initialize",
@@ -1434,7 +1480,7 @@ class ACPProvider(LLMProvider):
 
         await self._async_send(proc.stdin, {
             "jsonrpc": "2.0", "id": 1, "method": "session/new",
-            "params": {"cwd": self._cwd, "mcpServers": []},
+            "params": {"cwd": self._cwd, "mcpServers": mcp_servers or []},
         })
         session_resp = await self._async_recv(proc.stdout, timeout=30)
         return session_resp.get("result", {}).get("sessionId", "")
@@ -1446,6 +1492,10 @@ class ACPProvider(LLMProvider):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> BaseMessage:
+        mcp_entry = self._mcp_server_entry(tools or [])
+        mcp_mode = mcp_entry is not None
+        mcp_servers = [mcp_entry] if mcp_entry else []
+
         proc = await asyncio.create_subprocess_exec(
             *self._command,
             stdin=asyncio.subprocess.PIPE,
@@ -1453,7 +1503,7 @@ class ACPProvider(LLMProvider):
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            session_id = await self._async_initialize_session(proc)
+            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers)
 
             prompt_text = self._build_conversation_prompt(messages, system_prompt)
             log.debug("REQUEST  acp=%s\n  prompt: %s", self._command[0], prompt_text[:2000])
@@ -1473,7 +1523,7 @@ class ACPProvider(LLMProvider):
                     log.debug("RESPONSE  acp=%s\n  content: %s", self._command[0], result.content[:2000])
                     return result
                 if "id" in msg and "method" in msg:
-                    await self._async_handle_agent_request(proc.stdin, msg)
+                    await self._async_handle_agent_request(proc.stdin, msg, mcp_mode=mcp_mode)
                 elif "method" in msg and "id" not in msg:
                     chunk = self._extract_chunk_text(msg.get("params", {}))
                     if chunk:
@@ -1489,6 +1539,10 @@ class ACPProvider(LLMProvider):
         system_prompt: str | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[BaseMessage]:
+        mcp_entry = self._mcp_server_entry(tools or [])
+        mcp_mode = mcp_entry is not None
+        mcp_servers = [mcp_entry] if mcp_entry else []
+
         proc = await asyncio.create_subprocess_exec(
             *self._command,
             stdin=asyncio.subprocess.PIPE,
@@ -1496,7 +1550,7 @@ class ACPProvider(LLMProvider):
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            session_id = await self._async_initialize_session(proc)
+            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers)
 
             await self._async_send(proc.stdin, {
                 "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
@@ -1514,7 +1568,14 @@ class ACPProvider(LLMProvider):
                     method = msg.get("method", "")
                     req_id = msg["id"]
                     params = msg.get("params", {})
-                    if method == "terminal/create":
+                    if mcp_mode and method in ("terminal/create", "fs/read_text_file", "fs/write_text_file"):
+                        # MCP mode: reject built-in callbacks so the subprocess uses MCP tools
+                        await self._async_send(proc.stdin, {
+                            "jsonrpc": "2.0", "id": req_id,
+                            "error": {"code": -32601, "message": f"Use MCP tools instead of {method}"},
+                        })
+                    elif not mcp_mode and method == "terminal/create":
+                        # Legacy mode: handle inline and yield visibility chunk
                         cmd = params.get("command", "")
                         cwd_param = params.get("cwd", self._cwd)
                         try:
@@ -1536,7 +1597,8 @@ class ACPProvider(LLMProvider):
                                 "jsonrpc": "2.0", "id": req_id,
                                 "error": {"code": -32000, "message": str(exc)},
                             })
-                    elif method == "fs/read_text_file":
+                    elif not mcp_mode and method == "fs/read_text_file":
+                        # Legacy mode: handle inline and yield visibility chunk
                         path_str = params.get("path", "")
                         try:
                             content = Path(path_str).read_text()
@@ -1590,11 +1652,14 @@ def _normalized_tool_to_lc_schema(t: NormalizedToolDef):
 
 def skilltool_to_normalized_def(skill_tool: Any) -> NormalizedToolDef:
     """Convert a SkillTool Pydantic model to a NormalizedToolDef dict."""
-    return {
+    d: NormalizedToolDef = {
         "name": skill_tool.name,
         "description": skill_tool.description,
         "parameters": skill_tool.schema,
     }
+    if skill_tool.entrypoint:
+        d["entrypoint"] = skill_tool.entrypoint
+    return d
 
 
 def lc_tool_to_normalized_def(tool: Any) -> NormalizedToolDef:

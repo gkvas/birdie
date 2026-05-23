@@ -108,6 +108,10 @@ Pass via `--config FILE` or by setting `LLM_PROVIDER_CONFIG="$(cat file.json)"`:
 
 The `model` field is the binary name to spawn. Birdie starts it as a child process and communicates via stdin/stdout (JSON-RPC 2.0 over stdio). The binary must be on PATH.
 
+**Skills with ACP**: Skills enabled via `/skill enable` are available to the ACP agent. When at least one skill is enabled, Birdie starts an MCP server (stdio transport) alongside the ACP subprocess and passes it in the `session/new` handshake. The ACP agent's underlying model can then call skill tools through MCP, and the built-in ACP callbacks (`terminal/create`, `fs/read_text_file`, `fs/write_text_file`) are disabled in favour of the MCP tools. Tool calls are visible in the CLI output.
+
+**Conversation history**: The full conversation history is sent to the ACP subprocess on every turn as a formatted dialogue, giving the model the same context as native providers.
+
 ### Config fields
 
 | Field | Type | Default | Description |
