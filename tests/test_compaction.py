@@ -6,11 +6,14 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, ToolMessage
 
 from birdie.agent.graph import (
-    MIN_MESSAGES,
-    MAX_MESSAGES,
-    COMPRESSION_WINDOW,
+    MIN_MESSAGES_AUTO,
+    MIN_MESSAGES_FORCED,
+    COMPRESSION_WINDOW_SIZE,
     compact_history,
 )
+
+# Auto-compaction threshold derived from the two constants.
+_TRIGGER = MIN_MESSAGES_AUTO + COMPRESSION_WINDOW_SIZE
 
 
 class _MockProvider:
@@ -57,8 +60,8 @@ def _build_history(n_turns: int) -> list:
 
 @pytest.mark.asyncio
 async def test_compact_history_too_few_messages_no_op():
-    """Below MAX_MESSAGES threshold - no compaction."""
-    msgs = _build_history(MAX_MESSAGES // 2 // 2)  # well below threshold
+    """Below auto-trigger threshold - no compaction."""
+    msgs = _build_history((_TRIGGER // 2) // 2)  # well below threshold
     provider = _MockProvider()
     summary, removes = await compact_history(msgs, provider)
     assert summary == ""
@@ -68,20 +71,21 @@ async def test_compact_history_too_few_messages_no_op():
 
 @pytest.mark.asyncio
 async def test_compact_history_at_threshold_triggers():
-    """Exactly MAX_MESSAGES messages should trigger compaction."""
-    msgs = _build_history(MAX_MESSAGES // 2)  # each turn = 2 msgs
+    """At the auto-trigger threshold, compaction fires."""
+    msgs = _build_history(_TRIGGER // 2)  # each turn = 2 msgs -> exactly _TRIGGER messages
+    assert len(msgs) >= _TRIGGER
     provider = _MockProvider()
     summary, removes = await compact_history(msgs, provider)
-    # Should attempt compaction (provider is called)
     assert len(provider.calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_compact_history_below_threshold_no_op():
-    """One message below MAX_MESSAGES - no compaction."""
-    msgs = _build_history((MAX_MESSAGES - 1) // 2)
-    if len(msgs) >= MAX_MESSAGES:
-        msgs = msgs[:MAX_MESSAGES - 1]
+    """One message below auto-trigger threshold - no compaction."""
+    n_turns = (_TRIGGER - 1) // 2
+    msgs = _build_history(n_turns)
+    if len(msgs) >= _TRIGGER:
+        msgs = msgs[:_TRIGGER - 1]
     provider = _MockProvider()
     summary, removes = await compact_history(msgs, provider)
     assert removes == []
@@ -95,7 +99,7 @@ async def test_compact_history_below_threshold_no_op():
 @pytest.mark.asyncio
 async def test_compact_history_returns_summary_string():
     """compact_history returns a non-empty summary string on success."""
-    msgs = _build_history(MAX_MESSAGES // 2)
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider()
     summary, removes = await compact_history(msgs, provider)
     assert isinstance(summary, str)
@@ -105,7 +109,7 @@ async def test_compact_history_returns_summary_string():
 @pytest.mark.asyncio
 async def test_compact_history_returns_only_remove_messages():
     """All state updates are RemoveMessage objects - no new messages inserted."""
-    msgs = _build_history(MAX_MESSAGES // 2)
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider()
     _, removes = await compact_history(msgs, provider)
     assert len(removes) > 0
@@ -116,7 +120,7 @@ async def test_compact_history_returns_only_remove_messages():
 @pytest.mark.asyncio
 async def test_compact_history_removed_ids_are_in_original():
     """Every removed ID must exist in the original history."""
-    msgs = _build_history(MAX_MESSAGES // 2)
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider()
     _, removes = await compact_history(msgs, provider)
     original_ids = {m.id for m in msgs}
@@ -130,21 +134,21 @@ async def test_compact_history_removed_ids_are_in_original():
 
 @pytest.mark.asyncio
 async def test_compact_history_removes_at_most_compression_window():
-    """No more than COMPRESSION_WINDOW messages are removed per run."""
-    msgs = _build_history(MAX_MESSAGES // 2)
+    """No more than COMPRESSION_WINDOW_SIZE messages are removed per run."""
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider()
     _, removes = await compact_history(msgs, provider)
-    assert len(removes) <= COMPRESSION_WINDOW
+    assert len(removes) <= COMPRESSION_WINDOW_SIZE
 
 
 @pytest.mark.asyncio
 async def test_compact_history_leaves_at_least_min_messages():
-    """At least MIN_MESSAGES messages must remain after compaction."""
-    msgs = _build_history(MAX_MESSAGES // 2)
+    """At least MIN_MESSAGES_AUTO messages must remain after auto-compaction."""
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider()
     _, removes = await compact_history(msgs, provider)
     remaining = len(msgs) - len(removes)
-    assert remaining >= MIN_MESSAGES
+    assert remaining >= MIN_MESSAGES_AUTO
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +165,7 @@ async def test_compact_history_ltm_store_add_called():
         def add(self, result: dict):
             self.calls.append(result)
 
-    msgs = _build_history(MAX_MESSAGES // 2)
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider()
     ltm = _MockLTM()
     await compact_history(msgs, provider, ltm_store=ltm)
@@ -200,7 +204,7 @@ async def test_compact_history_parses_json_summary():
         '"extracted_facts": [], "user_preferences": [], '
         '"world_facts": [], "tool_results": [], "open_tasks": []}'
     )
-    msgs = _build_history(MAX_MESSAGES // 2)
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider(response=json_response)
     summary, _ = await compact_history(msgs, provider)
     assert summary == "Test summary text."
@@ -216,7 +220,7 @@ async def test_compact_history_handles_json_embedded_in_prose():
         '"world_facts": [], "tool_results": [], "open_tasks": []}\n'
         'End of output.'
     )
-    msgs = _build_history(MAX_MESSAGES // 2)
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider(response=json_response)
     summary, _ = await compact_history(msgs, provider)
     assert summary == "Embedded summary."
@@ -230,7 +234,7 @@ async def test_compact_history_handles_json_embedded_in_prose():
 async def test_compact_history_with_tool_messages():
     """Tool messages in old history are included in the transcript sent for summarisation."""
     msgs = []
-    for i in range(MAX_MESSAGES // 4):
+    for i in range(_TRIGGER // 4):
         h = HumanMessage(content=f"User {i}", id=f"h{i}")
         a = AIMessage(
             content="",
@@ -256,7 +260,7 @@ async def test_compact_history_with_tool_messages():
 @pytest.mark.asyncio
 async def test_compact_history_provider_called_once():
     """Provider.achat is called exactly once per compaction run."""
-    msgs = _build_history(MAX_MESSAGES // 2)
+    msgs = _build_history(_TRIGGER // 2)
     provider = _MockProvider()
     await compact_history(msgs, provider)
     assert len(provider.calls) == 1
@@ -268,13 +272,11 @@ async def test_compact_history_provider_called_once():
 
 @pytest.mark.asyncio
 async def test_compact_history_force_bypasses_threshold():
-    """force=True compacts even when len < MAX_MESSAGES."""
-    # Build a history that is above the minimum but below MAX_MESSAGES
-    msgs = _build_history(30)  # 60 messages, well below MAX_MESSAGES=100
-    assert len(msgs) < MAX_MESSAGES
+    """force=True compacts even when len < auto-trigger threshold."""
+    msgs = _build_history(10)  # 20 messages, well below _TRIGGER
+    assert len(msgs) < _TRIGGER
     provider = _MockProvider()
     summary, removes = await compact_history(msgs, provider, force=True)
-    # Should have compacted (provider called, removes produced)
     assert len(provider.calls) == 1
     assert len(removes) > 0
 
@@ -282,12 +284,25 @@ async def test_compact_history_force_bypasses_threshold():
 @pytest.mark.asyncio
 async def test_compact_history_force_false_skips_below_threshold():
     """Without force=True, below-threshold history is not compacted."""
-    msgs = _build_history(30)
-    assert len(msgs) < MAX_MESSAGES
+    msgs = _build_history(10)
+    assert len(msgs) < _TRIGGER
     provider = _MockProvider()
     summary, removes = await compact_history(msgs, provider, force=False)
     assert removes == []
     assert provider.calls == []
+
+
+@pytest.mark.asyncio
+async def test_compact_history_force_uses_min_messages_forced():
+    """force=True uses MIN_MESSAGES_FORCED floor, allowing compaction of short sessions."""
+    # Build a session with only MIN_MESSAGES_FORCED + a few extra messages.
+    # Auto-compaction floor (MIN_MESSAGES_AUTO) would prevent compaction here.
+    msgs = _build_history((MIN_MESSAGES_FORCED + 4) // 2 + 1)
+    assert len(msgs) < MIN_MESSAGES_AUTO  # confirms this is below auto floor
+    provider = _MockProvider()
+    _, removes = await compact_history(msgs, provider, force=True)
+    remaining = len(msgs) - len(removes)
+    assert remaining >= MIN_MESSAGES_FORCED
 
 
 # ---------------------------------------------------------------------------
@@ -295,8 +310,8 @@ async def test_compact_history_force_false_skips_below_threshold():
 # ---------------------------------------------------------------------------
 
 def test_constants_sane():
-    """MAX_MESSAGES > COMPRESSION_WINDOW > MIN_MESSAGES > 0."""
-    assert MAX_MESSAGES > COMPRESSION_WINDOW
-    assert COMPRESSION_WINDOW > MIN_MESSAGES
-    assert MIN_MESSAGES > 0
-    assert MAX_MESSAGES - COMPRESSION_WINDOW >= MIN_MESSAGES
+    """Verify constant relationships: trigger > window > auto_floor >= forced_floor > 0."""
+    assert _TRIGGER == MIN_MESSAGES_AUTO + COMPRESSION_WINDOW_SIZE
+    assert COMPRESSION_WINDOW_SIZE > MIN_MESSAGES_AUTO
+    assert MIN_MESSAGES_AUTO >= MIN_MESSAGES_FORCED
+    assert MIN_MESSAGES_FORCED > 0

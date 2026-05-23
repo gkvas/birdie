@@ -41,9 +41,10 @@ from ..core.ltm import LTMStore
 log = logging.getLogger(__name__)
 
 # Compaction thresholds.
-MIN_MESSAGES = 20       # minimum messages to retain after compaction
-MAX_MESSAGES = 100      # trigger compaction when stored history reaches this
-COMPRESSION_WINDOW = 60  # maximum number of oldest messages to compress per run
+MIN_MESSAGES_AUTO = 20      # auto-compaction floor: minimum messages to retain
+MIN_MESSAGES_FORCED = 4     # /compact floor: minimum messages to retain
+COMPRESSION_WINDOW_SIZE = 60  # maximum number of oldest messages to compress per run
+# Auto-compaction triggers when len(messages) >= MIN_MESSAGES_AUTO + COMPRESSION_WINDOW_SIZE
 
 # Tool output cap: truncate ToolMessage content stored in the checkpoint to
 # this many characters.  Prevents large shell/file outputs from bloating the
@@ -155,25 +156,23 @@ async def compact_history(
     provider: LLMProvider,
     ltm_store: Optional[LTMStore] = None,
     force: bool = False,
-    min_messages: int = MIN_MESSAGES,
-    max_messages: int = MAX_MESSAGES,
-    compression_window: int = COMPRESSION_WINDOW,
+    min_messages_auto: int = MIN_MESSAGES_AUTO,
+    min_messages_forced: int = MIN_MESSAGES_FORCED,
+    compression_window_size: int = COMPRESSION_WINDOW_SIZE,
 ) -> Tuple[str, List[RemoveMessage]]:
     """Summarize the oldest conversation segment and store it in LTM.
 
-    Finds the largest HumanMessage-aligned split point within
-    ``compression_window`` messages from the start, such that at least
-    ``min_messages`` messages remain after the split.  The messages before
-    the split are summarised with a structured JSON prompt; the result is
-    stored in ``ltm_store`` (when provided) and the old messages are
-    returned as RemoveMessage deletions for the LangGraph checkpointer.
+    Auto-compaction triggers when len(messages) >= min_messages_auto + compression_window_size.
+    Forced compaction (``/compact``) runs regardless of history length and uses
+    ``min_messages_forced`` as the floor so short-but-heavy sessions can be compacted.
 
-    When ``force`` is ``True`` the ``max_messages`` threshold is bypassed so
-    compaction runs regardless of history length (used by ``/compact``).
+    Finds the largest HumanMessage-aligned split point within
+    ``compression_window_size`` messages from the start, such that at least
+    ``min_messages_auto`` (or ``min_messages_forced`` when forced) messages remain.
 
     Returns ``("", [])`` when there is nothing worth compacting.
     """
-    if not force and len(all_messages) < max_messages:
+    if not force and len(all_messages) < min_messages_auto + compression_window_size:
         return "", []
 
     human_indices = [i for i, m in enumerate(all_messages) if isinstance(m, HumanMessage)]
@@ -182,9 +181,10 @@ async def compact_history(
 
     # Find the largest HumanMessage index that:
     #   - is at least 1 (don't compress zero messages)
-    #   - keeps at least min_messages messages after the split
-    #   - does not exceed compression_window (don't over-compress)
-    max_split = min(compression_window, len(all_messages) - min_messages)
+    #   - keeps at least floor messages after the split
+    #   - does not exceed compression_window_size (don't over-compress)
+    floor = min_messages_forced if force else min_messages_auto
+    max_split = min(compression_window_size, len(all_messages) - floor)
     split_at = None
     for idx in reversed(human_indices):
         if 0 < idx <= max_split:
@@ -195,7 +195,7 @@ async def compact_history(
         return "", []
 
     old_msgs = all_messages[:split_at]
-    if len(old_msgs) < min_messages // 2:
+    if len(old_msgs) < 2:
         return "", []
 
     # Build a readable transcript of the messages to be summarised.
@@ -234,8 +234,8 @@ async def compact_history(
     ]
 
     log.info(
-        "Compaction: summarised %d messages into LTM, kept %d (threshold=%d)",
-        len(old_msgs), len(all_messages) - len(old_msgs), max_messages,
+        "Compaction: summarised %d messages into LTM, kept %d",
+        len(old_msgs), len(all_messages) - len(old_msgs),
     )
     return summary_text, remove_msgs
 
@@ -272,9 +272,9 @@ def create_agent_graph(
     mcp_manager: MCPClientManager | None = None,
     agent_registry: AgentRegistry | None = None,
     ltm_factory: Optional[Callable[[str], LTMStore]] = None,
-    min_messages: int = MIN_MESSAGES,
-    max_messages: int = MAX_MESSAGES,
-    compression_window: int = COMPRESSION_WINDOW,
+    min_messages_auto: int = MIN_MESSAGES_AUTO,
+    min_messages_forced: int = MIN_MESSAGES_FORCED,
+    compression_window_size: int = COMPRESSION_WINDOW_SIZE,
 ) -> StateGraph:
     """
     Build a LangGraph workflow that routes through the LLMProvider.
@@ -282,7 +282,7 @@ def create_agent_graph(
     On every agent-node invocation:
       1. LTM is queried with the current user message and injected into the
          system prompt (when ``ltm_factory`` is provided and a user_id is known).
-      2. The full message history is compacted when it exceeds MAX_MESSAGES.
+      2. The full message history is compacted when it exceeds the auto threshold.
       3. The full non-compacted history is sent to the LLM, starting from
          the first HumanMessage (required by some providers, e.g. Mistral).
       4. Any dangling tool calls (interrupted prior turn) are repaired.
@@ -478,14 +478,14 @@ def create_agent_graph(
                 if entries:
                     ltm_context = ltm_store.format_for_prompt(entries)
 
-        # Compact history when it has grown beyond the threshold.
+        # Compact history when it has grown beyond the auto threshold.
         compaction_removes: List[BaseMessage] = []
-        if len(all_messages) >= max_messages:
+        if len(all_messages) >= min_messages_auto + compression_window_size:
             _, compaction_removes = await compact_history(
                 all_messages, provider, ltm_store=ltm_store,
-                min_messages=min_messages,
-                max_messages=max_messages,
-                compression_window=compression_window,
+                min_messages_auto=min_messages_auto,
+                min_messages_forced=min_messages_forced,
+                compression_window_size=compression_window_size,
             )
             if compaction_removes:
                 # Remove compacted messages from the local working copy.

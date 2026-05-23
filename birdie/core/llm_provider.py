@@ -134,23 +134,23 @@ class ProviderConfig(BaseModel):
         gt=0,
         description="Maximum tokens per completion.  None means vendor default.",
     )
-    min_messages: Optional[int] = Field(
+    min_messages_auto: Optional[int] = Field(
         default=None,
         gt=0,
         description=(
-            "Minimum messages to retain in the checkpoint after compaction.  "
+            "Auto-compaction floor: minimum messages to retain after compaction.  "
             "None uses the built-in default (20)."
         ),
     )
-    max_messages: Optional[int] = Field(
+    min_messages_forced: Optional[int] = Field(
         default=None,
         gt=0,
         description=(
-            "Trigger compaction when stored history reaches this many messages.  "
-            "None uses the built-in default (100)."
+            "Forced-compaction floor (/compact): minimum messages to retain.  "
+            "None uses the built-in default (4)."
         ),
     )
-    compression_window: Optional[int] = Field(
+    compression_window_size: Optional[int] = Field(
         default=None,
         gt=0,
         description=(
