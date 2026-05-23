@@ -202,18 +202,59 @@ class DynamicAgent:
     # -- skill management ---------------------------------------------------
 
     def _load_skills(self) -> None:
-        """Discover SKILL.MD files from all skill dirs and register them."""
-        dirs = [self.skills_dir]
+        """Discover SKILL.MD files from all skill dirs and register them.
+
+        Skills are loaded in priority order (highest to lowest):
+        1. --skills-dir (CLI argument, if provided)
+        2. ~/.birdie/skills (user config directory)
+        3. Bundled skills directory
+
+        Higher priority sources override lower priority ones for skills with the same name.
+        """
+        import logging
+
+        # Determine all skill directories in priority order (highest to lowest)
+        skill_dirs = []
+
+        # 1. CLI --skills-dir (highest priority)
+        # Check if skills_dir is explicitly set (not the default "skills")
+        bundled_skills_dir = Path(__file__).parent.parent / "skills"
+        default_skills_path = str(bundled_skills_dir) if bundled_skills_dir.is_dir() else "skills"
+        
+        if self.skills_dir and self.skills_dir != default_skills_path:
+            # Only add if it's explicitly set (not the default)
+            skill_dirs.append(self.skills_dir)
+
+        # 2. User config directory
         user_skills_dir = Path.home() / ".birdie" / "skills"
         if user_skills_dir.is_dir():
-            dirs.append(str(user_skills_dir))
+            skill_dirs.append(str(user_skills_dir))
 
-        for d in dirs:
-            for skill in discover_skills_from_directory(d):
-                self.registry.register_skill(skill)
-                if skill.mcp_server is not None:
-                    self.mcp_manager.register_server(skill.name, skill.mcp_server)
+        # 3. Bundled skills (lowest priority)
+        if bundled_skills_dir.is_dir():
+            skill_dirs.append(str(bundled_skills_dir))
+
+        # Load skills in priority order (highest to lowest)
+        # Higher priority sources override lower priority ones
+        loaded_skills = set()
+
+        for skill_dir in skill_dirs:  # Process in NORMAL order
+            try:
+                for skill in discover_skills_from_directory(skill_dir):
+                    # Only register if not already loaded by higher priority source
+                    if skill.name not in loaded_skills:
+                        self.registry.register_skill(skill)
+                        if skill.mcp_server is not None:
+                            self.mcp_manager.register_server(skill.name, skill.mcp_server)
+                        loaded_skills.add(skill.name)
+            except Exception as e:
+                # Log error but continue with other directories
+                logging.warning(f"Failed to load skills from {skill_dir}: {str(e)}")
+
         self.policy.set_default_skills(self.registry.list_skills())
+
+
+
 
     def _load_agents(self) -> None:
         """Discover AGENT.MD files from all agent dirs and register them."""
