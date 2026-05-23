@@ -37,6 +37,7 @@ from prompt_toolkit.styles import Style
 
 from rich.console import Console
 
+from .agent.graph import MAX_TOOL_OUTPUT_CAP
 from .agent.run import DynamicAgent
 from .core.errors import BirdieRateLimitError
 from .core.models import Skill
@@ -64,6 +65,8 @@ HELP_TEXT = """
   [yellow]/tool output full[/yellow]             Show complete tool output
   [yellow]/tool output short[/yellow]            Show first 1000 characters + remaining count (default)
   [yellow]/tool output off[/yellow]              Show only line count, no content
+  [yellow]/tool cap <N>[/yellow]                 Cap tool output stored in history at N characters
+  [yellow]/tool cap off[/yellow]                 Remove the cap (store full tool output)
 
   [bold]Skill commands[/bold]
   [yellow]/skill list[/yellow]                   List all loaded skills with status
@@ -119,6 +122,7 @@ class BirdieCLI:
         self._last_context: int = 0
         self._tool_output_mode: str = "short"
         self._agent_output_mode: str = "off"
+        self._tool_output_cap: int = agent._tool_output_cap
         self._llm_log_handler: Optional[logging.FileHandler] = None
         self._orig_async_send = None
         self._orig_sync_send = None
@@ -496,9 +500,23 @@ class BirdieCLI:
                 self._tool_output_mode = subarg
                 self.console.print(f"[dim]Tool output mode: [bold]{subarg}[/bold][/dim]")
 
+        elif subcmd == "cap":
+            if not subarg:
+                cap_display = f"{self._tool_output_cap:,}" if self._tool_output_cap else "off"
+                self.console.print(f"[dim]Tool output cap: [bold]{cap_display}[/bold] characters[/dim]")
+            elif subarg == "off":
+                self._tool_output_cap = 0
+                self.console.print("[dim]Tool output cap: [bold]off[/bold][/dim]")
+            else:
+                try:
+                    self._tool_output_cap = int(subarg)
+                    self.console.print(f"[dim]Tool output cap: [bold]{self._tool_output_cap:,}[/bold] characters[/dim]")
+                except ValueError:
+                    self.console.print("[red]Usage: /tool cap <N> | off[/red]")
+
         else:
             self.console.print(
-                "[red]Usage: /tool list | output full|short|off[/red]"
+                "[red]Usage: /tool list | output full|short|off | cap <N>|off[/red]"
             )
 
     def _resolve_skill_name(self, name: str) -> Optional[str]:
@@ -820,6 +838,7 @@ class BirdieCLI:
                 thread_id=self.session.id,
                 user_id=self.user_id,
                 long_term_memory=ltm if ltm else None,
+                config={"configurable": {"tool_output_cap": self._tool_output_cap}},
             ):
                 for node_name, node_output in update.items():
                     msgs = node_output.get("messages", [])

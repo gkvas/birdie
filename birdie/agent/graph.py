@@ -45,6 +45,11 @@ MIN_MESSAGES = 20       # minimum messages to retain after compaction
 MAX_MESSAGES = 100      # trigger compaction when stored history reaches this
 COMPRESSION_WINDOW = 60  # maximum number of oldest messages to compress per run
 
+# Tool output cap: truncate ToolMessage content stored in the checkpoint to
+# this many characters.  Prevents large shell/file outputs from bloating the
+# context sent to the LLM on every subsequent turn.
+MAX_TOOL_OUTPUT_CAP = 20_000
+
 _MAX_RETRIES = 3          # maximum retry attempts on transient provider errors
 _RETRY_BASE_DELAY = 5.0   # base seconds for exponential backoff when no Retry-After header
 
@@ -574,9 +579,11 @@ def create_agent_graph(
         langchain_tools = (
             [skilltool_to_langchain_tool(t) for t in skill_tools] + mcp_tools + agent_tools
         )
+        cap = config.get("configurable", {}).get("tool_output_cap", MAX_TOOL_OUTPUT_CAP)
+
         tool_node = ToolNode(langchain_tools)
         try:
-            return await tool_node.ainvoke(state, config)
+            result = await tool_node.ainvoke(state, config)
         except Exception as exc:
             last = state["messages"][-1]
             return {"messages": [
@@ -587,6 +594,18 @@ def create_agent_graph(
                 )
                 for tc in getattr(last, "tool_calls", [])
             ]}
+
+        if cap:
+            result = {"messages": [
+                ToolMessage(
+                    content=msg.content[:cap] + f"\n[truncated: {len(msg.content) - cap} more characters]",
+                    tool_call_id=msg.tool_call_id,
+                    name=msg.name,
+                ) if isinstance(msg, ToolMessage) and isinstance(msg.content, str) and len(msg.content) > cap
+                else msg
+                for msg in result.get("messages", [])
+            ]}
+        return result
 
     def should_continue(state: AgentState) -> str:
         last = state["messages"][-1]
