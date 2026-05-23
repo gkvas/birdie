@@ -30,7 +30,7 @@ from ..core.llm_provider import (
 from ..core.ltm import LTMStore
 from .graph import (
     create_agent_graph, compact_history, AgentState,
-    MIN_MESSAGES, MAX_MESSAGES, COMPRESSION_WINDOW,
+    MIN_MESSAGES, MAX_MESSAGES, COMPRESSION_WINDOW, MAX_TOOL_OUTPUT_CAP,
 )
 
 
@@ -82,6 +82,7 @@ class DynamicAgent:
         min_messages: int = MIN_MESSAGES,
         max_messages: int = MAX_MESSAGES,
         compression_window: int = COMPRESSION_WINDOW,
+        tool_output_cap: int = MAX_TOOL_OUTPUT_CAP,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
         if isinstance(llm_or_provider, LLMProvider):
@@ -93,6 +94,7 @@ class DynamicAgent:
         self._min_messages = min_messages
         self._max_messages = max_messages
         self._compression_window = compression_window
+        self._tool_output_cap = tool_output_cap
 
         self.skills_dir = skills_dir
         self.agents_dir = agents_dir
@@ -176,10 +178,11 @@ class DynamicAgent:
 
         # Extract compaction thresholds from config before creating the provider.
         # These are agent-level settings and must not be forwarded to vendor SDKs.
-        _AGENT_FIELDS = {"min_messages", "max_messages", "compression_window"}
+        _AGENT_FIELDS = {"min_messages", "max_messages", "compression_window", "tool_output_cap"}
         min_messages = int(config_dict.get("min_messages") or MIN_MESSAGES)
         max_messages = int(config_dict.get("max_messages") or MAX_MESSAGES)
         compression_window = int(config_dict.get("compression_window") or COMPRESSION_WINDOW)
+        tool_output_cap = int(config_dict.get("tool_output_cap") or MAX_TOOL_OUTPUT_CAP)
         provider_config_clean = {k: v for k, v in config_dict.items() if k not in _AGENT_FIELDS}
 
         provider = get_llm_provider(provider_config_clean)
@@ -190,7 +193,8 @@ class DynamicAgent:
                    agent_console=agent_console, checkpointer=checkpointer,
                    provider_config=config_dict, ltm_store_factory=ltm_store_factory,
                    min_messages=min_messages, max_messages=max_messages,
-                   compression_window=compression_window)
+                   compression_window=compression_window,
+                   tool_output_cap=tool_output_cap)
 
     # -- skill management ---------------------------------------------------
 
@@ -326,6 +330,7 @@ class DynamicAgent:
         run_config: Dict[str, Any] = {"configurable": {
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
+            "tool_output_cap": self._tool_output_cap,
         }}
         if user_id:
             run_config["configurable"]["user_id"] = user_id
@@ -365,6 +370,7 @@ class DynamicAgent:
         run_config: Dict[str, Any] = {"configurable": {
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
+            "tool_output_cap": self._tool_output_cap,
         }}
         if user_id:
             run_config["configurable"]["user_id"] = user_id
