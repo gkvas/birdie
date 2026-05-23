@@ -398,49 +398,66 @@ def create_agent_graph(
     def _repair_dangling_tool_calls(
         messages: List[BaseMessage],
     ) -> Tuple[List[ToolMessage], List[BaseMessage]]:
+        """Fix tool_use blocks that are not immediately followed by their tool_result.
+
+        Two failure modes are handled:
+        - Missing tool_result: interrupted before execution; a synthetic result is
+          injected so the provider accepts the history.
+        - Misplaced tool_result: the ToolMessage exists in the checkpoint but was
+          appended out of order (e.g. after a HumanMessage) from a prior repair
+          pass.  It is moved to immediately follow its AIMessage.
+
+        Repair messages are NOT written back to the checkpoint (returning them
+        would cause LangGraph to append them at the tail, mis-ordering them again
+        on the very next turn).  The repair is re-derived cheaply on every turn
+        until the conversation naturally moves past the broken segment.
         """
-        Scan for AIMessages whose tool_calls have no matching ToolMessage and
-        inject placeholder ToolMessages for each orphan.
+        # Quick pass: is everything already in the correct order?
+        def _needs_repair() -> bool:
+            for i, msg in enumerate(messages):
+                for j, tc in enumerate(getattr(msg, "tool_calls", []) if isinstance(msg, AIMessage) else []):
+                    expected = i + 1 + j
+                    if expected >= len(messages):
+                        return True
+                    nxt = messages[expected]
+                    if not isinstance(nxt, ToolMessage) or nxt.tool_call_id != tc["id"]:
+                        return True
+            return False
 
-        This handles the case where the process was interrupted between the LLM
-        response (checkpointed) and the tool execution, leaving the checkpoint
-        in a state that most providers reject as a protocol violation.
-
-        Returns (repair_msgs, patched_messages).  ``repair_msgs`` is included
-        in the node's return value so it is written back to the checkpoint,
-        healing the state permanently.
-        """
-        tool_call_ids_answered: set[str] = set()
-        for msg in messages:
-            if isinstance(msg, ToolMessage):
-                tool_call_ids_answered.add(msg.tool_call_id)
-
-        repair_msgs: List[ToolMessage] = []
-        for msg in messages:
-            if not isinstance(msg, AIMessage):
-                continue
-            for tc in getattr(msg, "tool_calls", []):
-                if tc["id"] not in tool_call_ids_answered:
-                    repair_msgs.append(ToolMessage(
-                        content="Tool execution was interrupted before a result was produced.",
-                        tool_call_id=tc["id"],
-                        name=tc["name"],
-                    ))
-
-        if not repair_msgs:
+        if not _needs_repair():
             return [], messages
 
-        # Insert repairs immediately after their originating AIMessage
+        # Build a lookup of existing ToolMessages by tool_call_id.
+        tm_by_id: dict[str, ToolMessage] = {
+            msg.tool_call_id: msg
+            for msg in messages
+            if isinstance(msg, ToolMessage)
+        }
+
+        placed: set[str] = set()  # tool_call_ids already emitted at correct position
         patched: List[BaseMessage] = []
-        repair_by_call_id = {m.tool_call_id: m for m in repair_msgs}
+
         for msg in messages:
+            # Skip ToolMessages already re-emitted at their correct position.
+            if isinstance(msg, ToolMessage) and msg.tool_call_id in placed:
+                continue
+
             patched.append(msg)
+
             if isinstance(msg, AIMessage):
                 for tc in getattr(msg, "tool_calls", []):
-                    if tc["id"] in repair_by_call_id:
-                        patched.append(repair_by_call_id[tc["id"]])
+                    tc_id = tc["id"]
+                    placed.add(tc_id)
+                    if tc_id in tm_by_id:
+                        patched.append(tm_by_id[tc_id])
+                    else:
+                        patched.append(ToolMessage(
+                            content="Tool execution was interrupted before a result was produced.",
+                            tool_call_id=tc_id,
+                            name=tc["name"],
+                        ))
 
-        return repair_msgs, patched
+        return [], patched
 
     async def call_model(state: AgentState, config: RunnableConfig) -> dict:
         all_messages = list(state["messages"])
