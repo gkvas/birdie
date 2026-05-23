@@ -1357,8 +1357,9 @@ class ACPProvider(LLMProvider):
 
             # Phase 2: session/new
             session_params: dict = {"cwd": self._cwd, "mcpServers": mcp_servers}
-            if mcp_servers:
-                session_params["_meta"] = {"disableBuiltInTools": True}
+            if mcp_mode:
+                allowed_tools = [f"mcp__birdie__{t['name']}" for t in (tools or []) if "entrypoint" in t]
+                session_params["_meta"] = {"claudeCode": {"options": {"tools": allowed_tools}}}
             self._sync_send(proc.stdin, {
                 "jsonrpc": "2.0", "id": 1, "method": "session/new",
                 "params": session_params,
@@ -1468,7 +1469,7 @@ class ACPProvider(LLMProvider):
                                            "error": {"code": -32601, "message": f"Method not found: {method}"}})
 
     async def _async_initialize_session(
-        self, proc: Any, mcp_servers: list[dict] | None = None
+        self, proc: Any, mcp_servers: list[dict] | None = None, allowed_tools: list[str] | None = None
     ) -> str:
         """Run Phase 1 + Phase 2; return the sessionId."""
         await self._async_send(proc.stdin, {
@@ -1482,8 +1483,8 @@ class ACPProvider(LLMProvider):
         await self._async_recv(proc.stdout, timeout=30)
 
         session_params: dict = {"cwd": self._cwd, "mcpServers": mcp_servers or []}
-        if mcp_servers:
-            session_params["_meta"] = {"disableBuiltInTools": True}
+        if allowed_tools is not None:
+            session_params["_meta"] = {"claudeCode": {"options": {"tools": allowed_tools}}}
         await self._async_send(proc.stdin, {
             "jsonrpc": "2.0", "id": 1, "method": "session/new",
             "params": session_params,
@@ -1501,6 +1502,7 @@ class ACPProvider(LLMProvider):
         mcp_entry = self._mcp_server_entry(tools or [])
         mcp_mode = mcp_entry is not None
         mcp_servers = [mcp_entry] if mcp_entry else []
+        allowed_tools = [f"mcp__birdie__{t['name']}" for t in (tools or []) if "entrypoint" in t] if mcp_mode else None
 
         proc = await asyncio.create_subprocess_exec(
             *self._command,
@@ -1509,7 +1511,7 @@ class ACPProvider(LLMProvider):
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers)
+            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers, allowed_tools=allowed_tools)
 
             prompt_text = self._build_conversation_prompt(messages, system_prompt)
             log.debug("REQUEST  acp=%s\n  prompt: %s", self._command[0], prompt_text[:2000])
@@ -1548,6 +1550,7 @@ class ACPProvider(LLMProvider):
         mcp_entry = self._mcp_server_entry(tools or [])
         mcp_mode = mcp_entry is not None
         mcp_servers = [mcp_entry] if mcp_entry else []
+        allowed_tools = [f"mcp__birdie__{t['name']}" for t in (tools or []) if "entrypoint" in t] if mcp_mode else None
 
         proc = await asyncio.create_subprocess_exec(
             *self._command,
@@ -1556,7 +1559,7 @@ class ACPProvider(LLMProvider):
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers)
+            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers, allowed_tools=allowed_tools)
 
             await self._async_send(proc.stdin, {
                 "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
