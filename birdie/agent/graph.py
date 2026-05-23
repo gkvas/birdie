@@ -33,7 +33,7 @@ from ..core.errors import BirdieRateLimitError
 from ..core.registry import SkillRegistry
 from ..core.adapter import skilltool_to_langchain_tool
 from ..core.policy import SkillPolicy
-from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def, lc_tool_to_normalized_def
+from ..core.llm_provider import LLMProvider, skilltool_to_normalized_def, lc_tool_to_normalized_def, agentdef_to_normalized_def, ACPProvider
 from ..core.mcp_client import MCPClientManager
 from ..core.agent_registry import AgentRegistry
 from ..core.ltm import LTMStore
@@ -297,6 +297,9 @@ def create_agent_graph(
     min_messages_auto: int = MIN_MESSAGES_AUTO,
     min_messages_forced: int = MIN_MESSAGES_FORCED,
     compression_window_size: int = COMPRESSION_WINDOW_SIZE,
+    skills_dir: str = "skills",
+    agents_dir: Optional[str] = None,
+    provider_config: Optional[dict] = None,
 ) -> StateGraph:
     """
     Build a LangGraph workflow that routes through the LLMProvider.
@@ -536,10 +539,35 @@ def create_agent_graph(
         agent_tools = agent_registry.get_tools(_get_allowed_agents(config)) if agent_registry else []
 
         if provider.supports_tools() and (skill_tools or mcp_tools or agent_tools):
-            normalized_tools = (
-                [skilltool_to_normalized_def(t) for t in skill_tools]
-                + [lc_tool_to_normalized_def(t) for t in mcp_tools + agent_tools]
-            )
+            if isinstance(provider, ACPProvider):
+                # For ACPProvider, agent tools are bridged via the MCP server
+                # subprocess (BIRDIE_AGENTS_JSON) rather than as LangChain
+                # StructuredTools.  Build their NormalizedToolDef with the
+                # full execution context so acp_mcp_server can reconstruct them.
+                allowed_agent_tools = (
+                    agent_registry.get_tools(_get_allowed_agents(config))
+                    if agent_registry else []
+                )
+                agent_normalized = [
+                    agentdef_to_normalized_def(
+                        agent_registry.get_agent(t.name),
+                        provider_config=provider_config,
+                        skills_dir=skills_dir,
+                        agents_dir=agents_dir,
+                    )
+                    for t in allowed_agent_tools
+                    if agent_registry and agent_registry.get_agent(t.name) is not None
+                ]
+                normalized_tools = (
+                    [skilltool_to_normalized_def(t) for t in skill_tools]
+                    + [lc_tool_to_normalized_def(t) for t in mcp_tools]
+                    + agent_normalized
+                )
+            else:
+                normalized_tools = (
+                    [skilltool_to_normalized_def(t) for t in skill_tools]
+                    + [lc_tool_to_normalized_def(t) for t in mcp_tools + agent_tools]
+                )
         else:
             normalized_tools = None
 
