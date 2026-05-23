@@ -30,7 +30,7 @@ from ..core.llm_provider import (
 from ..core.ltm import LTMStore
 from .graph import (
     create_agent_graph, compact_history, AgentState,
-    MIN_MESSAGES, MAX_MESSAGES, COMPRESSION_WINDOW, MAX_TOOL_OUTPUT_CAP,
+    MIN_MESSAGES_AUTO, MIN_MESSAGES_FORCED, COMPRESSION_WINDOW_SIZE, MAX_TOOL_OUTPUT_CAP,
 )
 
 
@@ -79,9 +79,9 @@ class DynamicAgent:
         checkpointer=None,
         provider_config: Optional[Dict[str, Any]] = None,
         ltm_store_factory=None,
-        min_messages: int = MIN_MESSAGES,
-        max_messages: int = MAX_MESSAGES,
-        compression_window: int = COMPRESSION_WINDOW,
+        min_messages_auto: int = MIN_MESSAGES_AUTO,
+        min_messages_forced: int = MIN_MESSAGES_FORCED,
+        compression_window_size: int = COMPRESSION_WINDOW_SIZE,
         tool_output_cap: int = MAX_TOOL_OUTPUT_CAP,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
@@ -91,9 +91,9 @@ class DynamicAgent:
             self.provider = LangChainProvider(llm_or_provider)
         self._provider_config = provider_config
         self._ltm_store_factory = ltm_store_factory
-        self._min_messages = min_messages
-        self._max_messages = max_messages
-        self._compression_window = compression_window
+        self._min_messages_auto = min_messages_auto
+        self._min_messages_forced = min_messages_forced
+        self._compression_window_size = compression_window_size
         self._tool_output_cap = tool_output_cap
 
         self.skills_dir = skills_dir
@@ -112,9 +112,9 @@ class DynamicAgent:
             self.provider, self.registry, self.policy, self.mcp_manager,
             self.agent_registry,
             ltm_factory=self._ltm_store_factory,
-            min_messages=self._min_messages,
-            max_messages=self._max_messages,
-            compression_window=self._compression_window,
+            min_messages_auto=self._min_messages_auto,
+            min_messages_forced=self._min_messages_forced,
+            compression_window_size=self._compression_window_size,
         )
         self.app = graph.compile(checkpointer=checkpointer or MemorySaver())
 
@@ -178,10 +178,10 @@ class DynamicAgent:
 
         # Extract compaction thresholds from config before creating the provider.
         # These are agent-level settings and must not be forwarded to vendor SDKs.
-        _AGENT_FIELDS = {"min_messages", "max_messages", "compression_window", "tool_output_cap"}
-        min_messages = int(config_dict.get("min_messages") or MIN_MESSAGES)
-        max_messages = int(config_dict.get("max_messages") or MAX_MESSAGES)
-        compression_window = int(config_dict.get("compression_window") or COMPRESSION_WINDOW)
+        _AGENT_FIELDS = {"min_messages_auto", "min_messages_forced", "compression_window_size", "tool_output_cap"}
+        min_messages_auto = int(config_dict.get("min_messages_auto") or MIN_MESSAGES_AUTO)
+        min_messages_forced = int(config_dict.get("min_messages_forced") or MIN_MESSAGES_FORCED)
+        compression_window_size = int(config_dict.get("compression_window_size") or COMPRESSION_WINDOW_SIZE)
         tool_output_cap = int(config_dict.get("tool_output_cap") or MAX_TOOL_OUTPUT_CAP)
         provider_config_clean = {k: v for k, v in config_dict.items() if k not in _AGENT_FIELDS}
 
@@ -192,8 +192,8 @@ class DynamicAgent:
         return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir,
                    agent_console=agent_console, checkpointer=checkpointer,
                    provider_config=config_dict, ltm_store_factory=ltm_store_factory,
-                   min_messages=min_messages, max_messages=max_messages,
-                   compression_window=compression_window,
+                   min_messages_auto=min_messages_auto, min_messages_forced=min_messages_forced,
+                   compression_window_size=compression_window_size,
                    tool_output_cap=tool_output_cap)
 
     # -- skill management ---------------------------------------------------
@@ -407,9 +407,9 @@ class DynamicAgent:
 
         summary, removes = await compact_history(
             all_messages, self.provider, ltm_store=ltm_store, force=True,
-            min_messages=self._min_messages,
-            max_messages=self._max_messages,
-            compression_window=self._compression_window,
+            min_messages_auto=self._min_messages_auto,
+            min_messages_forced=self._min_messages_forced,
+            compression_window_size=self._compression_window_size,
         )
 
         if removes:
