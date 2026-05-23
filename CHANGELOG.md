@@ -1,3 +1,13 @@
+## [0.3.0] - 2026-05-23
+
+### Added
+- Updated version to 0.3.0
+
+### Changed
+- Version bump to 0.3.0
+
+### Fixed
+- No fixes in this release
 # Changelog
 
 All notable changes to this project are documented here.
