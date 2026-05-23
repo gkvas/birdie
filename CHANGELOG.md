@@ -1,3 +1,18 @@
+## [0.3.0] - 2026-05-23
+
+### Added
+- Skill directory loading is now additive: skills from `--skills-dir`, `~/.birdie/skills`, and bundled skills are all loaded, with higher priority sources overriding lower priority ones for skills with the same name.
+- Weather skill now reads the API key from the `WEATHERAPI_KEY` environment variable, eliminating the need to pass it in the conversation.
+- ACP provider now exposes enabled Birdie agents to the ACP agent via a stdio MCP server, allowing the ACP agent to use Birdie's agent tools.
+
+### Changed
+- Weather skill entrypoints switched from `http:get` to `python:` to securely inject the API key server-side.
+- Tool descriptions in skill SKILL.MD files updated to include actionable guidance previously buried in the Markdown body.
+
+### Fixed
+- Skill directory loading now respects priority order: `--skills-dir` (highest), `~/.birdie/skills` (medium), bundled skills (lowest).
+- Weather API queries now use the correct parameter `q` instead of `city`.
+- ACP provider correctly forwards agent tools alongside skill tools to the MCP server.
 # Changelog
 
 All notable changes to this project are documented here.
