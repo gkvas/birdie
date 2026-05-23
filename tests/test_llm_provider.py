@@ -571,8 +571,7 @@ class TestACPProvider:
         servers = session_new["params"]["mcpServers"]
         assert len(servers) == 1
         assert servers[0]["name"] == "birdie"
-        allowed = session_new["params"]["_meta"]["claudeCode"]["options"]["tools"]
-        assert allowed == ["mcp__birdie__run_bash"]
+        assert session_new["params"]["_meta"]["disableBuiltInTools"] is True
 
     def test_chat_without_tools_sends_empty_mcp_servers(self):
         from birdie.core.llm_provider import ACPProvider
