@@ -38,6 +38,7 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 
 from .agent.run import DynamicAgent
+from .core.errors import BirdieRateLimitError
 from .core.models import Skill
 from .core.session import Session, SessionManager, UserMemory
 
@@ -919,6 +920,10 @@ class BirdieCLI:
                 await task
             except asyncio.CancelledError:
                 self.console.print("\n[dim]Interrupted.[/dim]")
+            except BirdieRateLimitError:
+                self.console.print(
+                    "[yellow]Rate limit reached - please wait a moment and try again.[/yellow]"
+                )
             except Exception as exc:
                 self.console.print(
                     f"[red bold]Error:[/red bold] {type(exc).__name__}: {exc}"

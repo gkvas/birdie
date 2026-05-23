@@ -29,6 +29,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 
+from ..core.errors import BirdieRateLimitError
 from ..core.registry import SkillRegistry
 from ..core.adapter import skilltool_to_langchain_tool
 from ..core.policy import SkillPolicy
@@ -44,8 +45,41 @@ MIN_MESSAGES = 20       # minimum messages to retain after compaction
 MAX_MESSAGES = 100      # trigger compaction when stored history reaches this
 COMPRESSION_WINDOW = 60  # maximum number of oldest messages to compress per run
 
-# Delays (seconds) between successive retries when the provider returns 429.
-_RATE_LIMIT_RETRY_DELAYS = (5, 15, 45)
+_MAX_RETRIES = 3          # maximum retry attempts on transient provider errors
+_RETRY_BASE_DELAY = 5.0   # base seconds for exponential backoff when no Retry-After header
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    """Return True if *exc* is a transient provider error (HTTP 429/529)."""
+    status = getattr(exc, 'status_code', None)
+    if status in (429, 529):
+        return True
+    name = type(exc).__name__
+    if any(k in name for k in ("RateLimit", "Overloaded", "TooManyRequests")):
+        return True
+    msg = str(exc)
+    return "429" in msg or "529" in msg or "rate_limit" in msg.lower()
+
+
+def _get_retry_after(exc: Exception) -> float | None:
+    """Read the Retry-After wait time (seconds) from the provider error, if present."""
+    response = getattr(exc, 'response', None)
+    if response is None:
+        return None
+    headers = getattr(response, 'headers', {})
+    ms = headers.get('retry-after-ms')
+    if ms:
+        try:
+            return max(1.0, float(ms) / 1000)
+        except (ValueError, TypeError):
+            pass
+    after = headers.get('retry-after')
+    if after:
+        try:
+            return max(1.0, float(after))
+        except (ValueError, TypeError):
+            pass
+    return None
 
 _COMPACTION_PROMPT = """\
 You are a memory compaction system. Analyse the following conversation \
@@ -467,16 +501,9 @@ def create_agent_graph(
 
         system_prompt = _build_system_prompt(state, config, ltm_context=ltm_context)
 
-        # Retry on HTTP 429 (rate limit) with exponential back-off.
+        # Retry on transient provider errors (429/529) with Retry-After-aware back-off.
         response: BaseMessage | None = None
-        for attempt in range(len(_RATE_LIMIT_RETRY_DELAYS) + 1):
-            if attempt > 0:
-                delay = _RATE_LIMIT_RETRY_DELAYS[attempt - 1]
-                log.warning(
-                    "Provider rate-limited (429); retrying in %ds (attempt %d/%d)",
-                    delay, attempt + 1, len(_RATE_LIMIT_RETRY_DELAYS) + 1,
-                )
-                await asyncio.sleep(delay)
+        for attempt in range(_MAX_RETRIES + 1):
             try:
                 response = await provider.achat(
                     messages=clean_messages,
@@ -485,9 +512,19 @@ def create_agent_graph(
                 )
                 break
             except Exception as exc:
-                if "429" in str(exc) and attempt < len(_RATE_LIMIT_RETRY_DELAYS):
-                    continue
-                raise
+                if not _is_retryable_error(exc):
+                    raise
+                delay = _get_retry_after(exc) or (_RETRY_BASE_DELAY * (2 ** attempt))
+                if attempt >= _MAX_RETRIES:
+                    raise BirdieRateLimitError(
+                        f"Provider rate limit hit; retries exhausted after {_MAX_RETRIES} attempts.",
+                        retry_after=delay,
+                    ) from exc
+                log.warning(
+                    "Provider rate-limited; retrying in %.1fs (attempt %d/%d)",
+                    delay, attempt + 1, _MAX_RETRIES,
+                )
+                await asyncio.sleep(delay)
 
         return {"messages": compaction_removes + repair_msgs + [response]}
 
