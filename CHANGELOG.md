@@ -19,6 +19,10 @@ All notable changes to this project are documented here.
   format `{"outcome": {"outcome": "selected", "optionId": "allow"}}`;
   the previous flat `{"optionId": "allow"}` caused every MCP tool call to
   be silently denied.
+- Claude Code built-in tools (Read, Bash, Write, etc.) are now suppressed
+  when MCP mode is active by setting `disableBuiltInTools: true` in
+  `session/new`; previously the model could use all built-in tools
+  regardless of which Birdie skills were enabled.
 - ACP provider sends the full conversation history on every turn instead
   of only the last user message, giving the model the same context as
   native providers.
