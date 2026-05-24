@@ -1,3 +1,11 @@
+## [0.3.1] - 2026-05-24
+
+### Changed
+- Skills and agents no longer declare `enabled_by_default` in their SKILL.MD/AGENT.MD frontmatter. Deployers now pass explicit `skills_enabled` and `agents_enabled` lists to `DynamicAgent` (or via `ProviderConfig` JSON) to control which capabilities are active by default.
+
+### Fixed
+- Async ACP stdout reader mock updated to use `read()` instead of `readline()`, matching the chunked-read implementation introduced in 0.3.0.
+
 ## [0.3.0] - 2026-05-23
 
 ### Added
