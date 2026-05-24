@@ -160,6 +160,28 @@ class ProviderConfig(BaseModel):
             "None uses the built-in default (60)."
         ),
     )
+    tool_output_cap: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Maximum characters of tool output stored in history per tool call.  "
+            "None means no cap (store full output)."
+        ),
+    )
+    skills_enabled: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Skills enabled by default for every session.  "
+            "Corresponds to skill names declared in SKILL.MD frontmatter."
+        ),
+    )
+    agents_enabled: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Agents enabled by default for every session.  "
+            "Corresponds to agent names declared in AGENT.MD frontmatter."
+        ),
+    )
 
     @classmethod
     def from_json(cls, json_str: str) -> "ProviderConfig":

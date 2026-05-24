@@ -7,11 +7,10 @@ from birdie.core.agent_registry import AgentRegistry
 from birdie.core.models import AgentDef
 
 
-def _make_def(name: str, enabled_by_default: bool = False) -> AgentDef:
+def _make_def(name: str) -> AgentDef:
     return AgentDef(
         name=name,
         description=f"Agent {name}",
-        enabled_by_default=enabled_by_default,
         prompt="do something",
     )
 
@@ -23,15 +22,24 @@ def _make_tool(name: str):
 
 
 class TestAgentRegistryDefaults:
-    def test_register_not_default(self):
+    def test_register_not_default_without_set_default_agents(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=False), _make_tool("A"))
+        reg.register(_make_def("A"), _make_tool("A"))
         assert "A" not in reg.get_allowed_agents()
 
-    def test_register_default(self):
+    def test_set_default_agents_enables_agent(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
+        reg.register(_make_def("A"), _make_tool("A"))
+        reg.set_default_agents(["A"])
         assert "A" in reg.get_allowed_agents()
+
+    def test_set_default_agents_does_not_enable_unlisted(self):
+        reg = AgentRegistry()
+        reg.register(_make_def("A"), _make_tool("A"))
+        reg.register(_make_def("B"), _make_tool("B"))
+        reg.set_default_agents(["A"])
+        assert "A" in reg.get_allowed_agents()
+        assert "B" not in reg.get_allowed_agents()
 
     def test_list_agents(self):
         reg = AgentRegistry()
@@ -50,34 +58,37 @@ class TestAgentRegistryDefaults:
 class TestAgentRegistrySessionPolicy:
     def test_session_seeds_from_defaults(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
-        reg.register(_make_def("B", enabled_by_default=False), _make_tool("B"))
+        reg.register(_make_def("A"), _make_tool("A"))
+        reg.register(_make_def("B"), _make_tool("B"))
+        reg.set_default_agents(["A"])
         allowed = reg.get_allowed_agents("session1")
         assert "A" in allowed
         assert "B" not in allowed
 
     def test_enable_agent_for_session(self):
         reg = AgentRegistry()
-        reg.register(_make_def("B", enabled_by_default=False), _make_tool("B"))
+        reg.register(_make_def("B"), _make_tool("B"))
         reg.enable_agent("s1", "B")
         assert "B" in reg.get_allowed_agents("s1")
 
     def test_disable_agent_for_session(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
+        reg.register(_make_def("A"), _make_tool("A"))
+        reg.set_default_agents(["A"])
         reg.disable_agent("s1", "A")
         assert "A" not in reg.get_allowed_agents("s1")
 
     def test_sessions_are_isolated(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=False), _make_tool("A"))
+        reg.register(_make_def("A"), _make_tool("A"))
         reg.enable_agent("s1", "A")
         assert "A" in reg.get_allowed_agents("s1")
         assert "A" not in reg.get_allowed_agents("s2")
 
     def test_no_session_returns_defaults(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
+        reg.register(_make_def("A"), _make_tool("A"))
+        reg.set_default_agents(["A"])
         assert "A" in reg.get_allowed_agents(None)
         assert "A" in reg.get_allowed_agents("")
 
@@ -92,15 +103,17 @@ class TestAgentRegistrySessionPolicy:
 
     def test_enable_agents_for_session_replaces_set(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
-        reg.register(_make_def("B", enabled_by_default=False), _make_tool("B"))
+        reg.register(_make_def("A"), _make_tool("A"))
+        reg.register(_make_def("B"), _make_tool("B"))
+        reg.set_default_agents(["A"])
         reg.enable_agents_for_session("s1", ["B"])
         assert "B" in reg.get_allowed_agents("s1")
         assert "A" not in reg.get_allowed_agents("s1")
 
     def test_enable_agents_for_session_isolates_sessions(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
+        reg.register(_make_def("A"), _make_tool("A"))
+        reg.set_default_agents(["A"])
         reg.enable_agents_for_session("s1", [])
         assert "A" not in reg.get_allowed_agents("s1")
         assert "A" in reg.get_allowed_agents("s2")
@@ -110,8 +123,9 @@ class TestAgentRegistryGetTools:
     def test_returns_tools_for_allowed(self):
         reg = AgentRegistry()
         tool_a = _make_tool("A")
-        reg.register(_make_def("A", enabled_by_default=True), tool_a)
-        reg.register(_make_def("B", enabled_by_default=False), _make_tool("B"))
+        reg.register(_make_def("A"), tool_a)
+        reg.register(_make_def("B"), _make_tool("B"))
+        reg.set_default_agents(["A"])
 
         tools = reg.get_tools(reg.get_allowed_agents())
         assert tool_a in tools
@@ -119,7 +133,7 @@ class TestAgentRegistryGetTools:
 
     def test_empty_allowed_returns_empty(self):
         reg = AgentRegistry()
-        reg.register(_make_def("A", enabled_by_default=True), _make_tool("A"))
+        reg.register(_make_def("A"), _make_tool("A"))
         assert reg.get_tools(set()) == []
 
     def test_unknown_name_in_allowed_skipped(self):

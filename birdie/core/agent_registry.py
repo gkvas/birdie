@@ -32,8 +32,13 @@ class AgentRegistry:
         """Register an agent and its pre-built async tool."""
         self._agents[agent_def.name] = agent_def
         self._tools[agent_def.name] = tool
-        if agent_def.enabled_by_default:
-            self._default_agents.add(agent_def.name)
+
+    def set_default_agents(self, agent_names: List[str]) -> None:
+        """Seed the default set from an explicit list of agent names.
+
+        Safe to call again to reset defaults (e.g. after hot-reloading agents).
+        """
+        self._default_agents = set(agent_names)
 
     def list_agents(self) -> List[AgentDef]:
         return list(self._agents.values())

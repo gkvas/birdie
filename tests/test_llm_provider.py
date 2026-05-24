@@ -500,7 +500,7 @@ class TestACPProvider:
         read_lines = [init_resp, session_resp, term_req, chunk_msg, final]
         read_idx = 0
 
-        async def fake_readline():
+        async def fake_read(n=-1):
             nonlocal read_idx
             if read_idx < len(read_lines):
                 line = read_lines[read_idx]
@@ -509,7 +509,7 @@ class TestACPProvider:
             return b""
 
         mock_stdout = AsyncMock()
-        mock_stdout.readline = fake_readline
+        mock_stdout.read = fake_read
 
         mock_proc = AsyncMock()
         mock_proc.stdin = mock_stdin
@@ -611,7 +611,7 @@ class TestACPProvider:
         lines = [init_resp, session_resp] + [(json.dumps(r) + "\n").encode() for r in response_lines]
         idx = 0
 
-        async def readline():
+        async def read(n=-1):
             nonlocal idx
             if idx < len(lines):
                 line = lines[idx]; idx += 1; return line
@@ -621,7 +621,7 @@ class TestACPProvider:
         mock_stdin.write = MagicMock()
         mock_stdin.drain = AsyncMock()
         mock_stdout = AsyncMock()
-        mock_stdout.readline = readline
+        mock_stdout.read = read
         mock_proc = AsyncMock()
         mock_proc.stdin = mock_stdin
         mock_proc.stdout = mock_stdout
@@ -887,7 +887,6 @@ name: EchoSkill
 version: 1.0.0
 description: Echo skill
 tags: []
-enabled_by_default: true
 ---
 ## Tools
 ### echo
@@ -926,7 +925,7 @@ schema:
             def list_models(self): return []
 
         provider = TrackingProvider()
-        agent = DynamicAgent(provider, skills_dir=str(tmp_path))
+        agent = DynamicAgent(provider, skills_dir=str(tmp_path), skills_enabled=["EchoSkill"])
         await agent.invoke("test")
 
         assert provider.call_count == 1
@@ -968,7 +967,6 @@ class TestAgentdefToNormalizedDef:
         return AgentDef(
             name=name,
             description="Summarizes text into bullet points",
-            enabled_by_default=True,
             prompt="Summarize: {{ text }}",
             input_params=params,
         )

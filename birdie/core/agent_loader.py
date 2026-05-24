@@ -76,7 +76,6 @@ def parse_agent_markdown(content: str) -> AgentDef:
         name=frontmatter['name'],
         version=str(frontmatter.get('version', '1.0.0')),
         description=frontmatter['description'],
-        enabled_by_default=frontmatter.get('enabled_by_default', False),
         vendor=frontmatter.get('vendor'),
         model=frontmatter.get('model'),
         temperature=frontmatter.get('temperature'),

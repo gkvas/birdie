@@ -83,6 +83,8 @@ class DynamicAgent:
         min_messages_forced: int = MIN_MESSAGES_FORCED,
         compression_window_size: int = COMPRESSION_WINDOW_SIZE,
         tool_output_cap: int = MAX_TOOL_OUTPUT_CAP,
+        skills_enabled: Optional[List[str]] = None,
+        agents_enabled: Optional[List[str]] = None,
     ) -> None:
         # Accept either a native LLMProvider or any LangChain BaseChatModel
         if isinstance(llm_or_provider, LLMProvider):
@@ -95,6 +97,8 @@ class DynamicAgent:
         self._min_messages_forced = min_messages_forced
         self._compression_window_size = compression_window_size
         self._tool_output_cap = tool_output_cap
+        self._skills_enabled: List[str] = skills_enabled or []
+        self._agents_enabled: List[str] = agents_enabled or []
 
         self.skills_dir = skills_dir
         self.agents_dir = agents_dir
@@ -179,13 +183,18 @@ class DynamicAgent:
         else:
             config_dict = {}
 
-        # Extract compaction thresholds from config before creating the provider.
-        # These are agent-level settings and must not be forwarded to vendor SDKs.
-        _AGENT_FIELDS = {"min_messages_auto", "min_messages_forced", "compression_window_size", "tool_output_cap"}
+        # Extract agent-level settings from config before creating the provider.
+        # These must not be forwarded to vendor SDKs.
+        _AGENT_FIELDS = {
+            "min_messages_auto", "min_messages_forced", "compression_window_size",
+            "tool_output_cap", "skills_enabled", "agents_enabled",
+        }
         min_messages_auto = int(config_dict.get("min_messages_auto") or MIN_MESSAGES_AUTO)
         min_messages_forced = int(config_dict.get("min_messages_forced") or MIN_MESSAGES_FORCED)
         compression_window_size = int(config_dict.get("compression_window_size") or COMPRESSION_WINDOW_SIZE)
         tool_output_cap = int(config_dict.get("tool_output_cap") or MAX_TOOL_OUTPUT_CAP)
+        skills_enabled: List[str] = config_dict.get("skills_enabled") or []
+        agents_enabled: List[str] = config_dict.get("agents_enabled") or []
         provider_config_clean = {k: v for k, v in config_dict.items() if k not in _AGENT_FIELDS}
 
         provider = get_llm_provider(provider_config_clean)
@@ -197,7 +206,8 @@ class DynamicAgent:
                    provider_config=config_dict, ltm_store_factory=ltm_store_factory,
                    min_messages_auto=min_messages_auto, min_messages_forced=min_messages_forced,
                    compression_window_size=compression_window_size,
-                   tool_output_cap=tool_output_cap)
+                   tool_output_cap=tool_output_cap,
+                   skills_enabled=skills_enabled, agents_enabled=agents_enabled)
 
     # -- skill management ---------------------------------------------------
 
@@ -251,7 +261,7 @@ class DynamicAgent:
                 # Log error but continue with other directories
                 logging.warning(f"Failed to load skills from {skill_dir}: {str(e)}")
 
-        self.policy.set_default_skills(self.registry.list_skills())
+        self.policy.set_default_skills(self._skills_enabled)
 
 
 
@@ -269,6 +279,7 @@ class DynamicAgent:
             dirs.append(str(user_agents_dir))
 
         if not dirs:
+            self.agent_registry.set_default_agents(self._agents_enabled)
             return
 
         for d in dirs:
@@ -282,6 +293,8 @@ class DynamicAgent:
                     get_tool_output_mode=lambda: self.agent_output_mode,
                 )
                 self.agent_registry.register(agent_def, tool)
+
+        self.agent_registry.set_default_agents(self._agents_enabled)
 
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""
