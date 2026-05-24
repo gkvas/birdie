@@ -160,6 +160,28 @@ class ProviderConfig(BaseModel):
             "None uses the built-in default (60)."
         ),
     )
+    tool_output_cap: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Maximum characters of tool output stored in history per tool call.  "
+            "None means no cap (store full output)."
+        ),
+    )
+    skills_enabled: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Skills enabled by default for every session.  "
+            "Corresponds to skill names declared in SKILL.MD frontmatter."
+        ),
+    )
+    agents_enabled: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Agents enabled by default for every session.  "
+            "Corresponds to agent names declared in AGENT.MD frontmatter."
+        ),
+    )
 
     @classmethod
     def from_json(cls, json_str: str) -> "ProviderConfig":
@@ -1421,10 +1443,26 @@ class ACPProvider(LLMProvider):
         stdin.write((json.dumps(msg) + "\n").encode())
         await stdin.drain()
 
-    async def _async_recv(self, stdout: Any, timeout: float = 300.0) -> dict:
-        line = await asyncio.wait_for(stdout.readline(), timeout=timeout)
-        if not line:
-            raise EOFError("ACP subprocess closed stdout unexpectedly")
+    async def _async_recv(self, stdout: Any, timeout: float = 300.0, buf: bytearray | None = None) -> dict:
+        """Read one newline-delimited JSON-RPC message from stdout.
+
+        buf must be the same bytearray across all calls for a given subprocess so
+        that bytes read past a newline boundary are not lost.
+        """
+        if buf is None:
+            buf = bytearray()
+
+        async def _fill() -> None:
+            while b"\n" not in buf:
+                chunk = await stdout.read(65536)
+                if not chunk:
+                    raise EOFError("ACP subprocess closed stdout unexpectedly")
+                buf.extend(chunk)
+
+        await asyncio.wait_for(_fill(), timeout=timeout)
+        idx = buf.index(b"\n")
+        line = bytes(buf[:idx])
+        del buf[:idx + 1]
         return json.loads(line.decode())
 
     async def _async_handle_agent_request(self, stdin: Any, msg: dict, mcp_mode: bool = False) -> None:
@@ -1481,7 +1519,7 @@ class ACPProvider(LLMProvider):
                                            "error": {"code": -32601, "message": f"Method not found: {method}"}})
 
     async def _async_initialize_session(
-        self, proc: Any, mcp_servers: list[dict] | None = None
+        self, proc: Any, mcp_servers: list[dict] | None = None, buf: bytearray | None = None
     ) -> str:
         """Run Phase 1 + Phase 2; return the sessionId."""
         await self._async_send(proc.stdin, {
@@ -1492,7 +1530,7 @@ class ACPProvider(LLMProvider):
                 "clientCapabilities": {},
             },
         })
-        await self._async_recv(proc.stdout, timeout=30)
+        await self._async_recv(proc.stdout, timeout=30, buf=buf)
 
         session_params: dict = {"cwd": self._cwd, "mcpServers": mcp_servers or []}
         if mcp_servers:
@@ -1501,7 +1539,7 @@ class ACPProvider(LLMProvider):
             "jsonrpc": "2.0", "id": 1, "method": "session/new",
             "params": session_params,
         })
-        session_resp = await self._async_recv(proc.stdout, timeout=30)
+        session_resp = await self._async_recv(proc.stdout, timeout=30, buf=buf)
         return session_resp.get("result", {}).get("sessionId", "")
 
     async def achat(
@@ -1522,7 +1560,8 @@ class ACPProvider(LLMProvider):
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers)
+            buf: bytearray = bytearray()
+            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers, buf=buf)
 
             prompt_text = self._build_conversation_prompt(messages, system_prompt)
             log.debug("REQUEST  acp=%s\n  prompt: %s", self._command[0], prompt_text[:2000])
@@ -1536,7 +1575,7 @@ class ACPProvider(LLMProvider):
 
             text_parts: list[str] = []
             while True:
-                msg = await self._async_recv(proc.stdout)
+                msg = await self._async_recv(proc.stdout, buf=buf)
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
                     result = AIMessage(content="".join(text_parts))
                     log.debug("RESPONSE  acp=%s\n  content: %s", self._command[0], result.content[:2000])
@@ -1569,7 +1608,8 @@ class ACPProvider(LLMProvider):
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers)
+            buf: bytearray = bytearray()
+            session_id = await self._async_initialize_session(proc, mcp_servers=mcp_servers, buf=buf)
 
             await self._async_send(proc.stdin, {
                 "jsonrpc": "2.0", "id": 2, "method": "session/prompt",
@@ -1580,7 +1620,7 @@ class ACPProvider(LLMProvider):
             })
 
             while True:
-                msg = await self._async_recv(proc.stdout)
+                msg = await self._async_recv(proc.stdout, buf=buf)
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
                     break
                 if "id" in msg and "method" in msg:

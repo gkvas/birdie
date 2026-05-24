@@ -1,13 +1,12 @@
 """
 Per-session skill access control.
 
-All skills are disabled by default. Skills marked ``enabled_by_default=True``
-seed the global default set, which is copied into each session on first use.
-Interactive enable/disable mutates the session's live set directly.
+The global default set is seeded from an explicit list of skill names
+(configured in the provider config JSON).  Interactive enable/disable
+mutates the session's live set directly.
 """
 
 from typing import Dict, Set, Optional, List
-from .models import Skill
 
 
 class SkillPolicy:
@@ -21,12 +20,12 @@ class SkillPolicy:
         self._default_skills: Set[str] = set()
         self._session_skills: Dict[str, Set[str]] = {}
 
-    def set_default_skills(self, skills: List[Skill]) -> None:
-        """Seed the default set from all skills with ``enabled_by_default=True``.
+    def set_default_skills(self, skill_names: List[str]) -> None:
+        """Seed the default set from an explicit list of skill names.
 
         Safe to call again to reset defaults (e.g. after hot-reloading skills).
         """
-        self._default_skills = {s.name for s in skills if s.enabled_by_default}
+        self._default_skills = set(skill_names)
 
     def enable_skill(self, session_id: str, skill_name: str) -> None:
         """Add a skill to a session's allowed set."""

@@ -58,7 +58,6 @@ class AgentDef(BaseModel):
     name: str
     version: str = "1.0.0"
     description: str
-    enabled_by_default: bool = False
     vendor: Optional[str] = None
     model: Optional[str] = None
     temperature: Optional[float] = None
@@ -85,7 +84,6 @@ class Skill(BaseModel):
     tools: List[SkillTool] = []
     tags: List[str] = []
     triggers: List[str] = []
-    enabled_by_default: bool = False
     always_inject: bool = False   # inject body into system prompt every turn
     permissions: List[str] = []
     body: Optional[str] = None  # prose body injected into system prompt

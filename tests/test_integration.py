@@ -23,7 +23,6 @@ name: TestSkill
 version: 1.0.0
 description: A test skill
 tags: [test]
-enabled_by_default: true
 ---
 
 # Skill: TestSkill
@@ -75,7 +74,7 @@ async def test_agent_integration(temp_skills_dir):
                 )
             return AIMessage(content="Done")
 
-    agent = DynamicAgent(MockLLM(), skills_dir=temp_skills_dir)
+    agent = DynamicAgent(MockLLM(), skills_dir=temp_skills_dir, skills_enabled=["TestSkill"])
     result = await agent.invoke("Test message")
 
     # Expect: HumanMessage, AIMessage(tool_call), ToolMessage, AIMessage("Done")
@@ -106,7 +105,7 @@ async def test_dynamic_tool_binding():
             return AIMessage(content="ok")
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        for skill_name, enabled in [("PublicSkill", True), ("PrivateSkill", False)]:
+        for skill_name in ["PublicSkill", "PrivateSkill"]:
             skill_dir = os.path.join(temp_dir, skill_name)
             os.makedirs(skill_dir)
 
@@ -115,7 +114,6 @@ name: {skill_name}
 version: 1.0.0
 description: A {skill_name.lower()} skill
 tags: [test]
-enabled_by_default: {str(enabled).lower()}
 ---
 
 # Skill: {skill_name}
@@ -139,9 +137,12 @@ schema:
         # Use an empty temp dir for agents_dir so bundled and user agents don't
         # interfere with the skill-policy assertions below.
         with tempfile.TemporaryDirectory() as empty_agents_dir:
-            agent = DynamicAgent(llm, skills_dir=temp_dir, agents_dir=empty_agents_dir)
+            agent = DynamicAgent(
+                llm, skills_dir=temp_dir, agents_dir=empty_agents_dir,
+                skills_enabled=["PublicSkill"],
+            )
 
-            # No user — only PublicSkill (enabled_by_default=true)
+            # No user — only PublicSkill (enabled via skills_enabled config)
             await agent.invoke("Test message")
             skill_tool_names = {t.name for t in llm.bound_tools}
             assert "publicskill_tool" in skill_tool_names
@@ -155,15 +156,14 @@ schema:
             assert "privateskill_tool" in tool_names
 
 
-def _write_skill(directory: str, name: str, enabled_by_default: bool = False) -> None:
+def _write_skill(directory: str, name: str, version: str = "1.0.0") -> None:
     skill_dir = os.path.join(directory, name)
     os.makedirs(skill_dir, exist_ok=True)
     with open(os.path.join(skill_dir, "SKILL.MD"), "w") as f:
         f.write(f"""---
 name: {name}
-version: 1.0.0
+version: {version}
 description: Test skill {name}
-enabled_by_default: {str(enabled_by_default).lower()}
 ---
 """)
 
@@ -178,18 +178,18 @@ class _NoopLLM:
 
 
 def test_load_skills_registers_all_skills():
-    """Skills from the primary dir are registered and policy is seeded."""
+    """Skills from the primary dir are registered; policy is seeded from skills_enabled."""
     with tempfile.TemporaryDirectory() as skills_dir:
-        _write_skill(skills_dir, "SkillA", enabled_by_default=True)
-        _write_skill(skills_dir, "SkillB", enabled_by_default=False)
+        _write_skill(skills_dir, "SkillA")
+        _write_skill(skills_dir, "SkillB")
 
-        agent = DynamicAgent(_NoopLLM(), skills_dir=skills_dir)
+        agent = DynamicAgent(_NoopLLM(), skills_dir=skills_dir, skills_enabled=["SkillA"])
 
         names = {s.name for s in agent.registry.list_skills()}
         assert "SkillA" in names
         assert "SkillB" in names
 
-        # Policy seeded: SkillA enabled by default, SkillB not
+        # Policy seeded from skills_enabled: SkillA enabled, SkillB not
         allowed = agent.policy.get_allowed_skills("default")
         assert "SkillA" in allowed
         assert "SkillB" not in allowed

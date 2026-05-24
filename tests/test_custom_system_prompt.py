@@ -39,14 +39,13 @@ class CapturingProvider(LLMProvider):
         return []
 
 
-def _write_skill(directory: Path, name: str, enabled: bool = True) -> None:
+def _write_skill(directory: Path, name: str) -> None:
     skill_dir = directory / name
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.MD").write_text(f"""---
 name: {name}
 version: 1.0.0
 description: Test skill {name}
-enabled_by_default: {str(enabled).lower()}
 ---
 """)
 
@@ -59,13 +58,13 @@ def skills_dir(tmp_path):
     return d
 
 
-def _make_agent_no_user_skills(tmp_path, provider, skills_dir):
+def _make_agent_no_user_skills(tmp_path, provider, skills_dir, skills_enabled=None):
     """Create DynamicAgent with Path.home() pointing to an empty fake home."""
     real_path = Path
     with patch("birdie.agent.run.Path") as mock_path:
         mock_path.home.return_value = real_path(tmp_path)
         mock_path.side_effect = real_path
-        return DynamicAgent(provider, skills_dir=str(skills_dir))
+        return DynamicAgent(provider, skills_dir=str(skills_dir), skills_enabled=skills_enabled or [])
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +80,7 @@ async def test_custom_prompt_prepended_before_skills(tmp_path, monkeypatch, skil
     (birdie_dir / "system_prompt.md").write_text("You are a helpful assistant.")
 
     provider = CapturingProvider()
-    agent = DynamicAgent(provider, skills_dir=str(skills_dir))
+    agent = DynamicAgent(provider, skills_dir=str(skills_dir), skills_enabled=["TestSkill"])
     await agent.invoke("Hello")
 
     prompt = provider.last
@@ -99,7 +98,7 @@ async def test_no_file_does_not_add_custom_prefix(tmp_path, monkeypatch, skills_
     monkeypatch.chdir(tmp_path)  # tmp_path has no .birdie directory
 
     provider = CapturingProvider()
-    agent = DynamicAgent(provider, skills_dir=str(skills_dir))
+    agent = DynamicAgent(provider, skills_dir=str(skills_dir), skills_enabled=["TestSkill"])
     await agent.invoke("Hello")
 
     prompt = provider.last
@@ -116,7 +115,7 @@ async def test_empty_file_is_treated_as_absent(tmp_path, monkeypatch, skills_dir
     (birdie_dir / "system_prompt.md").write_text("")
 
     provider = CapturingProvider()
-    agent = DynamicAgent(provider, skills_dir=str(skills_dir))
+    agent = DynamicAgent(provider, skills_dir=str(skills_dir), skills_enabled=["TestSkill"])
     await agent.invoke("Hello")
 
     prompt = provider.last
@@ -133,7 +132,7 @@ async def test_whitespace_only_file_is_treated_as_absent(tmp_path, monkeypatch, 
     (birdie_dir / "system_prompt.md").write_text("   \n\n\t  ")
 
     provider = CapturingProvider()
-    agent = DynamicAgent(provider, skills_dir=str(skills_dir))
+    agent = DynamicAgent(provider, skills_dir=str(skills_dir), skills_enabled=["TestSkill"])
     await agent.invoke("Hello")
 
     prompt = provider.last

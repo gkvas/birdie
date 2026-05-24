@@ -30,7 +30,6 @@ FULL_AGENTS_MD = """\
 name: Summarizer
 version: 1.2.0
 description: Summarizes text into bullet points
-enabled_by_default: true
 vendor: anthropic
 model: claude-haiku-4-5-20251001
 allowed_skills:
@@ -74,7 +73,6 @@ class TestParseAgentMarkdown:
     def test_minimal_defaults(self):
         agent = parse_agent_markdown(MINIMAL_AGENTS_MD)
         assert agent.version == "1.0.0"
-        assert agent.enabled_by_default is False
         assert agent.vendor is None
         assert agent.model is None
         assert agent.allowed_skills == []
@@ -85,7 +83,6 @@ class TestParseAgentMarkdown:
         agent = parse_agent_markdown(FULL_AGENTS_MD)
         assert agent.name == "Summarizer"
         assert agent.version == "1.2.0"
-        assert agent.enabled_by_default is True
         assert agent.vendor == "anthropic"
         assert agent.model == "claude-haiku-4-5-20251001"
         assert agent.allowed_skills == ["search", "calculator"]
