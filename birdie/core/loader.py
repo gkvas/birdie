@@ -108,8 +108,9 @@ def parse_skill_markdown(content: str) -> Skill:
     if 'mcp_server' in frontmatter:
         mcp_server = MCPServerConfig(**frontmatter['mcp_server'])
 
+    skill_name = frontmatter['name']
     return Skill(
-        name=frontmatter['name'],
+        name=skill_name,
         version=str(frontmatter.get('version', '1.0.0')),
         description=frontmatter['description'],
         tools=tools,
@@ -118,6 +119,7 @@ def parse_skill_markdown(content: str) -> Skill:
         always_inject=always_inject,
         permissions=permissions,
         body=body,
+        location=frontmatter.get('location', skill_name),
         mcp_server=mcp_server,
     )
 

@@ -46,6 +46,10 @@ MIN_MESSAGES_FORCED = 4     # /compact floor: minimum messages to retain
 COMPRESSION_WINDOW_SIZE = 60  # maximum number of oldest messages to compress per run
 # Auto-compaction triggers when len(messages) >= MIN_MESSAGES_AUTO + COMPRESSION_WINDOW_SIZE
 
+# Progressive skill loading: freetext skill decay / cache settings.
+SKILL_DECAY_TURNS = 5    # unload a skill after this many human turns without a reload
+SKILL_MAX_LOADED = 3     # maximum simultaneously loaded freetext skills (LRU cap)
+
 # Tool output cap: truncate ToolMessage content stored in the checkpoint to
 # this many characters.  Prevents large shell/file outputs from bloating the
 # context sent to the LLM on every subsequent turn.
@@ -287,6 +291,52 @@ def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
     return count
 
 
+def _loaded_skills_from_history(
+    messages: list,
+    allowed: set,
+    decay_turns: int = SKILL_DECAY_TURNS,
+    max_loaded: int = SKILL_MAX_LOADED,
+) -> set:
+    """Return the set of freetext skill names that are currently active.
+
+    A skill becomes active when the LLM calls ``get_skill(skill_name=<name>)``.
+    It remains active for ``decay_turns`` human turns after the most recent
+    such call, subject to an LRU cap of ``max_loaded`` simultaneous skills.
+
+    Args:
+        messages: Full message history from AgentState.
+        allowed: Set of allowed skill names for the current session.
+        decay_turns: Human turns after which an un-refreshed skill is evicted.
+        max_loaded: Maximum number of simultaneously loaded skills (LRU).
+
+    Returns:
+        Set of skill names whose bodies should be injected this turn.
+    """
+    # Find the most recent AIMessage index at which get_skill was called per skill.
+    last_load_idx: dict[str, int] = {}
+    for i, msg in enumerate(messages):
+        if isinstance(msg, AIMessage):
+            for tc in getattr(msg, "tool_calls", []):
+                if tc["name"] == "get_skill":
+                    skill_name = tc["args"].get("skill_name", "")
+                    if skill_name and skill_name in allowed:
+                        last_load_idx[skill_name] = i
+
+    # Keep only skills whose load is within the decay window.
+    active: dict[str, int] = {}
+    for skill_name, load_idx in last_load_idx.items():
+        turns_since = sum(
+            1 for j, m in enumerate(messages)
+            if j > load_idx and isinstance(m, HumanMessage)
+        )
+        if turns_since <= decay_turns:
+            active[skill_name] = load_idx
+
+    # LRU cap: retain only the max_loaded most recently loaded skills.
+    by_recency = sorted(active.items(), key=lambda x: -x[1])[:max_loaded]
+    return {name for name, _ in by_recency}
+
+
 def create_agent_graph(
     provider: LLMProvider,
     registry: SkillRegistry,
@@ -350,9 +400,47 @@ def create_agent_graph(
                 return str(msg.content)
         return ""
 
-    def _triggered_freetext(state: AgentState, allowed: set) -> list:
-        """Return freetext skills whose triggers appear in the latest user message."""
-        return registry.find_skills_by_trigger(_last_user_text(state), allowed)
+    def _make_get_skill_tool(allowed: set, decay_turns: int = SKILL_DECAY_TURNS):
+        """Build a LangChain StructuredTool that returns a freetext skill's body.
+
+        The returned tool is created fresh each turn with the current ``allowed``
+        set baked in, so permission checks are always up-to-date.
+        """
+        from langchain_core.tools import StructuredTool
+        from pydantic import BaseModel as _BaseModel
+
+        class _Input(_BaseModel):
+            skill_name: str
+
+        def _fn(skill_name: str) -> str:
+            if skill_name not in allowed:
+                available = [
+                    s.location or s.name
+                    for s in registry.list_skills()
+                    if s.name in allowed and s.body and not s.always_inject
+                ]
+                return (
+                    f"Skill '{skill_name}' is not available. "
+                    f"Available knowledge skills: {available}"
+                )
+            skill = registry.get_skill(skill_name)
+            if skill is None:
+                return f"Skill '{skill_name}' not found."
+            if not skill.body:
+                return f"Skill '{skill_name}' has no loadable body."
+            return skill.body
+
+        return StructuredTool.from_function(
+            func=_fn,
+            name="get_skill",
+            description=(
+                "Load the full instructions for a knowledge skill. "
+                "Pass the skill name shown in [load: <name>] in the skills list. "
+                f"Loaded skills are injected for {decay_turns} turns; "
+                "call again to refresh."
+            ),
+            args_schema=_Input,
+        )
 
     def _get_skill_tools(config: RunnableConfig) -> list:
         """Return the callable SkillTools for all allowed skills this turn."""
@@ -376,9 +464,11 @@ def create_agent_graph(
         Five tiers, joined with double newlines:
 
         - **Tier 0** - custom instructions from ``.birdie/system_prompt.md``.
-        - **Tier 1** - compact bullet list of all allowed skills.
+        - **Tier 1** - compact bullet list of all allowed skills; knowledge
+          skills show a ``[load: <name>]`` hint instead of trigger keywords.
         - **Tier 2a** - full prose body for ``always_inject`` skills.
-        - **Tier 2b** - full prose body for freetext skills whose triggers fired.
+        - **Tier 2b** - full prose body for progressively-loaded freetext skills
+          (those whose ``get_skill`` lease has not yet expired this session).
         - **Tier 3** - long-term memory: manual entries from config plus
           semantically retrieved compaction entries (``ltm_context``).
 
@@ -389,6 +479,14 @@ def create_agent_graph(
         all_skills = [s for s in registry.list_skills() if s.name in allowed]
         manual_ltm = config.get("configurable", {}).get("long_term_memory") or []
 
+        cfg = config.get("configurable", {})
+        decay_turns = cfg.get("skill_decay_turns", SKILL_DECAY_TURNS)
+        max_loaded = cfg.get("skill_max_loaded", SKILL_MAX_LOADED)
+        loaded_skill_names = _loaded_skills_from_history(
+            list(state["messages"]), allowed,
+            decay_turns=decay_turns, max_loaded=max_loaded,
+        )
+
         parts: List[str] = []
 
         # Tier 0
@@ -398,18 +496,33 @@ def create_agent_graph(
         # Tiers 1 + 2
         if all_skills:
             lines = ["You have access to the following skills:\n"]
+            has_loadable = False
             for skill in all_skills:
-                trigger_hint = (
-                    f"  triggers: {', '.join(skill.triggers)}" if skill.triggers else ""
+                if skill.body and not skill.always_inject:
+                    loc = skill.location or skill.name
+                    loaded_hint = " [loaded]" if skill.name in loaded_skill_names else ""
+                    lines.append(
+                        f"- **{skill.name}**: {skill.description}"
+                        f" [load: {loc}]{loaded_hint}"
+                    )
+                    has_loadable = True
+                else:
+                    lines.append(f"- **{skill.name}**: {skill.description}")
+
+            if has_loadable:
+                lines.append(
+                    "\nKnowledge skills show [load: <name>] - call"
+                    " get_skill(skill_name=<name>) to load full instructions."
                 )
-                lines.append(f"- **{skill.name}**: {skill.description}{trigger_hint}")
+
             skill_block = "\n".join(lines)
 
             for skill in all_skills:
                 if skill.always_inject and skill.body:
                     skill_block += f"\n\n--- {skill.name} instructions ---\n{skill.body}"
-            for skill in _triggered_freetext(state, allowed):
-                if skill.body:
+
+            for skill in all_skills:
+                if skill.name in loaded_skill_names and skill.body and not skill.always_inject:
                     skill_block += f"\n\n--- {skill.name} skill context ---\n{skill.body}"
 
             parts.append(skill_block)
@@ -538,7 +651,16 @@ def create_agent_graph(
         mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
         agent_tools = agent_registry.get_tools(_get_allowed_agents(config)) if agent_registry else []
 
-        if provider.supports_tools() and (skill_tools or mcp_tools or agent_tools):
+        loadable_skills = [
+            s for s in registry.list_skills()
+            if s.name in allowed and s.body and not s.always_inject
+        ]
+        get_skill_tool = _make_get_skill_tool(
+            allowed,
+            decay_turns=config.get("configurable", {}).get("skill_decay_turns", SKILL_DECAY_TURNS),
+        ) if loadable_skills else None
+
+        if provider.supports_tools() and (skill_tools or mcp_tools or agent_tools or get_skill_tool):
             if isinstance(provider, ACPProvider):
                 # For ACPProvider, agent tools are bridged via the MCP server
                 # subprocess (BIRDIE_AGENTS_JSON) rather than as LangChain
@@ -558,15 +680,17 @@ def create_agent_graph(
                     for t in allowed_agent_tools
                     if agent_registry and agent_registry.get_agent(t.name) is not None
                 ]
+                extra_lc = mcp_tools + ([get_skill_tool] if get_skill_tool else [])
                 normalized_tools = (
                     [skilltool_to_normalized_def(t) for t in skill_tools]
-                    + [lc_tool_to_normalized_def(t) for t in mcp_tools]
+                    + [lc_tool_to_normalized_def(t) for t in extra_lc]
                     + agent_normalized
                 )
             else:
+                extra_lc = mcp_tools + agent_tools + ([get_skill_tool] if get_skill_tool else [])
                 normalized_tools = (
                     [skilltool_to_normalized_def(t) for t in skill_tools]
-                    + [lc_tool_to_normalized_def(t) for t in mcp_tools + agent_tools]
+                    + [lc_tool_to_normalized_def(t) for t in extra_lc]
                 )
         else:
             normalized_tools = None
@@ -608,8 +732,19 @@ def create_agent_graph(
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
         mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
         agent_tools = agent_registry.get_tools(_get_allowed_agents(config)) if agent_registry else []
+        loadable_skills = [
+            s for s in registry.list_skills()
+            if s.name in allowed and s.body and not s.always_inject
+        ]
+        get_skill_tool = _make_get_skill_tool(
+            allowed,
+            decay_turns=config.get("configurable", {}).get("skill_decay_turns", SKILL_DECAY_TURNS),
+        ) if loadable_skills else None
         langchain_tools = (
-            [skilltool_to_langchain_tool(t) for t in skill_tools] + mcp_tools + agent_tools
+            [skilltool_to_langchain_tool(t) for t in skill_tools]
+            + mcp_tools
+            + agent_tools
+            + ([get_skill_tool] if get_skill_tool else [])
         )
         cap = config.get("configurable", {}).get("tool_output_cap", MAX_TOOL_OUTPUT_CAP)
 
