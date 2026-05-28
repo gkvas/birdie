@@ -75,16 +75,17 @@ class Skill(BaseModel):
     A self-contained capability bundle.
 
     Structured skills define explicit tools (entrypoint + schema).
-    Freetext skills carry instructional prose in `body` that is injected into
-    the system prompt when the skill is triggered; their `tools` list is empty.
+    Freetext skills carry instructional prose in `body` that is progressively
+    loaded into the system prompt on LLM request via the get_skill tool.
     """
     name: str
     version: str
     description: str
     tools: List[SkillTool] = []
     tags: List[str] = []
-    triggers: List[str] = []
+    triggers: List[str] = []  # deprecated: kept for backward compat, no longer used
     always_inject: bool = False   # inject body into system prompt every turn
     permissions: List[str] = []
-    body: Optional[str] = None  # prose body injected into system prompt
+    body: Optional[str] = None  # prose body loaded on demand via get_skill
+    location: Optional[str] = None  # identifier used to load this skill; defaults to name
     mcp_server: Optional[MCPServerConfig] = None  # set for MCP-backed skills
