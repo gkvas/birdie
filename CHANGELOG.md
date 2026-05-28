@@ -1,3 +1,25 @@
+## [0.4.0] - 2026-05-28
+
+### Changed
+- Freetext (knowledge) skills are no longer auto-injected based on keyword
+  triggers. The LLM now sees a compact `[load: <name>]` hint per skill and
+  calls the new `get_skill` tool when it needs the full body. This eliminates
+  false-positive injections and keeps the system prompt small by default.
+- `Skill.triggers` is retained for backward compatibility with existing
+  SKILL.MD files but no longer drives injection.
+
+### Added
+- `get_skill` built-in tool: returns the prose body of any allowed freetext
+  skill by name. Exposed automatically when at least one loadable skill is
+  enabled; no SKILL.MD changes required.
+- Progressive skill loading with turn-decay eviction: a loaded skill's body is
+  injected into the system prompt for `skill_decay_turns` human turns (default
+  5) after the last `get_skill` call; an LRU cap of `skill_max_loaded`
+  (default 3) limits simultaneous loaded skills. Both limits are overrideable
+  via `config["configurable"]`.
+- `Skill.location` field: identifier used in the `[load: <name>]` hint.
+  Defaults to the skill name; reserved for future remote skill references.
+
 ## [0.3.1] - 2026-05-24
 
 ### Changed
