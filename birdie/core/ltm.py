@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -49,17 +49,34 @@ class LTMStore:
 
     Backed by ``<storage_dir>/<user_id>.json``.  Loaded lazily on first
     access; saved atomically (write-then-rename) after every ``add`` call.
+
+    Eviction policy (applied on load and after each add):
+    - Entries older than ``max_age_days`` are dropped.
+    - If more than ``max_entries`` remain, the oldest are dropped.
+
+    Retrieval threshold:
+    - ``query()`` only returns entries whose cosine similarity to the query
+      meets or exceeds ``min_score``.
     """
 
     DEFAULT_DIR = Path.home() / ".birdie" / "ltm"
+    DEFAULT_MAX_AGE_DAYS: int = 90
+    DEFAULT_MAX_ENTRIES: int = 100
+    DEFAULT_MIN_SCORE: float = 0.05
 
     def __init__(
         self,
         user_id: str,
         storage_dir: Optional[Path] = None,
+        max_age_days: Optional[int] = DEFAULT_MAX_AGE_DAYS,
+        max_entries: Optional[int] = DEFAULT_MAX_ENTRIES,
+        min_score: float = DEFAULT_MIN_SCORE,
     ) -> None:
         self.user_id = user_id
         self.storage_dir = Path(storage_dir) if storage_dir else self.DEFAULT_DIR
+        self.max_age_days = max_age_days
+        self.max_entries = max_entries
+        self.min_score = min_score
         self._entries: List[LTMEntry] = []
         self._loaded = False
 
@@ -74,6 +91,10 @@ class LTMStore:
         if path.exists():
             raw = json.loads(path.read_text(encoding="utf-8"))
             self._entries = [LTMEntry(**e) for e in raw.get("entries", [])]
+            n_before = len(self._entries)
+            self._evict()
+            if len(self._entries) < n_before:
+                self.save()
         self._loaded = True
 
     def save(self) -> None:
@@ -101,6 +122,17 @@ class LTMStore:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         tmp.replace(path)
+
+    def _evict(self) -> None:
+        """Drop entries that exceed the age limit or entry cap (in-place)."""
+        if self.max_age_days is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(days=self.max_age_days)
+            self._entries = [
+                e for e in self._entries
+                if datetime.fromisoformat(e.created_at) >= cutoff
+            ]
+        if self.max_entries is not None and len(self._entries) > self.max_entries:
+            self._entries = self._entries[-self.max_entries:]
 
     def _ensure_loaded(self) -> None:
         if not self._loaded:
@@ -139,20 +171,21 @@ class LTMStore:
             created_at=datetime.now(timezone.utc).isoformat(),
         )
         self._entries.append(entry)
+        self._evict()
         self.save()
         return entry
 
     def query(self, text: str, k: int = 5) -> List[LTMEntry]:
-        """Return the top-k most relevant entries by cosine similarity."""
+        """Return the top-k entries whose similarity to *text* meets min_score."""
         self._ensure_loaded()
         if not self._entries:
             return []
         query_vec = embed(text)
-        return sorted(
-            self._entries,
-            key=lambda e: cosine_similarity(query_vec, e.embedding),
-            reverse=True,
-        )[:k]
+        scored = sorted(
+            ((e, cosine_similarity(query_vec, e.embedding)) for e in self._entries),
+            key=lambda x: -x[1],
+        )
+        return [e for e, score in scored if score >= self.min_score][:k]
 
     def format_for_prompt(self, entries: List[LTMEntry]) -> str:
         """Render retrieved LTM entries as readable text for prompt injection."""

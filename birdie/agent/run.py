@@ -188,6 +188,7 @@ class DynamicAgent:
         _AGENT_FIELDS = {
             "min_messages_auto", "min_messages_forced", "compression_window_size",
             "tool_output_cap", "skills_enabled", "agents_enabled",
+            "ltm_max_age_days", "ltm_max_entries", "ltm_min_score",
         }
         min_messages_auto = int(config_dict.get("min_messages_auto") or MIN_MESSAGES_AUTO)
         min_messages_forced = int(config_dict.get("min_messages_forced") or MIN_MESSAGES_FORCED)
@@ -195,12 +196,20 @@ class DynamicAgent:
         tool_output_cap = int(config_dict.get("tool_output_cap") or MAX_TOOL_OUTPUT_CAP)
         skills_enabled: List[str] = config_dict.get("skills_enabled") or []
         agents_enabled: List[str] = config_dict.get("agents_enabled") or []
+        ltm_max_age_days = int(config_dict.get("ltm_max_age_days") or LTMStore.DEFAULT_MAX_AGE_DAYS)
+        ltm_max_entries = int(config_dict.get("ltm_max_entries") or LTMStore.DEFAULT_MAX_ENTRIES)
+        ltm_min_score = float(config_dict.get("ltm_min_score") or LTMStore.DEFAULT_MIN_SCORE)
         provider_config_clean = {k: v for k, v in config_dict.items() if k not in _AGENT_FIELDS}
 
         provider = get_llm_provider(provider_config_clean)
         if ltm_store_factory is None:
             def ltm_store_factory(uid: str) -> LTMStore:
-                return LTMStore(uid)
+                return LTMStore(
+                    uid,
+                    max_age_days=ltm_max_age_days,
+                    max_entries=ltm_max_entries,
+                    min_score=ltm_min_score,
+                )
         return cls(provider, skills_dir=skills_dir, agents_dir=agents_dir,
                    agent_console=agent_console, checkpointer=checkpointer,
                    provider_config=config_dict, ltm_store_factory=ltm_store_factory,
