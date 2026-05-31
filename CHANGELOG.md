@@ -1,3 +1,22 @@
+## [0.4.1] - 2026-05-31
+
+### Added
+- LTM score threshold: `query()` now filters out entries whose cosine
+  similarity to the current message is below `min_score` (default 0.05),
+  preventing low-signal queries like greetings from injecting irrelevant
+  context on every turn.
+- LTM TTL eviction: entries older than `max_age_days` (default 90) are
+  dropped on store load and after each `add()`.
+- LTM entry cap: after TTL, if more than `max_entries` (default 100)
+  remain, the oldest are dropped to keep the newest N.
+- All three limits are configurable via `LTMStore` constructor params and
+  via JSON provider config keys `ltm_min_score`, `ltm_max_age_days`,
+  `ltm_max_entries`.
+
+### Fixed
+- `v0.4.0` git tag was created without the `v` prefix; corrected to
+  `v0.4.0` for consistency with all prior release tags.
+
 ## [0.4.0] - 2026-05-28
 
 ### Changed
