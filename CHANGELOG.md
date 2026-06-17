@@ -1,3 +1,16 @@
+## [0.5.0] - 2026-06-17
+
+### Added
+- MCP Streamable HTTP transport: `mcp_server` blocks now accept
+  `transport: streamable_http` (with `http` as a friendly alias) to connect
+  to remote MCP servers over the current MCP standard transport.
+- New optional `timeout` and `sse_read_timeout` fields (seconds) for the
+  `sse` and `streamable_http` transports. Streamable HTTP timeouts are
+  converted to `timedelta` as the adapter expects; SSE keeps floats.
+- `MCPServerConfig` now validates required fields per transport (`command`
+  for stdio, `url` for sse/streamable_http), failing fast at config time
+  instead of deep inside the adapter at connection time.
+
 ## [0.4.1] - 2026-05-31
 
 ### Added

@@ -3,7 +3,7 @@ Core data models for the dynamic skill system.
 """
 
 import warnings
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import List, Dict, Any, Optional, Literal
 
 # Pydantic v2 reserves `model_` prefixed names; `schema` shadows the legacy
@@ -17,16 +17,49 @@ warnings.filterwarnings(
 
 
 class MCPServerConfig(BaseModel):
-    """Connection config for a single MCP server declared in a SKILL.MD file."""
-    transport: Literal["stdio", "sse"] = "stdio"
+    """Connection config for a single MCP server declared in a SKILL.MD file.
+
+    Three transports are supported:
+
+    - ``stdio``: the server is launched as a subprocess (``command`` + ``args``).
+    - ``sse``: connect to a long-lived Server-Sent Events endpoint (``url``).
+    - ``streamable_http``: connect to a Streamable HTTP endpoint (``url``).  The
+      friendly alias ``http`` is accepted and normalized to ``streamable_http``.
+    """
+    transport: Literal["stdio", "sse", "streamable_http"] = "stdio"
     # stdio fields
     command: Optional[str] = None
     args: List[str] = []
     env: Optional[Dict[str, str]] = None
     cwd: Optional[str] = None
-    # sse / http fields
+    # sse / streamable_http fields
     url: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
+    # connection timeout in seconds (sse / streamable_http only)
+    timeout: Optional[float] = None
+    # read timeout for the SSE event stream in seconds (sse / streamable_http only)
+    sse_read_timeout: Optional[float] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_transport(cls, data: Any) -> Any:
+        """Accept ``http`` as a friendly alias for ``streamable_http``."""
+        if isinstance(data, dict) and data.get("transport") == "http":
+            data = {**data, "transport": "streamable_http"}
+        return data
+
+    @model_validator(mode="after")
+    def _check_required_fields(self) -> "MCPServerConfig":
+        """Ensure the fields required by the chosen transport are present."""
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError("MCP stdio transport requires 'command'")
+        else:
+            if not self.url:
+                raise ValueError(
+                    f"MCP {self.transport} transport requires 'url'"
+                )
+        return self
 
 
 class SkillTool(BaseModel):

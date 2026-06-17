@@ -25,7 +25,7 @@ mcp_server:
 ---
 ```
 
-**SSE / HTTP transport** (server is a running process you connect to):
+**SSE transport** (connect to a long-lived Server-Sent Events endpoint):
 
 ```yaml
 ---
@@ -39,17 +39,36 @@ mcp_server:
 ---
 ```
 
+**Streamable HTTP transport** (connect to a Streamable HTTP endpoint - the
+current MCP standard for remote servers, superseding the older SSE transport):
+
+```yaml
+---
+name: remote_tools
+version: 1.0.0
+description: Tools from a remote MCP server
+enabled_by_default: false
+mcp_server:
+  transport: streamable_http   # `http` is accepted as an alias
+  url: http://localhost:8080/mcp
+  headers:
+    Authorization: "Bearer ${TOKEN}"
+---
+```
+
 ### `mcp_server` fields
 
 | Field | Required | Description |
 |---|---|---|
-| `transport` | yes | `stdio` or `sse` |
+| `transport` | yes | `stdio`, `sse`, or `streamable_http` (`http` is an alias for the latter) |
 | `command` | stdio only | Executable to launch (e.g. `python`, `node`) |
 | `args` | stdio only | List of arguments passed to the command |
 | `env` | no | Extra environment variables for the subprocess |
 | `cwd` | no | Working directory for the subprocess |
-| `url` | sse only | URL of the SSE endpoint |
-| `headers` | sse only | HTTP headers to send with the connection |
+| `url` | sse / streamable_http | URL of the remote endpoint |
+| `headers` | no | HTTP headers to send with the connection (sse / streamable_http) |
+| `timeout` | no | Connection timeout in seconds (sse / streamable_http) |
+| `sse_read_timeout` | no | Read timeout for the event stream in seconds (sse / streamable_http) |
 
 ---
 

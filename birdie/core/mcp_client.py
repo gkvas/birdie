@@ -11,6 +11,7 @@ can be re-entered cheaply.
 """
 
 import logging
+from datetime import timedelta
 from typing import List, Optional
 
 from langchain_core.tools import BaseTool
@@ -21,7 +22,14 @@ log = logging.getLogger(__name__)
 
 
 def _to_adapter_config(name: str, cfg: MCPServerConfig) -> dict:
-    """Convert MCPServerConfig to the dict format expected by MultiServerMCPClient."""
+    """Convert MCPServerConfig to the dict format expected by MultiServerMCPClient.
+
+    Handles all three transports: ``stdio`` (subprocess), ``sse`` (Server-Sent
+    Events endpoint), and ``streamable_http`` (Streamable HTTP endpoint).  The
+    ``sse`` and ``streamable_http`` transports share the same URL/header/timeout
+    fields; the only wire difference is the transport string and that the
+    Streamable HTTP client expects ``timedelta`` timeouts where SSE takes floats.
+    """
     if cfg.transport == "stdio":
         entry: dict = {
             "transport": "stdio",
@@ -33,12 +41,23 @@ def _to_adapter_config(name: str, cfg: MCPServerConfig) -> dict:
         if cfg.cwd is not None:
             entry["cwd"] = cfg.cwd
     else:
+        # sse and streamable_http both connect to a URL.
         entry = {
             "transport": cfg.transport,
             "url": cfg.url,
         }
         if cfg.headers is not None:
             entry["headers"] = cfg.headers
+        # The Streamable HTTP adapter expects timedelta timeouts; SSE takes floats.
+        wrap = (
+            (lambda s: timedelta(seconds=s))
+            if cfg.transport == "streamable_http"
+            else (lambda s: s)
+        )
+        if cfg.timeout is not None:
+            entry["timeout"] = wrap(cfg.timeout)
+        if cfg.sse_read_timeout is not None:
+            entry["sse_read_timeout"] = wrap(cfg.sse_read_timeout)
     return entry
 
 
