@@ -1,3 +1,12 @@
+## [0.5.2] - 2026-06-21
+
+### Fixed
+- The `allowed_objects` warning suppression added in 0.5.1 did not take effect
+  on environments where langchain's `LangChainPendingDeprecationWarning`
+  descends from `DeprecationWarning` rather than `PendingDeprecationWarning`.
+  The filter now matches on the message only (against the base `Warning`
+  class), so it suppresses the warning regardless of the concrete subclass.
+
 ## [0.5.1] - 2026-06-21
 
 ### Fixed
