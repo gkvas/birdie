@@ -1,3 +1,12 @@
+## [0.5.1] - 2026-06-21
+
+### Fixed
+- Suppress the `LangChainPendingDeprecationWarning` about the future default
+  of `allowed_objects` emitted by newer langgraph versions when they build a
+  `JsonPlusSerializer` inside every checkpointer. Birdie never constructs that
+  serializer itself and the parameter does not exist on the langgraph floor it
+  declares, so the warning is filtered at package import.
+
 ## [0.5.0] - 2026-06-17
 
 ### Added
