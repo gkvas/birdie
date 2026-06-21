@@ -1,3 +1,13 @@
+## [0.5.3] - 2026-06-21
+
+### Fixed
+- The `allowed_objects` warning still surfaced because `langchain_core`, when
+  imported (after birdie), calls `surface_langchain_deprecation_warnings()`,
+  which prepends a `"default"` filter ahead of ours. Birdie now imports
+  `langchain_core` first and registers its ignore filter afterwards, so the
+  filter stays in front and the warning is suppressed for real. Added a
+  subprocess regression test that reproduces the langchain import ordering.
+
 ## [0.5.2] - 2026-06-21
 
 ### Fixed
