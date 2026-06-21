@@ -55,3 +55,6 @@ Thumbs.db
 # Distribution / packaging
 MANIFEST
 examples/persistence_demo.db
+
+# Claude Code session handoffs (local only)
+.claude/handoffs/
