@@ -20,6 +20,8 @@ Note: MCP tools are not resolved here.  MCP servers are declared via
 BaseTool objects, bypassing the entrypoint system.
 """
 
+import re
+import shlex
 import subprocess
 import requests
 import json
@@ -69,8 +71,14 @@ def resolve_http_post(entrypoint: str, **kwargs: Any) -> Any:
 def resolve_bash(entrypoint: str, **kwargs: Any) -> Any:
     """Execute a ``bash:`` entrypoint via a subprocess shell.
 
-    The command template (everything after ``bash:``) is formatted with kwargs
-    using Python's ``str.format()``, then run via ``subprocess.run(shell=True)``.
+    The command template (everything after ``bash:``) is formatted with kwargs,
+    then run via ``subprocess.run(shell=True)``.
+
+    Substituted values are shell-quoted (``shlex.quote``) so LLM-supplied
+    arguments cannot inject extra shell commands into templates like
+    ``bash:cat {path}``.  The single exception is a template that consists of
+    exactly one placeholder (e.g. ``bash:{command}``): such raw-shell tools
+    intentionally receive a full command string, where quoting would break it.
 
     Args:
         entrypoint: Full entrypoint string, e.g. ``bash:cat {path}``.
@@ -82,7 +90,12 @@ def resolve_bash(entrypoint: str, **kwargs: Any) -> Any:
     Raises:
         RuntimeError: If the process exits with a non-zero return code.
     """
-    command = entrypoint.split(":", 1)[1].strip().format(**kwargs)
+    template = entrypoint.split(":", 1)[1].strip()
+    if re.fullmatch(r'\{\w+\}', template):
+        command = template.format(**kwargs)
+    else:
+        quoted = {k: shlex.quote(str(v)) for k, v in kwargs.items()}
+        command = template.format(**quoted)
     result = subprocess.run(command, shell=True, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {result.stderr}")
