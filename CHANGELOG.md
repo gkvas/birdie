@@ -1,3 +1,46 @@
+## [0.7.0] - 2026-07-27
+
+### Added
+- Skill permission enforcement: tools of skills that declare a
+  `## Permissions` section now require approval before executing, via a
+  pluggable `tool_approval_callback` (sync or async) returning
+  allow / always / deny. The CLI prompts interactively ("always" is
+  persisted per session in `approved_skills` and re-applied on load);
+  library users without a callback keep the previous allow-all behaviour.
+- Structured sub-agent outputs: replies of agents that declare
+  `output_params` are parsed as JSON (tolerating surrounding prose),
+  validated against the declared fields and types, and retried once with a
+  corrective follow-up on mismatch. Valid replies are returned as canonical
+  JSON on both invocation paths.
+- Token/cost accounting: per-model pricing table
+  (`birdie.core.pricing`), cumulative per-session token totals persisted in
+  the session JSON, and a `/cost` command showing usage with an estimated
+  cost (upper bound; cache discounts are not modelled).
+- History replay: resuming a session (startup with prior turns,
+  `/session switch`) replays the tail of the checkpointed conversation;
+  `/history [N]` prints the last N messages on demand.
+- `/skill reload` re-discovers SKILL.MD files from disk in place
+  (`DynamicAgent.reload_skills()`); `/skill new <name>` scaffolds a starter
+  SKILL.MD under `~/.birdie/skills/<name>/`.
+- Per-tool resilience settings in SKILL.MD tool blocks: `timeout:` bounds a
+  single execution (enforced via the bash/HTTP resolvers) and `retries:`
+  re-attempts failed executions; idempotent `http:get` entrypoints default
+  to one automatic retry.
+
+### Changed
+- Prompt-cache-friendly context layout: the system prompt now carries only
+  stable content (custom instructions, skill listing, always_inject
+  bodies); volatile per-turn context (loaded skill bodies, rolling
+  summary, LTM) is delivered as an ephemeral trailing message that is never
+  checkpointed. AnthropicProvider places `cache_control` breakpoints on the
+  last tool, the system block, and the last stable message block, so tools,
+  system prompt, and the growing conversation history are served from the
+  provider prompt cache across turns. Disable with `"prompt_cache": false`
+  in the provider config.
+- The `[loaded]` hint was removed from the skill listing (it was the one
+  volatile byte in the stable prefix); loaded skills are visible through
+  their injected "skill context" blocks instead.
+
 ## [0.6.0] - 2026-07-27
 
 ### Added
