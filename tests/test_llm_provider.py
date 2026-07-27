@@ -236,6 +236,7 @@ def _make_anthropic_provider(model: str) -> AnthropicProvider:
     p._temperature = 0.3
     p._max_tokens = 4096
     p._send_temperature = _anthropic_accepts_temperature(model)
+    p._prompt_cache = True
     p._client = MagicMock()
     p._async_client = MagicMock()
     return p
@@ -1482,3 +1483,46 @@ class TestRetryableErrors:
             pass
 
         assert _is_retryable_error(APIConnectionError("net down"))
+
+
+class TestAnthropicPromptCaching:
+    def test_cache_breakpoints_on_tools_system_and_last_stable_message(self):
+        p = _make_anthropic_provider("claude-opus-5")
+        tools = [
+            {"name": "a", "description": "d", "parameters": {"type": "object", "properties": {}}},
+            {"name": "b", "description": "d", "parameters": {"type": "object", "properties": {}}},
+        ]
+        ephemeral = HumanMessage(
+            content="<session_context>volatile</session_context>",
+            additional_kwargs={"birdie_ephemeral": True},
+        )
+        kw = p._build_kwargs(
+            [HumanMessage(content="hi"), AIMessage(content="hello"),
+             HumanMessage(content="do it"), ephemeral],
+            tools, "stable system", None, None,
+        )
+        # Tools: breakpoint on the last tool only
+        assert "cache_control" not in kw["tools"][0]
+        assert kw["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+        # System: block form with breakpoint
+        assert kw["system"][0]["text"] == "stable system"
+        assert kw["system"][0]["cache_control"] == {"type": "ephemeral"}
+        # Messages: breakpoint on the message BEFORE the ephemeral context
+        msgs = kw["messages"]
+        assert "cache_control" not in str(msgs[-1])  # volatile tail untouched
+        stable_last = msgs[-2]
+        assert stable_last["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_breakpoint_on_last_message_when_no_ephemeral_tail(self):
+        p = _make_anthropic_provider("claude-opus-5")
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, None, None)
+        assert kw["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_prompt_cache_disabled_leaves_plain_shapes(self):
+        p = _make_anthropic_provider("claude-opus-5")
+        p._prompt_cache = False
+        tools = [{"name": "a", "description": "d", "parameters": {"type": "object", "properties": {}}}]
+        kw = p._build_kwargs([HumanMessage(content="hi")], tools, "sys", None, None)
+        assert kw["system"] == "sys"
+        assert "cache_control" not in kw["tools"][0]
+        assert kw["messages"][-1]["content"] == "hi"

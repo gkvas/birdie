@@ -902,6 +902,35 @@ def _tools_to_anthropic(tools: list[NormalizedToolDef]) -> list[dict]:
     ]
 
 
+def _attach_message_cache_breakpoint(
+    anthropic_messages: list[dict],
+    lc_messages: list[BaseMessage],
+) -> None:
+    """Attach a cache_control breakpoint to the last *stable* message block.
+
+    The graph delivers per-turn volatile context (loaded skills, summary,
+    LTM) as a trailing message tagged ``birdie_ephemeral``; placing the
+    breakpoint on the message before it keeps the cached prefix identical
+    across turns, so conversation history is served from cache as it grows.
+    """
+    if not anthropic_messages:
+        return
+    target_idx = len(anthropic_messages) - 1
+    if lc_messages and lc_messages[-1].additional_kwargs.get("birdie_ephemeral"):
+        target_idx -= 1
+    if target_idx < 0:
+        return
+    msg = anthropic_messages[target_idx]
+    content = msg["content"]
+    if isinstance(content, str):
+        if not content:
+            return
+        content = [{"type": "text", "text": content}]
+        msg["content"] = content
+    if content and isinstance(content[-1], dict):
+        content[-1]["cache_control"] = {"type": "ephemeral"}
+
+
 # Model families that removed the sampling parameters (temperature / top_p /
 # top_k).  Sending `temperature` to any of these returns HTTP 400
 # ("`temperature` is deprecated for this model.").
@@ -949,6 +978,7 @@ class AnthropicProvider(LLMProvider):
         api_key: str | None = None,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        prompt_cache: bool = True,
         **kwargs: Any,
     ) -> None:
         try:
@@ -962,6 +992,9 @@ class AnthropicProvider(LLMProvider):
         self._model = model
         self._temperature = temperature
         self._send_temperature = _anthropic_accepts_temperature(model)
+        # Place cache_control breakpoints on tools, system, and the last
+        # stable message block (disable with "prompt_cache": false in config).
+        self._prompt_cache = prompt_cache
         # Anthropic requires max_tokens; use 4096 as a safe default
         self._max_tokens = max_tokens or 4096
 
@@ -990,17 +1023,30 @@ class AnthropicProvider(LLMProvider):
                 resolved_system = str(system_msgs[-1].content)
 
         non_system = [m for m in messages if not isinstance(m, SystemMessage)]
+        anthropic_messages = _lc_to_anthropic_messages(non_system)
+        if self._prompt_cache:
+            _attach_message_cache_breakpoint(anthropic_messages, non_system)
         kw: dict[str, Any] = {
             "model": self._model,
-            "messages": _lc_to_anthropic_messages(non_system),
+            "messages": anthropic_messages,
             "max_tokens": max_tokens if max_tokens is not None else self._max_tokens,
         }
         if self._send_temperature:
             kw["temperature"] = temperature if temperature is not None else self._temperature
         if resolved_system:
-            kw["system"] = resolved_system
+            if self._prompt_cache:
+                kw["system"] = [{
+                    "type": "text",
+                    "text": resolved_system,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            else:
+                kw["system"] = resolved_system
         if tools:
-            kw["tools"] = _tools_to_anthropic(tools)
+            anthropic_tools = _tools_to_anthropic(tools)
+            if self._prompt_cache and anthropic_tools:
+                anthropic_tools[-1]["cache_control"] = {"type": "ephemeral"}
+            kw["tools"] = anthropic_tools
         return kw
 
     def _drop_temperature(self, kw: dict) -> bool:

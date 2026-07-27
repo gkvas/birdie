@@ -175,3 +175,54 @@ async def test_no_file_no_skills_yields_none(tmp_path, monkeypatch):
     await agent.invoke("Hello")
 
     assert provider.last is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: stable prefix vs volatile session context
+# ---------------------------------------------------------------------------
+
+class MessagesCapturingProvider(CapturingProvider):
+    """Also records the message lists passed to achat()."""
+
+    def __init__(self):
+        super().__init__()
+        self.captured_messages: list[list] = []
+
+    async def achat(self, messages, tools=None, system_prompt=None, **kwargs) -> BaseMessage:
+        self.captured_messages.append(list(messages))
+        return await super().achat(messages, tools=tools, system_prompt=system_prompt, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_stable_across_turns_with_ltm(tmp_path, monkeypatch, skills_dir):
+    """LTM entries ride in an ephemeral message; the system prompt stays identical."""
+    monkeypatch.chdir(tmp_path)
+    provider = MessagesCapturingProvider()
+    agent = DynamicAgent(provider, skills_dir=str(skills_dir), skills_enabled=["TestSkill"])
+
+    await agent.invoke("first", thread_id="t", long_term_memory=["User likes tabs"])
+    await agent.invoke("second", thread_id="t", long_term_memory=["User likes tabs"])
+
+    assert provider.captured[0] == provider.captured[1]  # stable prefix
+    assert "User likes tabs" not in (provider.captured[-1] or "")
+    context_msgs = [
+        m for m in provider.captured_messages[-1]
+        if getattr(m, "additional_kwargs", {}).get("birdie_ephemeral")
+    ]
+    assert len(context_msgs) == 1
+    assert "User likes tabs" in context_msgs[0].content
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_context_not_checkpointed(tmp_path, monkeypatch, skills_dir):
+    """The session-context message never lands in the stored history."""
+    monkeypatch.chdir(tmp_path)
+    provider = MessagesCapturingProvider()
+    agent = DynamicAgent(provider, skills_dir=str(skills_dir), skills_enabled=["TestSkill"])
+
+    result = await agent.invoke("hello", thread_id="t2", long_term_memory=["a fact"])
+
+    assert all(
+        not getattr(m, "additional_kwargs", {}).get("birdie_ephemeral")
+        for m in result["messages"]
+    )

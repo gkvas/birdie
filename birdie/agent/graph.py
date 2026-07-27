@@ -409,8 +409,10 @@ def create_agent_graph(
     Build a LangGraph workflow that routes through the LLMProvider.
 
     On every agent-node invocation:
-      1. LTM is queried with the current user message and injected into the
-         system prompt (when ``ltm_factory`` is provided and a user_id is known).
+      1. LTM is queried with the current user message and injected into an
+         ephemeral session-context message (when ``ltm_factory`` is provided
+         and a user_id is known).  The system prompt carries only stable
+         content so provider prompt caches survive across turns.
       2. When the history exceeds the auto threshold, a background compaction
          task is started; its removals and rolling summary are applied on the
          first turn after it completes (the turn itself is never blocked).
@@ -500,8 +502,8 @@ def create_agent_graph(
                 return f"Skill '{skill_name}' has no loadable body."
             return (
                 f"Skill '{skill.name}' loaded. Its full instructions are now "
-                f"in the system prompt under '--- {skill.name} skill context ---' "
-                f"and stay available for {decay_turns} turns."
+                f"in the session context under '--- {skill.name} skill "
+                f"context ---' and stay available for {decay_turns} turns."
             )
 
         return StructuredTool.from_function(
@@ -528,41 +530,26 @@ def create_agent_graph(
             return text if text else None
         return None
 
-    def _build_system_prompt(
-        state: AgentState,
-        config: RunnableConfig,
-        ltm_context: str = "",
-        summary_override: Optional[str] = None,
-    ) -> str | None:
-        """Assemble the system prompt for this turn from in-memory skill objects.
+    def _build_system_prompt(config: RunnableConfig) -> str | None:
+        """Assemble the *stable* system prompt from in-memory skill objects.
 
-        Five tiers, joined with double newlines:
+        Only content that is byte-identical across turns belongs here, so the
+        provider prompt-cache prefix (tools + system) survives from turn to
+        turn.  Tiers, joined with double newlines:
 
         - **Tier 0** - custom instructions from ``.birdie/system_prompt.md``.
         - **Tier 1** - compact bullet list of all allowed skills; knowledge
-          skills show a ``[load: <name>]`` hint instead of trigger keywords.
-        - **Tier 2a** - full prose body for ``always_inject`` skills.
-        - **Tier 2b** - full prose body for progressively-loaded freetext skills
-          (those whose ``get_skill`` lease has not yet expired this session).
-        - **Tier 3** - rolling summary of compacted-away conversation segments.
-        - **Tier 4** - long-term memory: manual entries from config plus
-          semantically retrieved compaction entries (``ltm_context``).
+          skills show a ``[load: <name>]`` hint.
+        - **Tier 2** - full prose body for ``always_inject`` skills.
+
+        Per-turn volatile content (loaded skill bodies, the rolling summary,
+        LTM) is delivered separately - see ``_build_volatile_context``.
 
         Returns ``None`` when nothing would be included.
         """
         custom = _load_custom_system_prompt()
         allowed = _get_allowed(config)
         all_skills = [s for s in registry.list_skills() if s.name in allowed]
-        manual_ltm = config.get("configurable", {}).get("long_term_memory") or []
-
-        cfg = config.get("configurable", {})
-        decay_turns = cfg.get("skill_decay_turns", SKILL_DECAY_TURNS)
-        max_loaded = cfg.get("skill_max_loaded", SKILL_MAX_LOADED)
-        loaded_skill_names = _loaded_skills_from_history(
-            list(state["messages"]), allowed,
-            decay_turns=decay_turns, max_loaded=max_loaded,
-            aliases=_skill_alias_map(registry, allowed),
-        )
 
         parts: List[str] = []
 
@@ -577,10 +564,9 @@ def create_agent_graph(
             for skill in all_skills:
                 if skill.body and not skill.always_inject:
                     loc = skill.location or skill.name
-                    loaded_hint = " [loaded]" if skill.name in loaded_skill_names else ""
                     lines.append(
                         f"- **{skill.name}**: {skill.description}"
-                        f" [load: {loc}]{loaded_hint}"
+                        f" [load: {loc}]"
                     )
                     has_loadable = True
                 else:
@@ -598,15 +584,53 @@ def create_agent_graph(
                 if skill.always_inject and skill.body:
                     skill_block += f"\n\n--- {skill.name} instructions ---\n{skill.body}"
 
-            for skill in all_skills:
-                if skill.name in loaded_skill_names and skill.body and not skill.always_inject:
-                    skill_block += f"\n\n--- {skill.name} skill context ---\n{skill.body}"
-
             parts.append(skill_block)
 
-        # Tier 3: continuity bridge for compacted-away history.  The override
-        # carries a summary produced by a compaction earlier in this same turn
-        # (not yet visible in the checkpointed state).
+        return "\n\n".join(parts) or None
+
+    def _build_volatile_context(
+        state: AgentState,
+        config: RunnableConfig,
+        ltm_context: str = "",
+        summary_override: Optional[str] = None,
+    ) -> str:
+        """Assemble the per-turn volatile context.
+
+        This is everything that changes from turn to turn and would bust the
+        provider prompt cache if it lived in the system prompt:
+
+        - full prose body for progressively-loaded freetext skills (those
+          whose ``get_skill`` lease has not yet expired this session),
+        - the rolling summary of compacted-away conversation segments,
+        - long-term memory (manual entries plus retrieved compaction entries).
+
+        It is delivered as an ephemeral message appended after the real
+        conversation, so it invalidates nothing in the cached prefix.
+
+        Returns ``""`` when nothing would be included.
+        """
+        allowed = _get_allowed(config)
+        all_skills = [s for s in registry.list_skills() if s.name in allowed]
+        manual_ltm = config.get("configurable", {}).get("long_term_memory") or []
+
+        cfg = config.get("configurable", {})
+        decay_turns = cfg.get("skill_decay_turns", SKILL_DECAY_TURNS)
+        max_loaded = cfg.get("skill_max_loaded", SKILL_MAX_LOADED)
+        loaded_skill_names = _loaded_skills_from_history(
+            list(state["messages"]), allowed,
+            decay_turns=decay_turns, max_loaded=max_loaded,
+            aliases=_skill_alias_map(registry, allowed),
+        )
+
+        parts: List[str] = []
+
+        for skill in all_skills:
+            if skill.name in loaded_skill_names and skill.body and not skill.always_inject:
+                parts.append(f"--- {skill.name} skill context ---\n{skill.body}")
+
+        # Continuity bridge for compacted-away history.  The override carries
+        # a summary produced by a compaction earlier in this same turn (not
+        # yet visible in the checkpointed state).
         rolling_summary = (
             summary_override if summary_override is not None
             else state.get("summary", "")
@@ -617,7 +641,6 @@ def create_agent_graph(
                 f"{rolling_summary}"
             )
 
-        # Tier 4
         if manual_ltm or ltm_context:
             ltm_lines = ["--- Long-term memory ---"]
             if manual_ltm:
@@ -626,7 +649,7 @@ def create_agent_graph(
                 ltm_lines.append(ltm_context)
             parts.append("\n".join(ltm_lines))
 
-        return "\n\n".join(parts) or None
+        return "\n\n".join(parts)
 
     def _repair_dangling_tool_calls(
         messages: List[BaseMessage],
@@ -818,10 +841,27 @@ def create_agent_graph(
         else:
             normalized_tools = None
 
-        system_prompt = _build_system_prompt(
+        system_prompt = _build_system_prompt(config)
+
+        # Volatile per-turn context (loaded skills, summary, LTM) rides as an
+        # ephemeral trailing message so the cached prefix (tools + system +
+        # conversation history) stays byte-identical across turns.  It is
+        # never written to the checkpoint.
+        volatile_context = _build_volatile_context(
             state, config, ltm_context=ltm_context,
             summary_override=compaction_summary or None,
         )
+        if volatile_context:
+            clean_messages = clean_messages + [HumanMessage(
+                content=(
+                    "<session_context>\n"
+                    "Context provided by the system for this turn "
+                    "(not written by the user):\n\n"
+                    f"{volatile_context}\n"
+                    "</session_context>"
+                ),
+                additional_kwargs={"birdie_ephemeral": True},
+            )]
 
         response = await _achat_with_retry(
             provider,

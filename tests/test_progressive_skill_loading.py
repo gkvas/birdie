@@ -207,7 +207,7 @@ class TestGetSkillReturnValue:
         )
 
         call_count = 0
-        captured_system_prompts = []
+        captured_requests = []
 
         class _Provider:
             def supports_tools(self):
@@ -216,7 +216,7 @@ class TestGetSkillReturnValue:
             async def achat(self, messages, tools=None, system_prompt=None, **kw):
                 nonlocal call_count
                 call_count += 1
-                captured_system_prompts.append(system_prompt or "")
+                captured_requests.append((list(messages), system_prompt or ""))
                 if call_count == 1:
                     return AIMessage(
                         content="",
@@ -246,6 +246,14 @@ class TestGetSkillReturnValue:
         assert len(tool_msgs) == 1
         assert "SECRET BODY TEXT" not in tool_msgs[0].content
         assert "loaded" in tool_msgs[0].content.lower()
-        # The body must instead be injected into the system prompt of the
-        # follow-up model call.
-        assert "SECRET BODY TEXT" in captured_system_prompts[-1]
+        # The body must instead be injected via the ephemeral session-context
+        # message of the follow-up model call (not the system prompt, which
+        # stays stable for prompt caching).
+        last_messages, last_system = captured_requests[-1]
+        assert "SECRET BODY TEXT" not in last_system
+        context_msgs = [
+            m for m in last_messages
+            if m.additional_kwargs.get("birdie_ephemeral")
+        ]
+        assert len(context_msgs) == 1
+        assert "SECRET BODY TEXT" in context_msgs[0].content
