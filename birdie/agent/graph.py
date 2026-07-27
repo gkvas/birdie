@@ -623,7 +623,7 @@ def create_agent_graph(
 
     def _repair_dangling_tool_calls(
         messages: List[BaseMessage],
-    ) -> Tuple[List[ToolMessage], List[BaseMessage]]:
+    ) -> List[BaseMessage]:
         """Fix tool_use blocks that are not immediately followed by their tool_result.
 
         Two failure modes are handled:
@@ -651,7 +651,7 @@ def create_agent_graph(
             return False
 
         if not _needs_repair():
-            return [], messages
+            return messages
 
         # Build a lookup of existing ToolMessages by tool_call_id.
         tm_by_id: dict[str, ToolMessage] = {
@@ -683,7 +683,7 @@ def create_agent_graph(
                             name=tc["name"],
                         ))
 
-        return [], patched
+        return patched
 
     async def call_model(state: AgentState, config: RunnableConfig) -> dict:
         all_messages = list(state["messages"])
@@ -760,7 +760,7 @@ def create_agent_graph(
         )
 
         # Repair any dangling tool calls within the context window.
-        repair_msgs, clean_messages = _repair_dangling_tool_calls(context_msgs)
+        clean_messages = _repair_dangling_tool_calls(context_msgs)
 
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
@@ -823,7 +823,7 @@ def create_agent_graph(
             system_prompt=system_prompt,
         )
 
-        result: dict = {"messages": compaction_removes + repair_msgs + [response]}
+        result: dict = {"messages": compaction_removes + [response]}
         if compaction_summary:
             result["summary"] = compaction_summary
         return result
