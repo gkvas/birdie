@@ -393,7 +393,9 @@ def create_agent_graph(
     On every agent-node invocation:
       1. LTM is queried with the current user message and injected into the
          system prompt (when ``ltm_factory`` is provided and a user_id is known).
-      2. The full message history is compacted when it exceeds the auto threshold.
+      2. When the history exceeds the auto threshold, a background compaction
+         task is started; its removals and rolling summary are applied on the
+         first turn after it completes (the turn itself is never blocked).
       3. The full non-compacted history is sent to the LLM, starting from
          the first HumanMessage (required by some providers, e.g. Mistral).
       4. Any dangling tool calls (interrupted prior turn) are repaired.
@@ -408,6 +410,11 @@ def create_agent_graph(
     # LTM store cache: one LTMStore instance per user_id for the lifetime of
     # this agent graph so we avoid reloading the JSON file on every turn.
     _ltm_cache: dict[str, LTMStore] = {}
+
+    # In-flight background auto-compaction tasks, keyed by thread_id.  The
+    # summarisation LLM call runs concurrently with the user's turn; its
+    # result is applied on the first call_model invocation after it finishes.
+    _compaction_tasks: dict[str, asyncio.Task] = {}
 
     def _get_ltm_store(user_id: str) -> Optional[LTMStore]:
         if not ltm_factory or not user_id:
@@ -681,21 +688,40 @@ def create_agent_graph(
                 if entries:
                     ltm_context = ltm_store.format_for_prompt(entries)
 
-        # Compact history when it has grown beyond the auto threshold.
+        # Auto-compaction runs as a background task so its extra LLM round
+        # trip never blocks the current turn.  A finished task's removals and
+        # summary are applied here on the next turn.
         compaction_removes: List[BaseMessage] = []
         compaction_summary = ""
-        if len(all_messages) >= min_messages_auto + compression_window_size:
-            compaction_summary, compaction_removes = await compact_history(
-                all_messages, provider, ltm_store=ltm_store,
+        thread = _session_id(config)
+        compaction_task = _compaction_tasks.get(thread)
+        if compaction_task is not None and compaction_task.done():
+            del _compaction_tasks[thread]
+            try:
+                compaction_summary, removes = compaction_task.result()
+            except Exception as exc:
+                log.warning("Background compaction failed: %s", exc)
+            else:
+                # Apply only removals whose messages still exist - a forced
+                # /compact may have already deleted them in the meantime.
+                present_ids = {m.id for m in all_messages}
+                compaction_removes = [r for r in removes if r.id in present_ids]
+                if compaction_removes:
+                    remove_ids = {r.id for r in compaction_removes}
+                    all_messages = [
+                        m for m in all_messages if m.id not in remove_ids
+                    ]
+        elif (
+            compaction_task is None
+            and len(all_messages) >= min_messages_auto + compression_window_size
+        ):
+            _compaction_tasks[thread] = asyncio.create_task(compact_history(
+                list(all_messages), provider, ltm_store=ltm_store,
                 min_messages_auto=min_messages_auto,
                 min_messages_forced=min_messages_forced,
                 compression_window_size=compression_window_size,
                 prior_summary=state.get("summary", ""),
-            )
-            if compaction_removes:
-                # Remove compacted messages from the local working copy.
-                remove_ids = {r.id for r in compaction_removes}
-                all_messages = [m for m in all_messages if m.id not in remove_ids]
+            ))
 
         # Send the full non-compacted history to the LLM.  Compaction already
         # bounds the checkpoint size; trimming further would discard context

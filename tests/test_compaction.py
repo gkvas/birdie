@@ -339,3 +339,50 @@ async def test_compact_history_no_prior_summary_marker_when_absent():
     await compact_history(msgs, provider)
     prompt_text = provider.calls[0][0].content
     assert "already-compacted" not in prompt_text
+
+
+# ---------------------------------------------------------------------------
+# Background auto-compaction through the graph
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_auto_compaction_runs_in_background_and_applies_next_turn():
+    import asyncio
+    from birdie.agent.run import DynamicAgent
+    from birdie.core.llm_provider import LLMProvider
+
+    class _ChatProvider:
+        """Answers normal turns with 'ok' and compaction prompts with JSON."""
+
+        def supports_tools(self):
+            return False
+
+        async def achat(self, messages, tools=None, system_prompt=None, **kw):
+            text = str(messages[0].content) if messages else ""
+            if "memory compaction system" in text:
+                return AIMessage(content=_MockProvider._DEFAULT_JSON)
+            return AIMessage(content="ok")
+
+    LLMProvider.register(_ChatProvider)
+
+    agent = DynamicAgent(
+        _ChatProvider(),
+        min_messages_auto=4,
+        compression_window_size=6,
+    )
+
+    # Trigger threshold: 4 + 6 = 10 messages. Each turn adds 2.
+    for i in range(6):
+        result = await agent.invoke(f"turn {i}", thread_id="bg")
+
+    # Turn 6 saw >= 10 messages and started the background task; no removal
+    # happened inside that same turn.
+    assert len(result["messages"]) == 12
+
+    # Let the background task complete, then run one more turn.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    result = await agent.invoke("turn 6", thread_id="bg")
+
+    assert len(result["messages"]) < 14  # compacted prefix was removed
+    assert result.get("summary") == "Summary of earlier conversation."
