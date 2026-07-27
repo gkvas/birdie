@@ -199,10 +199,17 @@ class SessionManager:
         user_dir = self._user_dir(user_id)
         if not user_dir.exists():
             return []
+
+        def _key(session_id: str):
+            # IDs look like YYYY-MM-DD_N; sort N numerically so _10 > _2.
+            date_part, _, suffix = session_id.rpartition("_")
+            n = int(suffix) if suffix.isdigit() else 0
+            return (date_part, n, session_id)
+
         # Exclude the memory file and checkpoints DB
         return sorted(
-            p.stem for p in user_dir.glob("*.json")
-            if p.stem != "memory"
+            (p.stem for p in user_dir.glob("*.json") if p.stem != "memory"),
+            key=_key,
         )
 
     def delete(self, user_id: str, session_id: str) -> None:

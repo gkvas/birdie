@@ -264,3 +264,15 @@ class TestUserMemoryPersistence:
 
         mb = manager.load_user_memory("bob")
         assert mb.entries == []
+
+
+class TestSessionListOrdering:
+    def test_numeric_suffix_sorts_after_single_digits(self, tmp_path):
+        mgr = SessionManager(sessions_root=tmp_path)
+        user_dir = tmp_path / "alice"
+        user_dir.mkdir(parents=True)
+        for sid in ["2026-07-27_2", "2026-07-27_10", "2026-07-27_1"]:
+            (user_dir / f"{sid}.json").write_text("{}")
+        assert mgr.list_sessions("alice") == [
+            "2026-07-27_1", "2026-07-27_2", "2026-07-27_10",
+        ]

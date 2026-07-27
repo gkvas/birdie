@@ -399,10 +399,22 @@ def _openai_msg_to_lc(raw: Any, usage: Any = None) -> AIMessage:
     for tc in raw.get("tool_calls") or []:
         fn = tc.get("function", tc)  # handle both nested and flat shapes
         args = fn.get("arguments", "{}")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                # Malformed function arguments from the model: degrade to an
+                # empty call so the tool layer reports a validation error the
+                # model can recover from, instead of crashing the turn.
+                log.warning(
+                    "Discarding malformed tool-call arguments for '%s': %.200s",
+                    fn.get("name", ""), args,
+                )
+                args = {}
         tool_calls.append({
             "id": tc.get("id", ""),
             "name": fn.get("name", ""),
-            "args": json.loads(args) if isinstance(args, str) else args,
+            "args": args,
             "type": "tool_call",
         })
 
@@ -822,10 +834,17 @@ def _lc_to_anthropic_messages(messages: list[BaseMessage]) -> list[dict]:
             blocks: list[dict] = []
             while i < len(messages) and isinstance(messages[i], ToolMessage):
                 tm = messages[i]
+                content = str(tm.content)
+                if len(content) > _MAX_TOOL_CONTENT_CHARS:
+                    dropped = len(content) - _MAX_TOOL_CONTENT_CHARS
+                    content = (
+                        content[:_MAX_TOOL_CONTENT_CHARS]
+                        + f"\n[...{dropped} characters truncated]"
+                    )
                 blocks.append({
                     "type": "tool_result",
                     "tool_use_id": tm.tool_call_id,
-                    "content": str(tm.content),
+                    "content": content,
                 })
                 i += 1
             result.append({"role": "user", "content": blocks})

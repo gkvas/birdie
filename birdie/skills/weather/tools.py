@@ -25,6 +25,7 @@ def get_weather(city: str) -> Any:
     response = requests.get(
         "https://api.weatherapi.com/v1/current.json",
         params={"key": _api_key(), "q": city},
+        timeout=30,
     )
     response.raise_for_status()
     return response.json()
@@ -35,6 +36,7 @@ def get_forecast(city: str, days: int = 3) -> Any:
     response = requests.get(
         "https://api.weatherapi.com/v1/forecast.json",
         params={"key": _api_key(), "q": city, "days": days},
+        timeout=30,
     )
     response.raise_for_status()
     return response.json()

@@ -27,6 +27,10 @@ import requests
 import json
 from typing import Callable, Any
 
+# Timeout (seconds) for HTTP entrypoints so a hung endpoint cannot stall the
+# agent turn indefinitely.
+HTTP_TIMEOUT = 30.0
+
 
 def resolve_http_get(entrypoint: str, **kwargs: Any) -> Any:
     """Execute an ``http:get`` entrypoint, passing kwargs as query parameters.
@@ -43,7 +47,7 @@ def resolve_http_get(entrypoint: str, **kwargs: Any) -> Any:
     """
     url = entrypoint.split(" ", 1)[1]
     params = {k: v for k, v in kwargs.items() if v is not None}
-    response = requests.get(url, params=params)
+    response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
@@ -63,7 +67,7 @@ def resolve_http_post(entrypoint: str, **kwargs: Any) -> Any:
     """
     url = entrypoint.split(" ", 1)[1]
     data = {k: v for k, v in kwargs.items() if v is not None}
-    response = requests.post(url, json=data)
+    response = requests.post(url, json=data, timeout=HTTP_TIMEOUT)
     response.raise_for_status()
     return response.json()
 

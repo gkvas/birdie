@@ -1414,3 +1414,29 @@ class TestProviderConfigSecrets:
         data = json.loads(cfg.to_json())
         assert "api_key" not in data
         assert data["model"] == "gpt-4o"
+
+
+class TestMalformedToolArgs:
+    def test_malformed_arguments_degrade_to_empty_args(self):
+        raw = {
+            "content": "",
+            "tool_calls": [{
+                "id": "tc1", "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": broken'},
+            }],
+        }
+        msg = _openai_msg_to_lc(raw)
+        assert msg.tool_calls[0]["name"] == "get_weather"
+        assert msg.tool_calls[0]["args"] == {}
+
+
+class TestAnthropicToolResultTruncation:
+    def test_oversized_tool_result_truncated(self):
+        from birdie.core.llm_provider import _MAX_TOOL_CONTENT_CHARS
+        big = "x" * (_MAX_TOOL_CONTENT_CHARS + 500)
+        result = _lc_to_anthropic_messages(
+            [ToolMessage(content=big, tool_call_id="tc1")]
+        )
+        block = result[0]["content"][0]
+        assert len(block["content"]) < len(big)
+        assert "characters truncated" in block["content"]
