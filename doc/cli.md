@@ -124,6 +124,26 @@ The `model` field is the binary name to spawn. Birdie starts it as a child proce
 | `max_tokens` | int | - | Max completion tokens |
 | `api_version` | string | `2024-02-01` | Azure OpenAI API version |
 | `timeout` | float | `120.0` | Request timeout in seconds (Mistral) |
+| `prompt_cache` | bool | `true` | Anthropic only: place `cache_control` breakpoints on tools, system prompt, and conversation history |
+
+### Agent-level config fields
+
+These fields are extracted from the same JSON config before it is forwarded to the vendor SDK, so they are safe to mix with the provider fields above:
+
+| Field | Default | Description |
+|---|---|---|
+| `skills_enabled` | `[]` | Skill names granted to every session |
+| `agents_enabled` | `[]` | Agent names granted to every session |
+| `tool_output_cap` | `20000` | Max characters of tool output stored in history per call |
+| `skill_decay_turns` | `5` | Human turns a loaded knowledge skill stays injected |
+| `skill_max_loaded` | `3` | Max simultaneously loaded knowledge skills (LRU) |
+| `min_messages_auto` | `20` | Messages retained after automatic compaction |
+| `min_messages_forced` | `4` | Messages retained after `/compact` |
+| `compression_window_size` | `60` | Max oldest messages compressed per run |
+| `compaction_token_threshold` | - | Also compact when the last call used at least this many input tokens |
+| `ltm_max_age_days` | `90` | Drop LTM entries older than this |
+| `ltm_max_entries` | `100` | Keep at most this many LTM entries |
+| `ltm_min_score` | `0.05` | Minimum similarity for LTM retrieval |
 
 ---
 
@@ -134,7 +154,10 @@ The `model` field is the binary name to spawn. Birdie starts it as a child proce
 | `/help` | Show available commands |
 | `/remember <text>` | Save a note to long-term memory |
 | `/compact` | Force-compact the current session's history into long-term memory now |
+| `/cost` | Show token usage and estimated cost for this session |
+| `/history [N]` | Replay the last N messages of this session (default 10) |
 | `/info` | Show user, session ID, turn count, and provider |
+| `/cd <path>` | Change working directory (Tab cycles directory completions) |
 | `/clear` | Clear the screen |
 | `/quit` | Exit |
 | **Tools** | |
@@ -142,10 +165,13 @@ The `model` field is the binary name to spawn. Birdie starts it as a child proce
 | `/tool output full` | Show complete tool output |
 | `/tool output short` | Show first 1000 characters + remaining count (default) |
 | `/tool output off` | Show only line count, no content |
+| `/tool cap <N>` | Cap tool output stored in history at N characters (`off` disables) |
 | **Skills** | |
 | `/skill list` | List all loaded skills with enabled/disabled status |
 | `/skill enable <name>` | Enable a skill (persisted to session). Suggests closest match on miss. |
 | `/skill disable <name>` | Disable a skill (persisted to session). |
+| `/skill reload` | Re-discover skills from disk (picks up SKILL.MD edits) |
+| `/skill new <name>` | Scaffold `~/.birdie/skills/<name>/SKILL.MD` from a template |
 | **Agents** | |
 | `/agent list` | List all loaded agents with enabled/disabled status |
 | `/agent enable <name>` | Enable a sub-agent (persisted to session). Suggests closest match on miss. |
@@ -172,6 +198,7 @@ The `model` field is the binary name to spawn. Birdie starts it as a child proce
 |---|---|
 | `Enter` | Submit message |
 | `Ctrl+J` | Insert newline (multi-line message) |
+| `Tab` (after `/cd `) | Cycle through directory completions |
 | `Ctrl+C` (non-empty input) | Clear the current input line |
 | `Ctrl+C` (empty input, first press) | Show hint: "Press Ctrl+C again to exit" |
 | `Ctrl+C` (empty input, second press) | Exit |
@@ -182,14 +209,29 @@ The `model` field is the binary name to spawn. Birdie starts it as a child proce
 ## Status bar
 
 ```
- anthropic · claude-sonnet-4-6   │   session: 2026-04-29_1   │   ctx: 1,234 tok   │   spent: ↑5,678  ↓1,234 tok
+ anthropic · claude-sonnet-4-6   │   ~/projects/demo   │   session: 2026-04-29_1   │   ctx: 1,234 tok   │   spent: ↑5,678  ↓1,234 tok
 ```
 
 | Field | Meaning |
 |---|---|
+| second column | Current working directory (changed with `/cd`) |
 | `session` | Active session ID |
 | `ctx` | Input tokens in the most recent API call |
 | `↑` / `↓` | Cumulative input / output tokens this process run |
+
+---
+
+## Permission prompts
+
+Tools that belong to a skill with a `## Permissions` section require approval before they run. The CLI pauses the turn and asks:
+
+```
+Skill MySkill requests permissions: network, filesystem
+Tool call: fetch_data(url='https://example.com')
+Allow? [y]es once / [a]lways this session / [N]o:
+```
+
+`a` stores a standing grant in the session file (`approved_skills`), so the skill is not asked about again when the session is resumed. `n` (or Enter) denies the call; the model receives an error tool result and can adjust.
 
 ---
 
@@ -224,14 +266,14 @@ The header line (`[CVulnAnalyst#d67c]`) is at the same indent as regular tool ou
 
 ### How automatic compaction works
 
-Birdie stores every message in a SQLite checkpoint (`~/.birdie/sessions/<user>/checkpoints.db`). As sessions grow long, the checkpoint accumulates messages that are loaded and forwarded to the LLM on every turn, increasing both cost and latency. Automatic compaction fires when the stored history reaches **100 messages** (configurable via `max_messages`) and silently:
+Birdie stores every message in a SQLite checkpoint (`~/.birdie/sessions/<user>/checkpoints.db`). As sessions grow long, the checkpoint accumulates messages that are loaded and forwarded to the LLM on every turn, increasing both cost and latency. Automatic compaction fires when the stored history reaches **80 messages** (`min_messages_auto` + `compression_window_size`, both configurable) or, when `compaction_token_threshold` is set, when the last model call consumed at least that many input tokens. It runs as a **background task** so the current turn is never blocked; the results are applied on the first turn after it finishes:
 
-1. Finds the largest group of complete turns at the start of the history that can be summarised without leaving fewer than 40 messages behind.
+1. Finds the largest group of complete turns at the start of the history that can be summarised while leaving at least `min_messages_auto` (default 20) messages behind.
 2. Sends that group to the LLM with a structured prompt that extracts six categories: a narrative summary, specific facts, user preferences, world knowledge, tool outcomes, and open tasks.
-3. Stores the result as a new entry in `~/.birdie/ltm/<user>.json`.
+3. Stores the result as a new entry in `~/.birdie/ltm/<user>.json`, and keeps the narrative summary with the session as a rolling continuity bridge that is injected into the model's context every turn (later compactions fold the previous summary in).
 4. Permanently removes the summarised messages from the checkpoint via LangGraph's `RemoveMessage` mechanism.
 
-The result is that very long sessions stay responsive and cheap while key information is preserved in the LTM store, where it can be retrieved by semantic similarity on future turns.
+The result is that very long sessions stay responsive and cheap while key information is preserved both in the session (rolling summary) and in the LTM store, where it can be retrieved by semantic similarity on future turns.
 
 ### `/compact` - manual compaction
 
@@ -280,13 +322,16 @@ The LTM file for your user is at `~/.birdie/ltm/<user>.json`. It is plain JSON a
 
 ### Configuring compaction thresholds
 
-The three thresholds that control when and how much is compacted can be set in the provider JSON config file (see [Provider configuration](#provider-configuration)):
+The thresholds that control when and how much is compacted can be set in the provider JSON config file (see [Provider configuration](#provider-configuration)):
 
 | Field | Default | Description |
 |---|---|---|
-| `min_messages` | `20` | Minimum messages to keep in the checkpoint after any compaction run |
-| `max_messages` | `100` | Trigger automatic compaction when stored history reaches this count |
-| `compression_window` | `60` | Maximum number of oldest messages to compress per run |
+| `min_messages_auto` | `20` | Minimum messages to keep in the checkpoint after automatic compaction |
+| `min_messages_forced` | `4` | Minimum messages to keep after a forced `/compact` |
+| `compression_window_size` | `60` | Maximum number of oldest messages to compress per run |
+| `compaction_token_threshold` | - | Also trigger compaction when the last model call consumed at least this many input tokens (disabled when unset) |
+
+Automatic compaction triggers when the history reaches `min_messages_auto + compression_window_size` messages (80 by default), or when the token threshold fires.
 
 Example - a config that compacts more aggressively:
 
@@ -294,9 +339,9 @@ Example - a config that compacts more aggressively:
 {
   "vendor": "anthropic",
   "model": "claude-sonnet-4-6",
-  "min_messages": 10,
-  "max_messages": 40,
-  "compression_window": 25
+  "min_messages_auto": 10,
+  "compression_window_size": 25,
+  "compaction_token_threshold": 60000
 }
 ```
 
