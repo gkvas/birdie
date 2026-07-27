@@ -1,3 +1,76 @@
+## [0.6.0] - 2026-07-27
+
+### Added
+- `enabled_by_default` frontmatter in SKILL.MD and AGENT.MD is now honoured:
+  flagged skills/agents are granted to every session alongside the
+  `skills_enabled` / `agents_enabled` config lists (previously the field was
+  parsed by neither loader and silently ignored).
+- Sub-agent `output_params` (AGENT.MD `## Output` section) are rendered into
+  the sub-agent prompt as explicit JSON output-format instructions on both
+  invocation paths (previously parsed but unused).
+- New agent-level config key `compaction_token_threshold`: additionally
+  triggers auto-compaction when the last model call's reported input tokens
+  reach the threshold, independent of message count.
+
+### Changed
+- Auto-compaction runs as a background task per thread; its removals and
+  summary are applied on the first turn after it completes, so the triggering
+  turn no longer pays an extra LLM round trip.
+- The compaction summary is kept as a rolling `summary` state channel and
+  injected into the system prompt every turn ("Earlier conversation
+  (compacted)"), so continuity survives even without an LTM store; `/compact`
+  writes it back to the checkpoint and later compactions fold it in.
+- `get_skill` returns a short acknowledgment instead of the skill body; the
+  body reaches the model solely via the system-prompt lease, so it is no
+  longer billed twice for the whole decay window.
+- `SkillRegistry.list_tools` returns tools in deterministic registration
+  order (stable prompts, provider prompt-cache friendly).
+- Sub-agent `DynamicAgent` instances are cached across invocations (skills
+  and agents are no longer re-parsed from disk per call); each run uses a
+  unique thread id so histories never bleed.
+- MCP tools are cached per server-name set instead of a single slot, so
+  sessions with different allowed skills no longer evict each other.
+- The Anthropic model catalog in `list_models` reflects the current
+  generation (Fable 5, Opus 5/4.8/4.7, Sonnet 5/4.6 at 1M context tokens,
+  Haiku 4.5 at 200K); transient 500/502/503/504 and connection errors are
+  retried with backoff alongside 429/529.
+- The deprecated trigger-matching API (`find_skills_by_trigger`) was removed;
+  the `triggers` frontmatter field remains parseable for backward
+  compatibility. `Skill.permissions` is explicitly documented as
+  informational-only.
+
+### Fixed
+- The documented config keys `skill_decay_turns` and `skill_max_loaded` are
+  now extracted from the provider config and forwarded to the graph;
+  previously they were silently ignored and leaked into vendor SDK kwargs.
+- `get_skill` accepts a skill's `location` as well as its name, matching the
+  `[load: <location>]` hint shown in the system prompt; skills with a custom
+  location were previously impossible to load.
+- OpenAI/Mistral history conversion no longer drops non-empty assistant text
+  when tool calls are present (only empty content is omitted).
+- `bash:` entrypoint arguments are shell-quoted with `shlex.quote`, closing a
+  shell-injection hole in templated tools like `bash:cat {path}`; a template
+  consisting of a single placeholder (raw-shell tools like `bash:{command}`)
+  still receives the full command string.
+- `api_key` is never serialised into `BIRDIE_AGENTS_JSON` (the MCP subprocess
+  inherits the vendor environment variable instead), and
+  `ProviderConfig.to_json` now honours its documented api_key exclusion.
+- `DynamicAgent` no longer implicitly loads a `skills/` directory from the
+  current working directory (and no longer puts it on `sys.path`);
+  `skills_dir` defaults to None, meaning user + bundled directories only.
+- Agent directories load with first-wins precedence matching skills (explicit
+  `agents_dir` before `~/.birdie/agents`); a broken AGENT.MD is skipped with
+  a warning instead of crashing startup.
+- Session IDs sort numerically by suffix (`_10` after `_2`); `/session
+  delete` also removes the thread's history from `checkpoints.db`.
+- HTTP entrypoints and the weather skill send requests with a timeout.
+- Malformed tool-call argument JSON from a model degrades to an empty-args
+  call (recoverable validation error) instead of crashing the turn; the
+  Anthropic history path truncates oversized tool results like the OpenAI
+  path.
+- `LTMStore.add` re-reads the store file before appending so concurrent
+  sessions of the same user do not clobber each other's entries.
+
 ## [0.5.4] - 2026-07-27
 
 ### Fixed
