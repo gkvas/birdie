@@ -361,9 +361,16 @@ def _loaded_skills_from_history(
     if aliases is None:
         aliases = {name: name for name in allowed}
 
-    # Find the most recent AIMessage index at which get_skill was called per skill.
+    # Single pass: record the most recent get_skill call per skill and build
+    # a running human-turn count so decay can be computed without re-scanning
+    # the history per skill.
     last_load_idx: dict[str, int] = {}
+    humans_before: list[int] = []  # humans_before[i] = HumanMessages in messages[:i+1]
+    human_count = 0
     for i, msg in enumerate(messages):
+        if isinstance(msg, HumanMessage):
+            human_count += 1
+        humans_before.append(human_count)
         if isinstance(msg, AIMessage):
             for tc in getattr(msg, "tool_calls", []):
                 if tc["name"] == "get_skill":
@@ -374,10 +381,7 @@ def _loaded_skills_from_history(
     # Keep only skills whose load is within the decay window.
     active: dict[str, int] = {}
     for skill_name, load_idx in last_load_idx.items():
-        turns_since = sum(
-            1 for j, m in enumerate(messages)
-            if j > load_idx and isinstance(m, HumanMessage)
-        )
+        turns_since = human_count - humans_before[load_idx]
         if turns_since <= decay_turns:
             active[skill_name] = load_idx
 
