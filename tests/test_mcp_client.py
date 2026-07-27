@@ -8,7 +8,8 @@ import pytest
 from pydantic import ValidationError
 
 from birdie.core.models import MCPServerConfig
-from birdie.core.mcp_client import _to_adapter_config
+from birdie.core.mcp_client import MCPClientManager, _to_adapter_config
+from unittest.mock import MagicMock
 
 
 def test_stdio_config():
@@ -82,3 +83,32 @@ def test_remote_transport_requires_url():
         MCPServerConfig(transport="sse")
     with pytest.raises(ValidationError):
         MCPServerConfig(transport="streamable_http")
+
+
+@pytest.mark.asyncio
+async def test_get_tools_caches_per_allowed_set(monkeypatch):
+    """Alternating allowed-sets must each hit the client only once."""
+    mgr = MCPClientManager()
+    mgr.register_server("a", MCPServerConfig(command="srv-a"))
+    mgr.register_server("b", MCPServerConfig(command="srv-b"))
+
+    created = []
+
+    class _FakeClient:
+        def __init__(self, configs):
+            created.append(frozenset(configs))
+            self._configs = configs
+
+        async def get_tools(self):
+            return [MagicMock(name=f"tool-{n}") for n in sorted(self._configs)]
+
+    import langchain_mcp_adapters.client as client_mod
+    monkeypatch.setattr(client_mod, "MultiServerMCPClient", _FakeClient)
+
+    tools_a1 = await mgr.get_tools({"a"})
+    tools_ab = await mgr.get_tools({"a", "b"})
+    tools_a2 = await mgr.get_tools({"a"})   # must be served from cache
+
+    assert created == [frozenset({"a"}), frozenset({"a", "b"})]
+    assert tools_a1 is tools_a2
+    assert len(tools_ab) == 2

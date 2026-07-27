@@ -87,18 +87,18 @@ class MCPClientManager:
 
     def __init__(self) -> None:
         self._configs: dict[str, dict] = {}
-        self._cached_tools: Optional[List[BaseTool]] = None
-        self._cache_key: Optional[frozenset] = None
+        # One cache entry per distinct server-name set, so sessions with
+        # different allowed skills don't evict each other's tools.
+        self._tools_cache: dict[frozenset, List[BaseTool]] = {}
 
     def register_server(self, name: str, config: MCPServerConfig) -> None:
         """Register an MCP server under *name*.  Call before any ``get_tools()``."""
-        if self._cached_tools is not None:
+        if self._tools_cache:
             log.warning(
                 "MCPClientManager: registering server '%s' after tools were already "
                 "cached - cache cleared", name
             )
-            self._cached_tools = None
-            self._cache_key = None
+            self._tools_cache.clear()
         self._configs[name] = _to_adapter_config(name, config)
         log.debug("Registered MCP server '%s' (%s)", name, config.transport)
 
@@ -112,8 +112,9 @@ class MCPClientManager:
         Only servers whose skill name appears in *allowed* are contacted.
         Pass ``None`` to include all registered servers.
 
-        Results are cached per allowed-set so repeated calls within the same
-        turn are free.  The cache is invalidated when a server is registered.
+        Results are cached per server-name set, so repeated calls within a
+        turn and alternating allowed-sets across sessions are both served
+        from cache.  The cache is invalidated when a server is registered.
         """
         configs = (
             {k: v for k, v in self._configs.items() if k in allowed}
@@ -124,8 +125,9 @@ class MCPClientManager:
             return []
 
         cache_key = frozenset(configs)
-        if self._cached_tools is not None and cache_key == self._cache_key:
-            return self._cached_tools
+        cached = self._tools_cache.get(cache_key)
+        if cached is not None:
+            return cached
 
         try:
             from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -137,8 +139,7 @@ class MCPClientManager:
 
         client = MultiServerMCPClient(configs)
         tools = await client.get_tools()
-        self._cached_tools = tools
-        self._cache_key = cache_key
+        self._tools_cache[cache_key] = tools
         log.debug(
             "MCP: loaded %d tool(s) from %d server(s)",
             len(tools), len(configs),
