@@ -1,3 +1,17 @@
+## [0.5.4] - 2026-07-27
+
+### Fixed
+- The Anthropic provider no longer sends `temperature` to model families that
+  removed the sampling parameters (Opus 4.7/4.8, Opus 5, Sonnet 5, Fable 5,
+  Mythos). Those models reject the parameter with HTTP 400
+  (`` `temperature` is deprecated for this model. ``), which made every request
+  fail. The provider now decides up front from the model name whether to send
+  `temperature`, and if the API rejects it at runtime anyway the parameter is
+  dropped and the request retried once - the provider remembers the outcome so
+  later calls skip it entirely. Applies to `chat`, `achat`, `stream_chat`, and
+  `astream_chat`; a streaming retry is only attempted when nothing has been
+  yielded yet. Documented the behaviour in `doc/cli.md`.
+
 ## [0.5.3] - 2026-06-21
 
 ### Fixed

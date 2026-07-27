@@ -24,6 +24,9 @@ from birdie.core.llm_provider import (
     _anthropic_response_to_lc,
     _tools_to_openai_functions,
     _tools_to_anthropic,
+    _anthropic_accepts_temperature,
+    _is_temperature_rejection,
+    AnthropicProvider,
     skilltool_to_normalized_def,
     get_llm_provider,
     get_llm_provider_from_json,
@@ -203,6 +206,88 @@ class TestAnthropicResponseConversion:
         assert len(msg.tool_calls) == 1
         assert msg.tool_calls[0]["name"] == "get_weather"
         assert msg.tool_calls[0]["args"] == {"city": "Graz"}
+
+
+# ---------------------------------------------------------------------------
+# Anthropic temperature handling
+# ---------------------------------------------------------------------------
+
+def _make_anthropic_provider(model: str) -> AnthropicProvider:
+    """Build an AnthropicProvider without touching the anthropic SDK."""
+    p = AnthropicProvider.__new__(AnthropicProvider)
+    p._model = model
+    p._temperature = 0.3
+    p._max_tokens = 4096
+    p._send_temperature = _anthropic_accepts_temperature(model)
+    p._client = MagicMock()
+    p._async_client = MagicMock()
+    return p
+
+
+def _anthropic_400(message: str) -> Exception:
+    exc = Exception(f"Error code: 400 - {message}")
+    exc.status_code = 400
+    return exc
+
+
+class TestAnthropicTemperature:
+    @pytest.mark.parametrize("model", ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"])
+    def test_older_models_accept_temperature(self, model):
+        assert _anthropic_accepts_temperature(model) is True
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-opus-4-7",
+            "claude-opus-4-8",
+            "claude-sonnet-5",
+            "anthropic.claude-opus-5",
+        ],
+    )
+    def test_new_models_reject_temperature(self, model):
+        assert _anthropic_accepts_temperature(model) is False
+
+    def test_temperature_sent_for_supported_model(self):
+        p = _make_anthropic_provider("claude-sonnet-4-6")
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, None, None)
+        assert kw["temperature"] == 0.3
+
+    def test_temperature_omitted_for_unsupported_model(self):
+        p = _make_anthropic_provider("claude-fable-5")
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, 0.7, None)
+        assert "temperature" not in kw
+
+    def test_chat_retries_without_temperature_on_400(self):
+        p = _make_anthropic_provider("claude-sonnet-4-6")
+        ok = MagicMock()
+        ok.content = [MagicMock(type="text", text="Hello")]
+        p._client.messages.create.side_effect = [
+            _anthropic_400("`temperature` is deprecated for this model."),
+            ok,
+        ]
+
+        msg = p.chat([HumanMessage(content="hi")])
+
+        assert "Hello" in msg.content
+        assert p._client.messages.create.call_count == 2
+        assert "temperature" in p._client.messages.create.call_args_list[0].kwargs
+        assert "temperature" not in p._client.messages.create.call_args_list[1].kwargs
+        # The provider remembers, so later calls skip temperature entirely
+        assert p._send_temperature is False
+
+    def test_chat_reraises_unrelated_400(self):
+        p = _make_anthropic_provider("claude-sonnet-4-6")
+        p._client.messages.create.side_effect = _anthropic_400("max_tokens is required")
+        with pytest.raises(Exception, match="max_tokens"):
+            p.chat([HumanMessage(content="hi")])
+        assert p._client.messages.create.call_count == 1
+
+    def test_rejection_detector_ignores_non_400(self):
+        exc = Exception("temperature something")
+        exc.status_code = 500
+        assert _is_temperature_rejection(exc) is False
 
 
 # ---------------------------------------------------------------------------
