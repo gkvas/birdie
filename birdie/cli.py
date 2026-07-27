@@ -74,6 +74,8 @@ HELP_TEXT = """
   [yellow]/skill list[/yellow]                   List all loaded skills with status
   [yellow]/skill enable <name>[/yellow]          Enable a skill (persists to session)
   [yellow]/skill disable <name>[/yellow]         Disable a skill (persists to session)
+  [yellow]/skill reload[/yellow]                 Re-discover skills from disk (picks up edits)
+  [yellow]/skill new <name>[/yellow]             Scaffold ~/.birdie/skills/<name>/SKILL.MD
 
   [bold]Agent commands[/bold]
   [yellow]/agent list[/yellow]                   List all loaded agents with status
@@ -699,9 +701,35 @@ class BirdieCLI:
                     self.session_manager.save(self.session)
                     self.console.print(f"[red]Disabled[/red] {resolved}")
 
+        elif subcmd == "reload":
+            try:
+                n = self.agent.reload_skills()
+            except Exception as exc:
+                self.console.print(f"[red]Reload failed:[/red] {exc}")
+            else:
+                self.console.print(f"[dim]Reloaded [bold]{n}[/bold] skills from disk.[/dim]")
+
+        elif subcmd == "new":
+            if not subarg:
+                self.console.print("[red]Usage: /skill new <SkillName>[/red]")
+            else:
+                from .core.loader import scaffold_skill
+                target_dir = Path.home() / ".birdie" / "skills"
+                try:
+                    path = scaffold_skill(str(target_dir), subarg)
+                except FileExistsError as exc:
+                    self.console.print(f"[red]{exc}[/red]")
+                else:
+                    self.console.print(
+                        f"[green]Created[/green] {path}\n"
+                        f"[dim]Edit it, then run /skill reload and "
+                        f"/skill enable {subarg}.[/dim]"
+                    )
+
         else:
             self.console.print(
-                "[red]Usage: /skill list | enable <name> | disable <name>[/red]"
+                "[red]Usage: /skill list | enable <name> | disable <name> "
+                "| reload | new <name>[/red]"
             )
 
     def _resolve_agent_name(self, name: str) -> Optional[str]:

@@ -349,6 +349,19 @@ class DynamicAgent:
         }
         self.agent_registry.set_default_agents(sorted(default_agents))
 
+    def reload_skills(self) -> int:
+        """Re-discover skills from disk, in place.  Returns the new skill count.
+
+        The registry and MCP manager objects are shared with the compiled
+        graph's closures, so they are mutated rather than replaced.  Default
+        grants are reseeded; per-session enable/disable sets are preserved
+        (they are plain name sets).
+        """
+        for skill in list(self.registry.list_skills()):
+            self.registry.unregister_skill(skill.name)
+        self._load_skills()
+        return len(self.registry.list_skills())
+
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""
         pass  # MCPClientManager uses per-call sessions; nothing to tear down
