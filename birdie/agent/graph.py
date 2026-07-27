@@ -437,10 +437,16 @@ def create_agent_graph(
         return ""
 
     def _make_get_skill_tool(allowed: set, decay_turns: int = SKILL_DECAY_TURNS):
-        """Build a LangChain StructuredTool that returns a freetext skill's body.
+        """Build a LangChain StructuredTool that loads a freetext skill.
 
         The returned tool is created fresh each turn with the current ``allowed``
         set baked in, so permission checks are always up-to-date.
+
+        A successful call returns a short acknowledgment, not the body: the
+        body is injected into the system prompt each turn by the
+        ``_loaded_skills_from_history`` lease mechanism.  Returning it here
+        too would duplicate the full text in the context window for the whole
+        decay window, and the ToolMessage copy would outlive lease eviction.
         """
         from langchain_core.tools import StructuredTool
         from pydantic import BaseModel as _BaseModel
@@ -467,16 +473,20 @@ def create_agent_graph(
                 return f"Skill '{skill_name}' not found."
             if not skill.body:
                 return f"Skill '{skill_name}' has no loadable body."
-            return skill.body
+            return (
+                f"Skill '{skill.name}' loaded. Its full instructions are now "
+                f"in the system prompt under '--- {skill.name} skill context ---' "
+                f"and stay available for {decay_turns} turns."
+            )
 
         return StructuredTool.from_function(
             func=_fn,
             name="get_skill",
             description=(
-                "Load the full instructions for a knowledge skill. "
-                "Pass the skill name shown in [load: <name>] in the skills list. "
-                f"Loaded skills are injected for {decay_turns} turns; "
-                "call again to refresh."
+                "Load the full instructions for a knowledge skill into the "
+                "system prompt. Pass the skill name shown in [load: <name>] "
+                f"in the skills list. Loaded skills are injected for "
+                f"{decay_turns} turns; call again to refresh."
             ),
             args_schema=_Input,
         )
