@@ -74,7 +74,7 @@ class DynamicAgent:
     def __init__(
         self,
         llm_or_provider: Any,
-        skills_dir: str = "skills",
+        skills_dir: Optional[str] = None,
         agents_dir: Optional[str] = None,
         agent_console=None,
         checkpointer=None,
@@ -134,7 +134,7 @@ class DynamicAgent:
     def from_config(
         cls,
         provider_config: "Dict[str, Any] | str | Path | ProviderConfig | None" = None,
-        skills_dir: str = "skills",
+        skills_dir: Optional[str] = None,
         agents_dir: Optional[str] = None,
         agent_console=None,
         checkpointer=None,
@@ -233,24 +233,23 @@ class DynamicAgent:
         """Discover SKILL.MD files from all skill dirs and register them.
 
         Skills are loaded in priority order (highest to lowest):
-        1. --skills-dir (CLI argument, if provided)
+        1. Explicitly passed ``skills_dir`` (CLI --skills-dir), if provided
         2. ~/.birdie/skills (user config directory)
         3. Bundled skills directory
 
-        Higher priority sources override lower priority ones for skills with the same name.
+        Higher priority sources override lower priority ones for skills with
+        the same name.  When no ``skills_dir`` is passed, only the user and
+        bundled directories are scanned - nothing is ever loaded implicitly
+        from the current working directory.
         """
         import logging
 
         # Determine all skill directories in priority order (highest to lowest)
         skill_dirs = []
 
-        # 1. CLI --skills-dir (highest priority)
-        # Check if skills_dir is explicitly set (not the default "skills")
+        # 1. Explicit skills_dir (highest priority)
         bundled_skills_dir = Path(__file__).parent.parent / "skills"
-        default_skills_path = str(bundled_skills_dir) if bundled_skills_dir.is_dir() else "skills"
-        
-        if self.skills_dir and self.skills_dir != default_skills_path:
-            # Only add if it's explicitly set (not the default)
+        if self.skills_dir and self.skills_dir != str(bundled_skills_dir):
             skill_dirs.append(self.skills_dir)
 
         # 2. User config directory
