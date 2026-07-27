@@ -31,6 +31,7 @@ from ..core.ltm import LTMStore
 from .graph import (
     create_agent_graph, compact_history, AgentState,
     MIN_MESSAGES_AUTO, MIN_MESSAGES_FORCED, COMPRESSION_WINDOW_SIZE, MAX_TOOL_OUTPUT_CAP,
+    SKILL_DECAY_TURNS, SKILL_MAX_LOADED,
 )
 
 
@@ -73,7 +74,7 @@ class DynamicAgent:
     def __init__(
         self,
         llm_or_provider: Any,
-        skills_dir: str = "skills",
+        skills_dir: Optional[str] = None,
         agents_dir: Optional[str] = None,
         agent_console=None,
         checkpointer=None,
@@ -83,6 +84,9 @@ class DynamicAgent:
         min_messages_forced: int = MIN_MESSAGES_FORCED,
         compression_window_size: int = COMPRESSION_WINDOW_SIZE,
         tool_output_cap: int = MAX_TOOL_OUTPUT_CAP,
+        skill_decay_turns: int = SKILL_DECAY_TURNS,
+        skill_max_loaded: int = SKILL_MAX_LOADED,
+        compaction_token_threshold: Optional[int] = None,
         skills_enabled: Optional[List[str]] = None,
         agents_enabled: Optional[List[str]] = None,
     ) -> None:
@@ -97,6 +101,9 @@ class DynamicAgent:
         self._min_messages_forced = min_messages_forced
         self._compression_window_size = compression_window_size
         self._tool_output_cap = tool_output_cap
+        self._skill_decay_turns = skill_decay_turns
+        self._skill_max_loaded = skill_max_loaded
+        self._compaction_token_threshold = compaction_token_threshold
         self._skills_enabled: List[str] = skills_enabled or []
         self._agents_enabled: List[str] = agents_enabled or []
 
@@ -119,6 +126,7 @@ class DynamicAgent:
             min_messages_auto=self._min_messages_auto,
             min_messages_forced=self._min_messages_forced,
             compression_window_size=self._compression_window_size,
+            compaction_token_threshold=self._compaction_token_threshold,
             skills_dir=self.skills_dir,
             agents_dir=self.agents_dir,
             provider_config=self._provider_config,
@@ -129,7 +137,7 @@ class DynamicAgent:
     def from_config(
         cls,
         provider_config: "Dict[str, Any] | str | Path | ProviderConfig | None" = None,
-        skills_dir: str = "skills",
+        skills_dir: Optional[str] = None,
         agents_dir: Optional[str] = None,
         agent_console=None,
         checkpointer=None,
@@ -187,13 +195,21 @@ class DynamicAgent:
         # These must not be forwarded to vendor SDKs.
         _AGENT_FIELDS = {
             "min_messages_auto", "min_messages_forced", "compression_window_size",
-            "tool_output_cap", "skills_enabled", "agents_enabled",
+            "compaction_token_threshold",
+            "tool_output_cap", "skill_decay_turns", "skill_max_loaded",
+            "skills_enabled", "agents_enabled",
             "ltm_max_age_days", "ltm_max_entries", "ltm_min_score",
         }
         min_messages_auto = int(config_dict.get("min_messages_auto") or MIN_MESSAGES_AUTO)
         min_messages_forced = int(config_dict.get("min_messages_forced") or MIN_MESSAGES_FORCED)
         compression_window_size = int(config_dict.get("compression_window_size") or COMPRESSION_WINDOW_SIZE)
         tool_output_cap = int(config_dict.get("tool_output_cap") or MAX_TOOL_OUTPUT_CAP)
+        skill_decay_turns = int(config_dict.get("skill_decay_turns") or SKILL_DECAY_TURNS)
+        skill_max_loaded = int(config_dict.get("skill_max_loaded") or SKILL_MAX_LOADED)
+        _raw_token_threshold = config_dict.get("compaction_token_threshold")
+        compaction_token_threshold = (
+            int(_raw_token_threshold) if _raw_token_threshold else None
+        )
         skills_enabled: List[str] = config_dict.get("skills_enabled") or []
         agents_enabled: List[str] = config_dict.get("agents_enabled") or []
         ltm_max_age_days = int(config_dict.get("ltm_max_age_days") or LTMStore.DEFAULT_MAX_AGE_DAYS)
@@ -216,6 +232,8 @@ class DynamicAgent:
                    min_messages_auto=min_messages_auto, min_messages_forced=min_messages_forced,
                    compression_window_size=compression_window_size,
                    tool_output_cap=tool_output_cap,
+                   skill_decay_turns=skill_decay_turns, skill_max_loaded=skill_max_loaded,
+                   compaction_token_threshold=compaction_token_threshold,
                    skills_enabled=skills_enabled, agents_enabled=agents_enabled)
 
     # -- skill management ---------------------------------------------------
@@ -224,24 +242,23 @@ class DynamicAgent:
         """Discover SKILL.MD files from all skill dirs and register them.
 
         Skills are loaded in priority order (highest to lowest):
-        1. --skills-dir (CLI argument, if provided)
+        1. Explicitly passed ``skills_dir`` (CLI --skills-dir), if provided
         2. ~/.birdie/skills (user config directory)
         3. Bundled skills directory
 
-        Higher priority sources override lower priority ones for skills with the same name.
+        Higher priority sources override lower priority ones for skills with
+        the same name.  When no ``skills_dir`` is passed, only the user and
+        bundled directories are scanned - nothing is ever loaded implicitly
+        from the current working directory.
         """
         import logging
 
         # Determine all skill directories in priority order (highest to lowest)
         skill_dirs = []
 
-        # 1. CLI --skills-dir (highest priority)
-        # Check if skills_dir is explicitly set (not the default "skills")
+        # 1. Explicit skills_dir (highest priority)
         bundled_skills_dir = Path(__file__).parent.parent / "skills"
-        default_skills_path = str(bundled_skills_dir) if bundled_skills_dir.is_dir() else "skills"
-        
-        if self.skills_dir and self.skills_dir != default_skills_path:
-            # Only add if it's explicitly set (not the default)
+        if self.skills_dir and self.skills_dir != str(bundled_skills_dir):
             skill_dirs.append(self.skills_dir)
 
         # 2. User config directory
@@ -270,13 +287,26 @@ class DynamicAgent:
                 # Log error but continue with other directories
                 logging.warning(f"Failed to load skills from {skill_dir}: {str(e)}")
 
-        self.policy.set_default_skills(self._skills_enabled)
+        # Default grants: explicit config plus skills flagged enabled_by_default.
+        default_names = set(self._skills_enabled) | {
+            s.name for s in self.registry.list_skills() if s.enabled_by_default
+        }
+        self.policy.set_default_skills(sorted(default_names))
 
 
 
 
     def _load_agents(self) -> None:
-        """Discover AGENT.MD files from all agent dirs and register them."""
+        """Discover AGENT.MD files from all agent dirs and register them.
+
+        Agents are loaded in priority order (highest to lowest), mirroring
+        ``_load_skills``: the explicit ``agents_dir`` (or bundled directory)
+        first, then ``~/.birdie/agents``.  The first definition of a name
+        wins.  A broken AGENT.MD (e.g. a disallowed vendor override) is
+        skipped with a warning instead of aborting startup.
+        """
+        import logging
+
         _bundled = Path(__file__).parent.parent / "agents"
         primary = self.agents_dir or (str(_bundled) if _bundled.is_dir() else None)
 
@@ -287,23 +317,33 @@ class DynamicAgent:
         if user_agents_dir.is_dir():
             dirs.append(str(user_agents_dir))
 
-        if not dirs:
-            self.agent_registry.set_default_agents(self._agents_enabled)
-            return
-
+        loaded_agents: set = set()
         for d in dirs:
             for agent_def in discover_agents_from_directory(d):
-                tool = agentdef_to_langchain_tool(
-                    agent_def,
-                    skills_dir=self.skills_dir,
-                    agents_dir=self.agents_dir,
-                    fallback_provider_config=self._provider_config,
-                    console=self._agent_console,
-                    get_tool_output_mode=lambda: self.agent_output_mode,
-                )
+                if agent_def.name in loaded_agents:
+                    continue
+                try:
+                    tool = agentdef_to_langchain_tool(
+                        agent_def,
+                        skills_dir=self.skills_dir,
+                        agents_dir=self.agents_dir,
+                        fallback_provider_config=self._provider_config,
+                        console=self._agent_console,
+                        get_tool_output_mode=lambda: self.agent_output_mode,
+                    )
+                except Exception as e:
+                    logging.warning(
+                        "Skipping agent '%s' from %s: %s", agent_def.name, d, e
+                    )
+                    continue
                 self.agent_registry.register(agent_def, tool)
+                loaded_agents.add(agent_def.name)
 
-        self.agent_registry.set_default_agents(self._agents_enabled)
+        # Default grants: explicit config plus agents flagged enabled_by_default.
+        default_agents = set(self._agents_enabled) | {
+            a.name for a in self.agent_registry.list_agents() if a.enabled_by_default
+        }
+        self.agent_registry.set_default_agents(sorted(default_agents))
 
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""
@@ -397,6 +437,8 @@ class DynamicAgent:
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
             "tool_output_cap": self._tool_output_cap,
+            "skill_decay_turns": self._skill_decay_turns,
+            "skill_max_loaded": self._skill_max_loaded,
         }}
         if user_id:
             run_config["configurable"]["user_id"] = user_id
@@ -437,6 +479,8 @@ class DynamicAgent:
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
             "tool_output_cap": self._tool_output_cap,
+            "skill_decay_turns": self._skill_decay_turns,
+            "skill_max_loaded": self._skill_max_loaded,
         }}
         if user_id:
             run_config["configurable"]["user_id"] = user_id
@@ -465,7 +509,9 @@ class DynamicAgent:
         """
         run_config: Dict[str, Any] = {"configurable": {"thread_id": thread_id}}
         snapshot = await self.app.aget_state(run_config)
-        all_messages = list((snapshot.values or {}).get("messages", []))
+        values = snapshot.values or {}
+        all_messages = list(values.get("messages", []))
+        prior_summary = values.get("summary", "")
 
         ltm_store = None
         if self._ltm_store_factory and user_id:
@@ -476,9 +522,13 @@ class DynamicAgent:
             min_messages_auto=self._min_messages_auto,
             min_messages_forced=self._min_messages_forced,
             compression_window_size=self._compression_window_size,
+            prior_summary=prior_summary,
         )
 
         if removes:
-            await self.app.aupdate_state(run_config, {"messages": removes})
+            update: Dict[str, Any] = {"messages": removes}
+            if summary:
+                update["summary"] = summary
+            await self.app.aupdate_state(run_config, update)
 
         return len(removes), summary

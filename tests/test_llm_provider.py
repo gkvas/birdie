@@ -98,6 +98,23 @@ class TestOpenAIMessageConversion:
         assert tc["function"]["name"] == "get_weather"
         assert json.loads(tc["function"]["arguments"]) == {"city": "Graz"}
 
+    def test_ai_message_with_tool_calls_keeps_text_content(self):
+        msg = AIMessage(
+            content="Checking the weather now.",
+            tool_calls=[{"id": "c1", "name": "get_weather", "args": {"city": "Graz"}, "type": "tool_call"}],
+        )
+        result = _lc_to_openai_messages([msg])
+        assert result[0]["content"] == "Checking the weather now."
+        assert result[0]["tool_calls"][0]["id"] == "c1"
+
+    def test_ai_message_with_tool_calls_omits_empty_content(self):
+        msg = AIMessage(
+            content="",
+            tool_calls=[{"id": "c1", "name": "get_weather", "args": {}, "type": "tool_call"}],
+        )
+        result = _lc_to_openai_messages([msg])
+        assert "content" not in result[0]
+
     def test_tool_message(self):
         msg = ToolMessage(content="sunny", tool_call_id="c1")
         result = _lc_to_openai_messages([msg])
@@ -1106,7 +1123,11 @@ class TestAgentdefToNormalizedDef:
         cfg = {"vendor": "anthropic", "model": "claude-haiku-4-5-20251001", "api_key": "sk-test"}
         result = agentdef_to_normalized_def(agent_def, provider_config=cfg)
 
-        assert result["_provider_config"] == cfg
+        # api_key must never be serialised into the tool def (it lands in the
+        # MCP subprocess environment); everything else is forwarded.
+        assert result["_provider_config"] == {
+            "vendor": "anthropic", "model": "claude-haiku-4-5-20251001",
+        }
 
     def test_skills_dir_and_agents_dir_forwarded(self):
         from birdie.core.llm_provider import agentdef_to_normalized_def
@@ -1384,3 +1405,80 @@ class TestAcpMcpServerWithAgents:
 
         mock_resolve.assert_called_once_with("python:birdie.skills.duckduckgo.tools.search")
         mock_fn.assert_called_once_with("python:birdie.skills.duckduckgo.tools.search", query="python")
+
+
+class TestProviderConfigSecrets:
+    def test_to_json_always_excludes_api_key(self):
+        from birdie.core.llm_provider import ProviderConfig
+        cfg = ProviderConfig(vendor="openai", model="gpt-4o", api_key="sk-secret")
+        data = json.loads(cfg.to_json())
+        assert "api_key" not in data
+        assert data["model"] == "gpt-4o"
+
+
+class TestMalformedToolArgs:
+    def test_malformed_arguments_degrade_to_empty_args(self):
+        raw = {
+            "content": "",
+            "tool_calls": [{
+                "id": "tc1", "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city": broken'},
+            }],
+        }
+        msg = _openai_msg_to_lc(raw)
+        assert msg.tool_calls[0]["name"] == "get_weather"
+        assert msg.tool_calls[0]["args"] == {}
+
+
+class TestAnthropicToolResultTruncation:
+    def test_oversized_tool_result_truncated(self):
+        from birdie.core.llm_provider import _MAX_TOOL_CONTENT_CHARS
+        big = "x" * (_MAX_TOOL_CONTENT_CHARS + 500)
+        result = _lc_to_anthropic_messages(
+            [ToolMessage(content=big, tool_call_id="tc1")]
+        )
+        block = result[0]["content"][0]
+        assert len(block["content"]) < len(big)
+        assert "characters truncated" in block["content"]
+
+
+class TestAnthropicModelCatalog:
+    def test_current_generation_models_listed(self):
+        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
+            provider = AnthropicProvider(api_key="test")
+        ids = {m.id for m in provider.list_models()}
+        assert {"claude-fable-5", "claude-opus-5", "claude-opus-4-8",
+                "claude-sonnet-5", "claude-sonnet-4-6"} <= ids
+        by_id = {m.id: m for m in provider.list_models()}
+        assert by_id["claude-opus-5"].context_window == 1_000_000
+        assert by_id["claude-haiku-4-5-20251001"].context_window == 200_000
+
+
+class TestRetryableErrors:
+    def test_transient_5xx_is_retryable(self):
+        from birdie.agent.graph import _is_retryable_error
+
+        class _ServerError(Exception):
+            status_code = 500
+
+        class _Unavailable(Exception):
+            status_code = 503
+
+        assert _is_retryable_error(_ServerError("boom"))
+        assert _is_retryable_error(_Unavailable("down"))
+
+    def test_client_errors_not_retryable(self):
+        from birdie.agent.graph import _is_retryable_error
+
+        class _BadRequest(Exception):
+            status_code = 400
+
+        assert not _is_retryable_error(_BadRequest("bad"))
+
+    def test_connection_error_name_is_retryable(self):
+        from birdie.agent.graph import _is_retryable_error
+
+        class APIConnectionError(Exception):
+            pass
+
+        assert _is_retryable_error(APIConnectionError("net down"))

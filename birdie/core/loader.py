@@ -117,6 +117,7 @@ def parse_skill_markdown(content: str) -> Skill:
         tags=frontmatter.get('tags', []),
         triggers=frontmatter.get('triggers', []),
         always_inject=always_inject,
+        enabled_by_default=bool(frontmatter.get('enabled_by_default', False)),
         permissions=permissions,
         body=body,
         location=frontmatter.get('location', skill_name),
@@ -162,9 +163,13 @@ def discover_skills_from_directory(directory: str) -> List[Skill]:
     Returns:
         List of successfully parsed ``Skill`` objects.
     """
+    root = Path(directory)
+    if not root.is_dir():
+        return []
+
     # Add the skills root to sys.path so that python: entrypoints in user skill
     # directories (e.g. python:tools.search_repos) can import their local modules.
-    skills_root = str(Path(directory).resolve())
+    skills_root = str(root.resolve())
     if skills_root not in sys.path:
         sys.path.insert(0, skills_root)
 

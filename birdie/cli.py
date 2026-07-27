@@ -655,7 +655,7 @@ class BirdieCLI:
                 "[red]Usage: /agent list | enable <name> | disable <name> | output full|short|off[/red]"
             )
 
-    def _handle_session(self, arg: str) -> None:
+    async def _handle_session(self, arg: str) -> None:
         """Handle /session sub-commands."""
         parts = arg.strip().split(maxsplit=1)
         subcmd = parts[0].lower() if parts else ""
@@ -682,6 +682,16 @@ class BirdieCLI:
             try:
                 is_current = subarg == self.session.id
                 self.session_manager.delete(self.user_id, subarg)
+                # Also drop the conversation history stored under this
+                # thread_id, otherwise it lingers in checkpoints.db forever.
+                checkpointer = getattr(self.agent.app, "checkpointer", None)
+                if checkpointer is not None and hasattr(checkpointer, "adelete_thread"):
+                    try:
+                        await checkpointer.adelete_thread(subarg)
+                    except Exception as exc:
+                        self.console.print(
+                            f"[dim]Could not delete checkpoint history: {exc}[/dim]"
+                        )
                 self.console.print(f"[dim]Deleted session {subarg}[/dim]")
                 if is_current:
                     new_session = self.session_manager.create(self.user_id)
@@ -734,7 +744,7 @@ class BirdieCLI:
         except PermissionError:
             self.console.print(f"[red]Permission denied:[/red] {target}")
 
-    def _handle_slash(self, line: str) -> bool:
+    async def _handle_slash(self, line: str) -> bool:
         """Return True if line was a slash command (handled here), False otherwise."""
         parts = line.strip().split(maxsplit=1)
         cmd = parts[0].lower()
@@ -776,7 +786,7 @@ class BirdieCLI:
             self._show_info()
 
         elif cmd == "/session":
-            self._handle_session(arg)
+            await self._handle_session(arg)
 
         elif cmd == "/cd":
             self._handle_cd(arg)
@@ -929,7 +939,7 @@ class BirdieCLI:
                 if user_input.strip().lower() == "/compact":
                     await self._compact()
                 else:
-                    self._handle_slash(user_input)
+                    await self._handle_slash(user_input)
                 continue
 
             loop = asyncio.get_running_loop()

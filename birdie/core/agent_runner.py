@@ -34,6 +34,28 @@ def _substitute(template: str, params: Dict[str, Any]) -> str:
     return re.sub(r'\{\{\s*(\w+)\s*\}\}', replace, template)
 
 
+def render_agent_prompt(agent_def: AgentDef, params: Dict[str, Any]) -> str:
+    """Render the final sub-agent prompt from an AgentDef and input params.
+
+    Substitutes ``{{ param }}`` placeholders and, when the agent declares
+    ``output_params``, appends explicit output-format instructions so the
+    declared output schema actually shapes the reply.
+    """
+    prompt = _substitute(agent_def.prompt, params)
+    if agent_def.output_params:
+        lines = [
+            "",
+            "Return your final answer as a single JSON object with exactly "
+            "these fields:",
+        ]
+        for p in agent_def.output_params:
+            desc = f": {p.description}" if p.description else ""
+            lines.append(f'- "{p.name}" ({p.type}){desc}')
+        lines.append("Output only the JSON object, no other text.")
+        prompt += "\n".join(lines)
+    return prompt
+
+
 def _input_schema(params: List[AgentParam]) -> dict:
     """Build a JSON Schema object from a list of AgentParam objects."""
     _TYPE_MAP = {
@@ -196,18 +218,30 @@ def agentdef_to_langchain_tool(
             f"Parent vendor: {config['vendor']}, AGENT.MD vendor: {agent_def.vendor}"
         )
 
+    # The DynamicAgent is built once per tool and reused across invocations -
+    # construction re-discovers and re-parses every SKILL.MD/AGENT.MD on disk,
+    # which is pure overhead per call.  Each invocation gets a fresh thread_id
+    # so histories never bleed between runs.
+    _cache: Dict[str, Any] = {}
+
+    def _get_sub_agent():
+        if "agent" not in _cache:
+            _cache["agent"] = DynamicAgent.from_config(
+                provider_config=config or None,
+                skills_dir=skills_dir,
+                agents_dir=agents_dir,
+            )
+        return _cache["agent"]
+
     async def _run(**kwargs: Any) -> str:
 
-        prompt = _substitute(agent_def.prompt, kwargs)
+        prompt = render_agent_prompt(agent_def, kwargs)
 
-        sub_agent = DynamicAgent.from_config(
-            provider_config=config or None,
-            skills_dir=skills_dir,
-            agents_dir=agents_dir,
-        )
-        sub_agent.enable_skills_for_session("_run", agent_def.allowed_skills)
-
+        sub_agent = _get_sub_agent()
         run_id = f"{agent_def.name}#{uuid.uuid4().hex[:4]}"
+        thread = f"_run-{run_id}"
+        sub_agent.enable_skills_for_session(thread, agent_def.allowed_skills)
+
         invoke_config = {
             "recursion_limit": agent_def.recursion_limit,
             "configurable": {"max_tool_repetitions": agent_def.max_tool_repetitions},
@@ -216,7 +250,7 @@ def agentdef_to_langchain_tool(
         if console is None:
             # Silent path: run to completion and return the last message.
             result = await sub_agent.invoke(
-                prompt, thread_id="_run", config=invoke_config,
+                prompt, thread_id=thread, config=invoke_config,
             )
             last = result["messages"][-1]
             return _extract_text(last.content)
@@ -226,7 +260,7 @@ def agentdef_to_langchain_tool(
         final_content = ""
         transcript: List[Tuple[str, Any]] = []
 
-        async for update in sub_agent.astream(prompt, thread_id="_run", config=invoke_config):
+        async for update in sub_agent.astream(prompt, thread_id=thread, config=invoke_config):
             for _node, data in update.items():
                 for msg in data.get("messages", []):
                     if isinstance(msg, AIMessage):

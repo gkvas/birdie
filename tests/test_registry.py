@@ -81,3 +81,26 @@ def test_list_tools_with_filters(sample_skill):
     # an empty set; list_tools(skill_names=[]) must honour that constraint.
     tools = registry.list_tools(skill_names=[])
     assert len(tools) == 0
+
+class TestListToolsOrdering:
+    def test_list_tools_is_deterministic_registration_order(self):
+        reg = SkillRegistry()
+        names = ["zeta_tool", "alpha_tool", "mid_tool", "beta_tool"]
+        for i, tool_name in enumerate(names):
+            reg.register_skill(Skill(
+                name=f"Skill{i}",
+                version="1.0.0",
+                description="d",
+                tools=[SkillTool(
+                    name=tool_name, description="d", entrypoint="bash:true",
+                    schema={"type": "object", "properties": {}},
+                )],
+            ))
+        listed = [t.name for t in reg.list_tools()]
+        assert listed == names
+        # Filtering must not disturb the order either.
+        filtered = [
+            t.name
+            for t in reg.list_tools(skill_names=["Skill3", "Skill0", "Skill1"])
+        ]
+        assert filtered == ["zeta_tool", "alpha_tool", "beta_tool"]

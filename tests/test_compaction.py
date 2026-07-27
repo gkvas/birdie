@@ -315,3 +315,141 @@ def test_constants_sane():
     assert COMPRESSION_WINDOW_SIZE > MIN_MESSAGES_AUTO
     assert MIN_MESSAGES_AUTO >= MIN_MESSAGES_FORCED
     assert MIN_MESSAGES_FORCED > 0
+
+
+# ---------------------------------------------------------------------------
+# Rolling summary (continuity bridge)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_compact_history_folds_prior_summary_into_prompt():
+    """A prior rolling summary is included in the compaction prompt."""
+    msgs = _build_history(_TRIGGER // 2 + 1)
+    provider = _MockProvider()
+    await compact_history(msgs, provider, prior_summary="Earlier we fixed the parser.")
+    prompt_text = provider.calls[0][0].content
+    assert "Earlier we fixed the parser." in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_compact_history_no_prior_summary_marker_when_absent():
+    """Without a prior summary, no already-compacted marker appears in the prompt."""
+    msgs = _build_history(_TRIGGER // 2 + 1)
+    provider = _MockProvider()
+    await compact_history(msgs, provider)
+    prompt_text = provider.calls[0][0].content
+    assert "already-compacted" not in prompt_text
+
+
+# ---------------------------------------------------------------------------
+# Background auto-compaction through the graph
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_auto_compaction_runs_in_background_and_applies_next_turn():
+    import asyncio
+    from birdie.agent.run import DynamicAgent
+    from birdie.core.llm_provider import LLMProvider
+
+    class _ChatProvider:
+        """Answers normal turns with 'ok' and compaction prompts with JSON."""
+
+        def supports_tools(self):
+            return False
+
+        async def achat(self, messages, tools=None, system_prompt=None, **kw):
+            text = str(messages[0].content) if messages else ""
+            if "memory compaction system" in text:
+                return AIMessage(content=_MockProvider._DEFAULT_JSON)
+            return AIMessage(content="ok")
+
+    LLMProvider.register(_ChatProvider)
+
+    agent = DynamicAgent(
+        _ChatProvider(),
+        min_messages_auto=4,
+        compression_window_size=6,
+    )
+
+    # Trigger threshold: 4 + 6 = 10 messages. Each turn adds 2.
+    for i in range(6):
+        result = await agent.invoke(f"turn {i}", thread_id="bg")
+
+    # Turn 6 saw >= 10 messages and started the background task; no removal
+    # happened inside that same turn.
+    assert len(result["messages"]) == 12
+
+    # Let the background task complete, then run one more turn.
+    for _ in range(10):
+        await asyncio.sleep(0)
+    result = await agent.invoke("turn 6", thread_id="bg")
+
+    assert len(result["messages"]) < 14  # compacted prefix was removed
+    assert result.get("summary") == "Summary of earlier conversation."
+
+
+@pytest.mark.asyncio
+async def test_token_threshold_triggers_compaction_below_message_count():
+    import asyncio
+    from birdie.agent.run import DynamicAgent
+    from birdie.core.llm_provider import LLMProvider
+
+    class _HeavyProvider:
+        """Reports a huge input-token footprint on every normal reply."""
+
+        def supports_tools(self):
+            return False
+
+        async def achat(self, messages, tools=None, system_prompt=None, **kw):
+            text = str(messages[0].content) if messages else ""
+            if "memory compaction system" in text:
+                return AIMessage(content=_MockProvider._DEFAULT_JSON)
+            return AIMessage(
+                content="ok",
+                usage_metadata={"input_tokens": 150_000, "output_tokens": 5,
+                                "total_tokens": 150_005},
+            )
+
+    LLMProvider.register(_HeavyProvider)
+
+    agent = DynamicAgent(_HeavyProvider(), compaction_token_threshold=100_000)
+
+    # Far below the message-count trigger (4 turns = 8 messages < 80), but the
+    # reported input tokens exceed the threshold after turn 1.
+    for i in range(4):
+        await agent.invoke(f"turn {i}", thread_id="heavy")
+    for _ in range(10):
+        await asyncio.sleep(0)
+    result = await agent.invoke("final", thread_id="heavy")
+
+    assert result.get("summary") == "Summary of earlier conversation."
+
+
+@pytest.mark.asyncio
+async def test_no_token_trigger_without_threshold():
+    import asyncio
+    from birdie.agent.run import DynamicAgent
+    from birdie.core.llm_provider import LLMProvider
+
+    class _HeavyProvider2:
+        def supports_tools(self):
+            return False
+
+        async def achat(self, messages, tools=None, system_prompt=None, **kw):
+            return AIMessage(
+                content="ok",
+                usage_metadata={"input_tokens": 150_000, "output_tokens": 5,
+                                "total_tokens": 150_005},
+            )
+
+    LLMProvider.register(_HeavyProvider2)
+    agent = DynamicAgent(_HeavyProvider2())
+
+    for i in range(4):
+        await agent.invoke(f"turn {i}", thread_id="light")
+    for _ in range(10):
+        await asyncio.sleep(0)
+    result = await agent.invoke("final", thread_id="light")
+
+    assert "summary" not in result
+    assert len(result["messages"]) == 10

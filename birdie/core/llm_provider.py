@@ -160,6 +160,15 @@ class ProviderConfig(BaseModel):
             "None uses the built-in default (60)."
         ),
     )
+    compaction_token_threshold: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Also trigger auto-compaction when the last model call consumed at "
+            "least this many input tokens, regardless of message count.  "
+            "None (default) disables the token-based trigger."
+        ),
+    )
     tool_output_cap: Optional[int] = Field(
         default=None,
         gt=0,
@@ -194,8 +203,9 @@ class ProviderConfig(BaseModel):
         return cls.model_validate_json(Path(path).read_text())
 
     def to_json(self, **kwargs: Any) -> str:
-        """Serialise to a JSON string (``api_key`` excluded by default)."""
+        """Serialise to a JSON string (``api_key`` always excluded)."""
         data = self.model_dump(exclude_none=True, **kwargs)
+        data.pop("api_key", None)
         return json.dumps(data)
 
 
@@ -341,8 +351,9 @@ def _lc_to_openai_messages(
             result.append({"role": "user", "content": str(msg.content)})
         elif isinstance(msg, AIMessage):
             if msg.tool_calls:
-                # Omit content when tool_calls are present - Mistral (and OpenAI)
-                # reject content="" alongside tool_calls in history messages.
+                # Omit *empty* content when tool_calls are present - Mistral
+                # (and OpenAI) reject content="" alongside tool_calls in
+                # history messages.  Non-empty assistant text is preserved.
                 m: dict[str, Any] = {
                     "role": "assistant",
                     "tool_calls": [
@@ -357,6 +368,9 @@ def _lc_to_openai_messages(
                         for tc in msg.tool_calls
                     ],
                 }
+                text = str(msg.content) if msg.content else ""
+                if text:
+                    m["content"] = text
             else:
                 m = {"role": "assistant", "content": msg.content or ""}
             result.append(m)
@@ -394,10 +408,22 @@ def _openai_msg_to_lc(raw: Any, usage: Any = None) -> AIMessage:
     for tc in raw.get("tool_calls") or []:
         fn = tc.get("function", tc)  # handle both nested and flat shapes
         args = fn.get("arguments", "{}")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                # Malformed function arguments from the model: degrade to an
+                # empty call so the tool layer reports a validation error the
+                # model can recover from, instead of crashing the turn.
+                log.warning(
+                    "Discarding malformed tool-call arguments for '%s': %.200s",
+                    fn.get("name", ""), args,
+                )
+                args = {}
         tool_calls.append({
             "id": tc.get("id", ""),
             "name": fn.get("name", ""),
-            "args": json.loads(args) if isinstance(args, str) else args,
+            "args": args,
             "type": "tool_call",
         })
 
@@ -817,10 +843,17 @@ def _lc_to_anthropic_messages(messages: list[BaseMessage]) -> list[dict]:
             blocks: list[dict] = []
             while i < len(messages) and isinstance(messages[i], ToolMessage):
                 tm = messages[i]
+                content = str(tm.content)
+                if len(content) > _MAX_TOOL_CONTENT_CHARS:
+                    dropped = len(content) - _MAX_TOOL_CONTENT_CHARS
+                    content = (
+                        content[:_MAX_TOOL_CONTENT_CHARS]
+                        + f"\n[...{dropped} characters truncated]"
+                    )
                 blocks.append({
                     "type": "tool_result",
                     "tool_use_id": tm.tool_call_id,
-                    "content": str(tm.content),
+                    "content": content,
                 })
                 i += 1
             result.append({"role": "user", "content": blocks})
@@ -1071,10 +1104,16 @@ class AnthropicProvider(LLMProvider):
                 yield AIMessageChunk(content=text)
 
     def list_models(self) -> list[ModelInfo]:
+        # Cached catalog (2026-07). Current-generation models have a 1M-token
+        # context window; Haiku 4.5 has 200K.
         _KNOWN = {
-            "claude-opus-4-7":          {"context_window": 200_000},
-            "claude-sonnet-4-6":        {"context_window": 200_000},
-            "claude-haiku-4-5-20251001":{"context_window": 200_000},
+            "claude-fable-5":            {"context_window": 1_000_000},
+            "claude-opus-5":             {"context_window": 1_000_000},
+            "claude-opus-4-8":           {"context_window": 1_000_000},
+            "claude-opus-4-7":           {"context_window": 1_000_000},
+            "claude-sonnet-5":           {"context_window": 1_000_000},
+            "claude-sonnet-4-6":         {"context_window": 1_000_000},
+            "claude-haiku-4-5-20251001": {"context_window": 200_000},
         }
         return [
             ModelInfo(
@@ -1864,13 +1903,20 @@ def agentdef_to_normalized_def(
     if required:
         schema["required"] = required
 
+    # Never serialise credentials into the tool def - it ends up in the MCP
+    # subprocess environment (BIRDIE_AGENTS_JSON) and may be logged.  The
+    # subprocess inherits the vendor env var (e.g. ANTHROPIC_API_KEY) instead.
+    sanitized_config = {
+        k: v for k, v in (provider_config or {}).items() if k != "api_key"
+    }
+
     d: NormalizedToolDef = {
         "name": agent_def.name,
         "description": agent_def.description,
         "parameters": schema,
         # Execution-context metadata consumed by acp_mcp_server._invoke_agent()
         "_agent_def": agent_def.model_dump(),
-        "_provider_config": provider_config or {},
+        "_provider_config": sanitized_config,
         "_skills_dir": skills_dir,
         "_agents_dir": agents_dir,
     }

@@ -100,3 +100,51 @@ def test_cli_overrides_user():
 
         finally:
             run_module.Path = original_path
+
+
+class TestSkillEnabledByDefault:
+    def test_skill_frontmatter_enabled_by_default_parsed(self):
+        from birdie.core.loader import parse_skill_markdown
+        content = (
+            "---\n"
+            "name: AlwaysOn\n"
+            "description: default-granted skill\n"
+            "enabled_by_default: true\n"
+            "---\n\n"
+            "Some instructions.\n"
+        )
+        skill = parse_skill_markdown(content)
+        assert skill.enabled_by_default is True
+
+    def test_skill_enabled_by_default_defaults_false(self):
+        from birdie.core.loader import parse_skill_markdown
+        content = (
+            "---\n"
+            "name: OptIn\n"
+            "description: opt-in skill\n"
+            "---\n\n"
+            "Some instructions.\n"
+        )
+        skill = parse_skill_markdown(content)
+        assert skill.enabled_by_default is False
+
+
+class TestNoImplicitCwdLoading:
+    def test_default_skills_dir_does_not_load_cwd_skills(self, tmp_path, monkeypatch):
+        """DynamicAgent() without skills_dir must ignore ./skills in the CWD."""
+        cwd_skills = tmp_path / "skills"
+        cwd_skills.mkdir()
+        _write_skill(str(cwd_skills), "CwdSkill")
+        monkeypatch.chdir(tmp_path)
+        # Point HOME somewhere empty so ~/.birdie/skills does not interfere.
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+        agent = DynamicAgent(_NoopLLM())
+        names = {s.name for s in agent.registry.list_skills()}
+        assert "CwdSkill" not in names
+
+    def test_discover_missing_directory_returns_empty(self, tmp_path):
+        from birdie.core.loader import discover_skills_from_directory
+        import sys as _sys
+        missing = tmp_path / "does-not-exist"
+        assert discover_skills_from_directory(str(missing)) == []
+        assert str(missing.resolve()) not in _sys.path

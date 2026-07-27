@@ -23,6 +23,8 @@ import re
 from pathlib import Path
 from typing import TypedDict, List, Annotated, Sequence, Tuple, Optional, Callable
 
+from typing_extensions import NotRequired
+
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
@@ -60,12 +62,15 @@ _RETRY_BASE_DELAY = 5.0   # base seconds for exponential backoff when no Retry-A
 
 
 def _is_retryable_error(exc: Exception) -> bool:
-    """Return True if *exc* is a transient provider error (HTTP 429/529)."""
+    """Return True for transient provider errors (rate limits, overload, 5xx)."""
     status = getattr(exc, 'status_code', None)
-    if status in (429, 529):
+    if status in (429, 500, 502, 503, 504, 529):
         return True
     name = type(exc).__name__
-    if any(k in name for k in ("RateLimit", "Overloaded", "TooManyRequests")):
+    if any(k in name for k in (
+        "RateLimit", "Overloaded", "TooManyRequests",
+        "InternalServerError", "ServiceUnavailable", "APIConnectionError",
+    )):
         return True
     msg = str(exc)
     return "429" in msg or "529" in msg or "rate_limit" in msg.lower()
@@ -139,6 +144,9 @@ Rules:
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    # Rolling summary of compacted-away conversation segments.  Kept in the
+    # checkpoint so continuity survives even when no LTM store is configured.
+    summary: NotRequired[str]
 
 
 def _msg_text(msg: BaseMessage) -> str:
@@ -185,8 +193,13 @@ async def compact_history(
     min_messages_auto: int = MIN_MESSAGES_AUTO,
     min_messages_forced: int = MIN_MESSAGES_FORCED,
     compression_window_size: int = COMPRESSION_WINDOW_SIZE,
+    prior_summary: str = "",
 ) -> Tuple[str, List[RemoveMessage]]:
     """Summarize the oldest conversation segment and store it in LTM.
+
+    ``prior_summary`` (the summary of previously compacted segments) is folded
+    into the transcript so the returned summary covers the whole compacted
+    history, not just the newest segment.
 
     Auto-compaction triggers when len(messages) >= min_messages_auto + compression_window_size.
     Forced compaction (``/compact``) runs regardless of history length and uses
@@ -244,6 +257,11 @@ async def compact_history(
             lines.append(f"Tool result ({msg.name}): {excerpt}")
 
     history_text = "\n".join(lines)
+    if prior_summary:
+        history_text = (
+            f"[Summary of earlier, already-compacted conversation]: {prior_summary}\n\n"
+            + history_text
+        )
     prompt = _COMPACTION_PROMPT.format(history=history_text)
 
     response = await _achat_with_retry(provider, messages=[HumanMessage(content=prompt)])
@@ -264,6 +282,16 @@ async def compact_history(
         len(old_msgs), len(all_messages) - len(old_msgs),
     )
     return summary_text, remove_msgs
+
+
+def _last_input_tokens(messages: list) -> int:
+    """Return input_tokens of the most recent AIMessage carrying usage metadata."""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            usage = getattr(msg, "usage_metadata", None)
+            if usage:
+                return usage.get("input_tokens", 0) or 0
+    return 0
 
 
 def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
@@ -291,11 +319,27 @@ def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
     return count
 
 
+def _skill_alias_map(registry: SkillRegistry, allowed: set) -> dict[str, str]:
+    """Map every accepted skill identifier (name or location) to the canonical name.
+
+    The system prompt advertises ``[load: <location>]`` (falling back to the
+    name), so ``get_skill`` calls may arrive with either identifier.
+    """
+    aliases: dict[str, str] = {}
+    for s in registry.list_skills():
+        if s.name in allowed:
+            aliases[s.name] = s.name
+            if s.location:
+                aliases[s.location] = s.name
+    return aliases
+
+
 def _loaded_skills_from_history(
     messages: list,
     allowed: set,
     decay_turns: int = SKILL_DECAY_TURNS,
     max_loaded: int = SKILL_MAX_LOADED,
+    aliases: Optional[dict] = None,
 ) -> set:
     """Return the set of freetext skill names that are currently active.
 
@@ -308,27 +352,36 @@ def _loaded_skills_from_history(
         allowed: Set of allowed skill names for the current session.
         decay_turns: Human turns after which an un-refreshed skill is evicted.
         max_loaded: Maximum number of simultaneously loaded skills (LRU).
+        aliases: Optional identifier → canonical-name map (see
+            ``_skill_alias_map``).  Defaults to the identity map over ``allowed``.
 
     Returns:
         Set of skill names whose bodies should be injected this turn.
     """
-    # Find the most recent AIMessage index at which get_skill was called per skill.
+    if aliases is None:
+        aliases = {name: name for name in allowed}
+
+    # Single pass: record the most recent get_skill call per skill and build
+    # a running human-turn count so decay can be computed without re-scanning
+    # the history per skill.
     last_load_idx: dict[str, int] = {}
+    humans_before: list[int] = []  # humans_before[i] = HumanMessages in messages[:i+1]
+    human_count = 0
     for i, msg in enumerate(messages):
+        if isinstance(msg, HumanMessage):
+            human_count += 1
+        humans_before.append(human_count)
         if isinstance(msg, AIMessage):
             for tc in getattr(msg, "tool_calls", []):
                 if tc["name"] == "get_skill":
-                    skill_name = tc["args"].get("skill_name", "")
-                    if skill_name and skill_name in allowed:
+                    skill_name = aliases.get(tc["args"].get("skill_name", ""))
+                    if skill_name:
                         last_load_idx[skill_name] = i
 
     # Keep only skills whose load is within the decay window.
     active: dict[str, int] = {}
     for skill_name, load_idx in last_load_idx.items():
-        turns_since = sum(
-            1 for j, m in enumerate(messages)
-            if j > load_idx and isinstance(m, HumanMessage)
-        )
+        turns_since = human_count - humans_before[load_idx]
         if turns_since <= decay_turns:
             active[skill_name] = load_idx
 
@@ -347,6 +400,7 @@ def create_agent_graph(
     min_messages_auto: int = MIN_MESSAGES_AUTO,
     min_messages_forced: int = MIN_MESSAGES_FORCED,
     compression_window_size: int = COMPRESSION_WINDOW_SIZE,
+    compaction_token_threshold: Optional[int] = None,
     skills_dir: str = "skills",
     agents_dir: Optional[str] = None,
     provider_config: Optional[dict] = None,
@@ -357,7 +411,9 @@ def create_agent_graph(
     On every agent-node invocation:
       1. LTM is queried with the current user message and injected into the
          system prompt (when ``ltm_factory`` is provided and a user_id is known).
-      2. The full message history is compacted when it exceeds the auto threshold.
+      2. When the history exceeds the auto threshold, a background compaction
+         task is started; its removals and rolling summary are applied on the
+         first turn after it completes (the turn itself is never blocked).
       3. The full non-compacted history is sent to the LLM, starting from
          the first HumanMessage (required by some providers, e.g. Mistral).
       4. Any dangling tool calls (interrupted prior turn) are repaired.
@@ -372,6 +428,11 @@ def create_agent_graph(
     # LTM store cache: one LTMStore instance per user_id for the lifetime of
     # this agent graph so we avoid reloading the JSON file on every turn.
     _ltm_cache: dict[str, LTMStore] = {}
+
+    # In-flight background auto-compaction tasks, keyed by thread_id.  The
+    # summarisation LLM call runs concurrently with the user's turn; its
+    # result is applied on the first call_model invocation after it finishes.
+    _compaction_tasks: dict[str, asyncio.Task] = {}
 
     def _get_ltm_store(user_id: str) -> Optional[LTMStore]:
         if not ltm_factory or not user_id:
@@ -401,10 +462,16 @@ def create_agent_graph(
         return ""
 
     def _make_get_skill_tool(allowed: set, decay_turns: int = SKILL_DECAY_TURNS):
-        """Build a LangChain StructuredTool that returns a freetext skill's body.
+        """Build a LangChain StructuredTool that loads a freetext skill.
 
         The returned tool is created fresh each turn with the current ``allowed``
         set baked in, so permission checks are always up-to-date.
+
+        A successful call returns a short acknowledgment, not the body: the
+        body is injected into the system prompt each turn by the
+        ``_loaded_skills_from_history`` lease mechanism.  Returning it here
+        too would duplicate the full text in the context window for the whole
+        decay window, and the ToolMessage copy would outlive lease eviction.
         """
         from langchain_core.tools import StructuredTool
         from pydantic import BaseModel as _BaseModel
@@ -412,8 +479,11 @@ def create_agent_graph(
         class _Input(_BaseModel):
             skill_name: str
 
+        aliases = _skill_alias_map(registry, allowed)
+
         def _fn(skill_name: str) -> str:
-            if skill_name not in allowed:
+            canonical = aliases.get(skill_name)
+            if canonical is None:
                 available = [
                     s.location or s.name
                     for s in registry.list_skills()
@@ -423,21 +493,25 @@ def create_agent_graph(
                     f"Skill '{skill_name}' is not available. "
                     f"Available knowledge skills: {available}"
                 )
-            skill = registry.get_skill(skill_name)
+            skill = registry.get_skill(canonical)
             if skill is None:
                 return f"Skill '{skill_name}' not found."
             if not skill.body:
                 return f"Skill '{skill_name}' has no loadable body."
-            return skill.body
+            return (
+                f"Skill '{skill.name}' loaded. Its full instructions are now "
+                f"in the system prompt under '--- {skill.name} skill context ---' "
+                f"and stay available for {decay_turns} turns."
+            )
 
         return StructuredTool.from_function(
             func=_fn,
             name="get_skill",
             description=(
-                "Load the full instructions for a knowledge skill. "
-                "Pass the skill name shown in [load: <name>] in the skills list. "
-                f"Loaded skills are injected for {decay_turns} turns; "
-                "call again to refresh."
+                "Load the full instructions for a knowledge skill into the "
+                "system prompt. Pass the skill name shown in [load: <name>] "
+                f"in the skills list. Loaded skills are injected for "
+                f"{decay_turns} turns; call again to refresh."
             ),
             args_schema=_Input,
         )
@@ -458,6 +532,7 @@ def create_agent_graph(
         state: AgentState,
         config: RunnableConfig,
         ltm_context: str = "",
+        summary_override: Optional[str] = None,
     ) -> str | None:
         """Assemble the system prompt for this turn from in-memory skill objects.
 
@@ -469,7 +544,8 @@ def create_agent_graph(
         - **Tier 2a** - full prose body for ``always_inject`` skills.
         - **Tier 2b** - full prose body for progressively-loaded freetext skills
           (those whose ``get_skill`` lease has not yet expired this session).
-        - **Tier 3** - long-term memory: manual entries from config plus
+        - **Tier 3** - rolling summary of compacted-away conversation segments.
+        - **Tier 4** - long-term memory: manual entries from config plus
           semantically retrieved compaction entries (``ltm_context``).
 
         Returns ``None`` when nothing would be included.
@@ -485,6 +561,7 @@ def create_agent_graph(
         loaded_skill_names = _loaded_skills_from_history(
             list(state["messages"]), allowed,
             decay_turns=decay_turns, max_loaded=max_loaded,
+            aliases=_skill_alias_map(registry, allowed),
         )
 
         parts: List[str] = []
@@ -527,7 +604,20 @@ def create_agent_graph(
 
             parts.append(skill_block)
 
-        # Tier 3
+        # Tier 3: continuity bridge for compacted-away history.  The override
+        # carries a summary produced by a compaction earlier in this same turn
+        # (not yet visible in the checkpointed state).
+        rolling_summary = (
+            summary_override if summary_override is not None
+            else state.get("summary", "")
+        )
+        if rolling_summary:
+            parts.append(
+                "--- Earlier conversation (compacted) ---\n"
+                f"{rolling_summary}"
+            )
+
+        # Tier 4
         if manual_ltm or ltm_context:
             ltm_lines = ["--- Long-term memory ---"]
             if manual_ltm:
@@ -540,7 +630,7 @@ def create_agent_graph(
 
     def _repair_dangling_tool_calls(
         messages: List[BaseMessage],
-    ) -> Tuple[List[ToolMessage], List[BaseMessage]]:
+    ) -> List[BaseMessage]:
         """Fix tool_use blocks that are not immediately followed by their tool_result.
 
         Two failure modes are handled:
@@ -568,7 +658,7 @@ def create_agent_graph(
             return False
 
         if not _needs_repair():
-            return [], messages
+            return messages
 
         # Build a lookup of existing ToolMessages by tool_call_id.
         tm_by_id: dict[str, ToolMessage] = {
@@ -600,7 +690,7 @@ def create_agent_graph(
                             name=tc["name"],
                         ))
 
-        return [], patched
+        return patched
 
     async def call_model(state: AgentState, config: RunnableConfig) -> dict:
         all_messages = list(state["messages"])
@@ -616,19 +706,52 @@ def create_agent_graph(
                 if entries:
                     ltm_context = ltm_store.format_for_prompt(entries)
 
-        # Compact history when it has grown beyond the auto threshold.
+        # Auto-compaction runs as a background task so its extra LLM round
+        # trip never blocks the current turn.  A finished task's removals and
+        # summary are applied here on the next turn.
         compaction_removes: List[BaseMessage] = []
-        if len(all_messages) >= min_messages_auto + compression_window_size:
-            _, compaction_removes = await compact_history(
-                all_messages, provider, ltm_store=ltm_store,
-                min_messages_auto=min_messages_auto,
-                min_messages_forced=min_messages_forced,
-                compression_window_size=compression_window_size,
+        compaction_summary = ""
+        thread = _session_id(config)
+        compaction_task = _compaction_tasks.get(thread)
+        if compaction_task is not None and compaction_task.done():
+            del _compaction_tasks[thread]
+            try:
+                compaction_summary, removes = compaction_task.result()
+            except Exception as exc:
+                log.warning("Background compaction failed: %s", exc)
+            else:
+                # Apply only removals whose messages still exist - a forced
+                # /compact may have already deleted them in the meantime.
+                present_ids = {m.id for m in all_messages}
+                compaction_removes = [r for r in removes if r.id in present_ids]
+                if compaction_removes:
+                    remove_ids = {r.id for r in compaction_removes}
+                    all_messages = [
+                        m for m in all_messages if m.id not in remove_ids
+                    ]
+        elif compaction_task is None:
+            # Two triggers: message count, or (optionally) the input-token
+            # footprint of the last model call - message counts say nothing
+            # about actual context size.
+            msgs_trigger = (
+                len(all_messages) >= min_messages_auto + compression_window_size
             )
-            if compaction_removes:
-                # Remove compacted messages from the local working copy.
-                remove_ids = {r.id for r in compaction_removes}
-                all_messages = [m for m in all_messages if m.id not in remove_ids]
+            tokens_trigger = (
+                compaction_token_threshold is not None
+                and _last_input_tokens(all_messages) >= compaction_token_threshold
+            )
+            if msgs_trigger or tokens_trigger:
+                _compaction_tasks[thread] = asyncio.create_task(compact_history(
+                    list(all_messages), provider, ltm_store=ltm_store,
+                    min_messages_auto=min_messages_auto,
+                    min_messages_forced=min_messages_forced,
+                    compression_window_size=compression_window_size,
+                    prior_summary=state.get("summary", ""),
+                    # The token trigger may fire on short-but-heavy histories
+                    # below the message-count floor; force uses the smaller
+                    # forced floor so compaction actually happens.
+                    force=not msgs_trigger,
+                ))
 
         # Send the full non-compacted history to the LLM.  Compaction already
         # bounds the checkpoint size; trimming further would discard context
@@ -644,7 +767,7 @@ def create_agent_graph(
         )
 
         # Repair any dangling tool calls within the context window.
-        repair_msgs, clean_messages = _repair_dangling_tool_calls(context_msgs)
+        clean_messages = _repair_dangling_tool_calls(context_msgs)
 
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
@@ -695,7 +818,10 @@ def create_agent_graph(
         else:
             normalized_tools = None
 
-        system_prompt = _build_system_prompt(state, config, ltm_context=ltm_context)
+        system_prompt = _build_system_prompt(
+            state, config, ltm_context=ltm_context,
+            summary_override=compaction_summary or None,
+        )
 
         response = await _achat_with_retry(
             provider,
@@ -704,7 +830,10 @@ def create_agent_graph(
             system_prompt=system_prompt,
         )
 
-        return {"messages": compaction_removes + repair_msgs + [response]}
+        result: dict = {"messages": compaction_removes + [response]}
+        if compaction_summary:
+            result["summary"] = compaction_summary
+        return result
 
     async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:
         # Infinite loop guard: block any tool call that has appeared consecutively

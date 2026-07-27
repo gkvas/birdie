@@ -126,7 +126,10 @@ class SkillRegistry:
                 included.
 
         Returns:
-            List of matching ``SkillTool`` objects.
+            List of matching ``SkillTool`` objects, in registration order.
+            The order is deterministic so the tool list presented to the LLM
+            is stable across turns and processes (reproducible behaviour,
+            provider prompt-cache friendly).
         """
         tool_names = set(self._tools.keys())
 
@@ -145,7 +148,11 @@ class SkillRegistry:
                         skill_filtered.add(tool.name)
             tool_names.intersection_update(skill_filtered)
 
-        return [self._tools[name] for name in tool_names]
+        # self._tools is insertion-ordered; filter it rather than iterating
+        # the set so the result order never depends on string hashing.
+        return [
+            tool for name, tool in self._tools.items() if name in tool_names
+        ]
 
     def get_tool(self, name: str) -> Optional[SkillTool]:
         """Look up a tool by name.
@@ -178,32 +185,3 @@ class SkillRegistry:
         if allowed_skill_names is None:
             return True
         return self._tool_to_skill.get(tool_name) in allowed_skill_names
-
-    def find_skills_by_trigger(
-        self,
-        text: str,
-        allowed_skill_names: Optional[Set[str]] = None,
-    ) -> List[Skill]:
-        """Return freetext skills whose trigger keywords appear in *text*.
-
-        Only skills without tools (freetext skills) participate - structured
-        skills are never matched here.  Matching is case-insensitive substring.
-
-        Args:
-            text: The user's message text to search within.
-            allowed_skill_names: Optional allow-set; skills outside this set
-                are ignored even if their triggers match.
-
-        Returns:
-            List of matching freetext ``Skill`` objects.
-        """
-        lower = text.lower()
-        matched = []
-        for skill in self._skills.values():
-            if allowed_skill_names is not None and skill.name not in allowed_skill_names:
-                continue
-            if not skill.triggers or skill.tools:
-                continue
-            if any(trigger.lower() in lower for trigger in skill.triggers):
-                matched.append(skill)
-        return matched

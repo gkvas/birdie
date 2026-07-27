@@ -146,8 +146,12 @@ class LTMStore:
         ``compaction_result`` must have the keys produced by the compaction
         prompt: ``summary``, ``extracted_facts``, ``user_preferences``,
         ``world_facts``, ``tool_results``, ``open_tasks``.
+
+        The file is re-read immediately before appending so that entries
+        written by a concurrent session of the same user are not clobbered
+        (best-effort; the write itself is atomic but not locked).
         """
-        self._ensure_loaded()
+        self.load()
 
         retrieval_text = " ".join(filter(None, [
             compaction_result.get("summary", ""),

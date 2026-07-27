@@ -184,3 +184,68 @@ def test_only_allowed_skills_tracked():
 def test_default_constants():
     assert SKILL_DECAY_TURNS == 5
     assert SKILL_MAX_LOADED == 3
+
+
+class TestGetSkillReturnValue:
+    """get_skill acks instead of duplicating the body: the body reaches the
+    LLM via the system-prompt lease, not the ToolMessage."""
+
+    @pytest.mark.asyncio
+    async def test_get_skill_tool_returns_ack_not_body(self, tmp_path):
+        import os
+        from birdie.agent.run import DynamicAgent
+
+        skill_dir = tmp_path / "knowledge"
+        os.makedirs(skill_dir)
+        (skill_dir / "SKILL.MD").write_text(
+            "---\n"
+            "name: Knowledge\n"
+            "version: 1.0.0\n"
+            "description: A knowledge skill\n"
+            "---\n\n"
+            "SECRET BODY TEXT that must not appear in the tool result.\n"
+        )
+
+        call_count = 0
+        captured_system_prompts = []
+
+        class _Provider:
+            def supports_tools(self):
+                return True
+
+            async def achat(self, messages, tools=None, system_prompt=None, **kw):
+                nonlocal call_count
+                call_count += 1
+                captured_system_prompts.append(system_prompt or "")
+                if call_count == 1:
+                    return AIMessage(
+                        content="",
+                        tool_calls=[{
+                            "name": "get_skill",
+                            "args": {"skill_name": "Knowledge"},
+                            "id": "tc1",
+                        }],
+                    )
+                return AIMessage(content="Done")
+
+        from birdie.core.llm_provider import LLMProvider
+        provider = _Provider()
+        # Duck-typed provider: DynamicAgent wraps non-LLMProvider objects in
+        # LangChainProvider, so register as a virtual subclass instead.
+        LLMProvider.register(_Provider)
+
+        agent = DynamicAgent(
+            provider, skills_dir=str(tmp_path), skills_enabled=["Knowledge"]
+        )
+        result = await agent.invoke("load the knowledge skill", thread_id="t1")
+
+        tool_msgs = [
+            m for m in result["messages"]
+            if isinstance(m, ToolMessage) and m.name == "get_skill"
+        ]
+        assert len(tool_msgs) == 1
+        assert "SECRET BODY TEXT" not in tool_msgs[0].content
+        assert "loaded" in tool_msgs[0].content.lower()
+        # The body must instead be injected into the system prompt of the
+        # follow-up model call.
+        assert "SECRET BODY TEXT" in captured_system_prompts[-1]

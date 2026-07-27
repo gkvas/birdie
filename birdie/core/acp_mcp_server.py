@@ -71,10 +71,18 @@ def _build_server(tool_defs: list[dict], agent_defs: list[dict]) -> Server:
     return server
 
 
+# Sub-agent instances reused across call_tool invocations (construction
+# re-parses all skills/agents from disk).  Keyed by agent name; each run uses
+# a fresh thread_id so histories never bleed between calls.
+_agent_cache: dict = {}
+
+
 async def _invoke_agent(agent_raw: dict, arguments: dict) -> str:
-    """Spin up an ephemeral DynamicAgent and run the agent prompt."""
+    """Run the agent prompt on a cached ephemeral DynamicAgent."""
     # Import here to avoid circular imports at module load time.
-    from birdie.core.models import AgentDef, AgentParam
+    import uuid
+
+    from birdie.core.models import AgentDef
     from birdie.agent.run import DynamicAgent
 
     # Reconstruct the AgentDef from the serialised dict stored in BIRDIE_AGENTS_JSON.
@@ -86,29 +94,28 @@ async def _invoke_agent(agent_raw: dict, arguments: dict) -> str:
     skills_dir: str = agent_raw.get("_skills_dir", "skills")
     agents_dir: str | None = agent_raw.get("_agents_dir")
 
-    # Build the prompt by substituting {{ param }} placeholders.
-    import re
+    # Build the prompt: {{ param }} substitution + output-format instructions.
+    from birdie.core.agent_runner import render_agent_prompt
 
-    def _substitute(template: str, params: dict) -> str:
-        def replace(m: re.Match) -> str:
-            key = m.group(1).strip()
-            return str(params.get(key, m.group(0)))
-        return re.sub(r'\{\{\s*(\w+)\s*\}\}', replace, template)
+    prompt = render_agent_prompt(agent_def, arguments)
 
-    prompt = _substitute(agent_def.prompt, arguments)
+    sub_agent = _agent_cache.get(agent_def.name)
+    if sub_agent is None:
+        sub_agent = DynamicAgent.from_config(
+            provider_config=provider_config or None,
+            skills_dir=skills_dir,
+            agents_dir=agents_dir,
+        )
+        _agent_cache[agent_def.name] = sub_agent
 
-    sub_agent = DynamicAgent.from_config(
-        provider_config=provider_config or None,
-        skills_dir=skills_dir,
-        agents_dir=agents_dir,
-    )
-    sub_agent.enable_skills_for_session("_acp_run", agent_def.allowed_skills)
+    thread = f"_acp_run-{uuid.uuid4().hex[:8]}"
+    sub_agent.enable_skills_for_session(thread, agent_def.allowed_skills)
 
     invoke_config = {
         "recursion_limit": agent_def.recursion_limit,
         "configurable": {"max_tool_repetitions": agent_def.max_tool_repetitions},
     }
-    result = await sub_agent.invoke(prompt, thread_id="_acp_run", config=invoke_config)
+    result = await sub_agent.invoke(prompt, thread_id=thread, config=invoke_config)
     last = result["messages"][-1]
     content = last.content
     if isinstance(content, list):
