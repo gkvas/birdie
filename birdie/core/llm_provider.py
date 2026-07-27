@@ -341,8 +341,9 @@ def _lc_to_openai_messages(
             result.append({"role": "user", "content": str(msg.content)})
         elif isinstance(msg, AIMessage):
             if msg.tool_calls:
-                # Omit content when tool_calls are present - Mistral (and OpenAI)
-                # reject content="" alongside tool_calls in history messages.
+                # Omit *empty* content when tool_calls are present - Mistral
+                # (and OpenAI) reject content="" alongside tool_calls in
+                # history messages.  Non-empty assistant text is preserved.
                 m: dict[str, Any] = {
                     "role": "assistant",
                     "tool_calls": [
@@ -357,6 +358,9 @@ def _lc_to_openai_messages(
                         for tc in msg.tool_calls
                     ],
                 }
+                text = str(msg.content) if msg.content else ""
+                if text:
+                    m["content"] = text
             else:
                 m = {"role": "assistant", "content": msg.content or ""}
             result.append(m)

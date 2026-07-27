@@ -98,6 +98,23 @@ class TestOpenAIMessageConversion:
         assert tc["function"]["name"] == "get_weather"
         assert json.loads(tc["function"]["arguments"]) == {"city": "Graz"}
 
+    def test_ai_message_with_tool_calls_keeps_text_content(self):
+        msg = AIMessage(
+            content="Checking the weather now.",
+            tool_calls=[{"id": "c1", "name": "get_weather", "args": {"city": "Graz"}, "type": "tool_call"}],
+        )
+        result = _lc_to_openai_messages([msg])
+        assert result[0]["content"] == "Checking the weather now."
+        assert result[0]["tool_calls"][0]["id"] == "c1"
+
+    def test_ai_message_with_tool_calls_omits_empty_content(self):
+        msg = AIMessage(
+            content="",
+            tool_calls=[{"id": "c1", "name": "get_weather", "args": {}, "type": "tool_call"}],
+        )
+        result = _lc_to_openai_messages([msg])
+        assert "content" not in result[0]
+
     def test_tool_message(self):
         msg = ToolMessage(content="sunny", tool_call_id="c1")
         result = _lc_to_openai_messages([msg])
