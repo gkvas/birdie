@@ -291,11 +291,27 @@ def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
     return count
 
 
+def _skill_alias_map(registry: SkillRegistry, allowed: set) -> dict[str, str]:
+    """Map every accepted skill identifier (name or location) to the canonical name.
+
+    The system prompt advertises ``[load: <location>]`` (falling back to the
+    name), so ``get_skill`` calls may arrive with either identifier.
+    """
+    aliases: dict[str, str] = {}
+    for s in registry.list_skills():
+        if s.name in allowed:
+            aliases[s.name] = s.name
+            if s.location:
+                aliases[s.location] = s.name
+    return aliases
+
+
 def _loaded_skills_from_history(
     messages: list,
     allowed: set,
     decay_turns: int = SKILL_DECAY_TURNS,
     max_loaded: int = SKILL_MAX_LOADED,
+    aliases: Optional[dict] = None,
 ) -> set:
     """Return the set of freetext skill names that are currently active.
 
@@ -308,18 +324,23 @@ def _loaded_skills_from_history(
         allowed: Set of allowed skill names for the current session.
         decay_turns: Human turns after which an un-refreshed skill is evicted.
         max_loaded: Maximum number of simultaneously loaded skills (LRU).
+        aliases: Optional identifier → canonical-name map (see
+            ``_skill_alias_map``).  Defaults to the identity map over ``allowed``.
 
     Returns:
         Set of skill names whose bodies should be injected this turn.
     """
+    if aliases is None:
+        aliases = {name: name for name in allowed}
+
     # Find the most recent AIMessage index at which get_skill was called per skill.
     last_load_idx: dict[str, int] = {}
     for i, msg in enumerate(messages):
         if isinstance(msg, AIMessage):
             for tc in getattr(msg, "tool_calls", []):
                 if tc["name"] == "get_skill":
-                    skill_name = tc["args"].get("skill_name", "")
-                    if skill_name and skill_name in allowed:
+                    skill_name = aliases.get(tc["args"].get("skill_name", ""))
+                    if skill_name:
                         last_load_idx[skill_name] = i
 
     # Keep only skills whose load is within the decay window.
@@ -412,8 +433,11 @@ def create_agent_graph(
         class _Input(_BaseModel):
             skill_name: str
 
+        aliases = _skill_alias_map(registry, allowed)
+
         def _fn(skill_name: str) -> str:
-            if skill_name not in allowed:
+            canonical = aliases.get(skill_name)
+            if canonical is None:
                 available = [
                     s.location or s.name
                     for s in registry.list_skills()
@@ -423,7 +447,7 @@ def create_agent_graph(
                     f"Skill '{skill_name}' is not available. "
                     f"Available knowledge skills: {available}"
                 )
-            skill = registry.get_skill(skill_name)
+            skill = registry.get_skill(canonical)
             if skill is None:
                 return f"Skill '{skill_name}' not found."
             if not skill.body:
@@ -485,6 +509,7 @@ def create_agent_graph(
         loaded_skill_names = _loaded_skills_from_history(
             list(state["messages"]), allowed,
             decay_turns=decay_turns, max_loaded=max_loaded,
+            aliases=_skill_alias_map(registry, allowed),
         )
 
         parts: List[str] = []
