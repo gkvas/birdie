@@ -120,7 +120,7 @@ The `model` field is the binary name to spawn. Birdie starts it as a child proce
 | `model` | string | provider default | Model identifier |
 | `api_key` | string | from env var | API key (omit to use env var) |
 | `base_url` | string | - | Override API endpoint (proxy, local server) |
-| `temperature` | float | `0.0` | Sampling temperature (0.0 - 2.0) |
+| `temperature` | float | `0.0` | Sampling temperature (0.0 - 2.0). Ignored for Anthropic models that removed sampling parameters (Opus 4.7+, Opus 5, Sonnet 5, Fable 5, ...) |
 | `max_tokens` | int | - | Max completion tokens |
 | `api_version` | string | `2024-02-01` | Azure OpenAI API version |
 | `timeout` | float | `120.0` | Request timeout in seconds (Mistral) |

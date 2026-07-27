@@ -869,11 +869,45 @@ def _tools_to_anthropic(tools: list[NormalizedToolDef]) -> list[dict]:
     ]
 
 
+# Model families that removed the sampling parameters (temperature / top_p /
+# top_k).  Sending `temperature` to any of these returns HTTP 400
+# ("`temperature` is deprecated for this model.").
+_ANTHROPIC_NO_SAMPLING_MODELS = (
+    "claude-opus-5",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+)
+
+
+def _anthropic_accepts_temperature(model: str) -> bool:
+    """True when the Anthropic model still accepts the `temperature` parameter."""
+    name = (model or "").lower()
+    return not any(prefix in name for prefix in _ANTHROPIC_NO_SAMPLING_MODELS)
+
+
+def _is_temperature_rejection(exc: Exception) -> bool:
+    """True when an Anthropic API error complains about `temperature`."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status != 400:
+        return False
+    return "temperature" in str(exc).lower()
+
+
 class AnthropicProvider(LLMProvider):
     """
     Anthropic Claude via the official anthropic SDK.
 
     Install: pip install anthropic
+
+    Newer models (Opus 4.7+, Opus 5, Sonnet 5, Fable 5, ...) removed the
+    sampling parameters; `temperature` is omitted for those models and is
+    dropped automatically if the API rejects it at runtime.
     """
 
     def __init__(
@@ -894,6 +928,7 @@ class AnthropicProvider(LLMProvider):
         self._async_client = _anthropic.AsyncAnthropic(api_key=key)
         self._model = model
         self._temperature = temperature
+        self._send_temperature = _anthropic_accepts_temperature(model)
         # Anthropic requires max_tokens; use 4096 as a safe default
         self._max_tokens = max_tokens or 4096
 
@@ -925,14 +960,27 @@ class AnthropicProvider(LLMProvider):
         kw: dict[str, Any] = {
             "model": self._model,
             "messages": _lc_to_anthropic_messages(non_system),
-            "temperature": temperature if temperature is not None else self._temperature,
             "max_tokens": max_tokens if max_tokens is not None else self._max_tokens,
         }
+        if self._send_temperature:
+            kw["temperature"] = temperature if temperature is not None else self._temperature
         if resolved_system:
             kw["system"] = resolved_system
         if tools:
             kw["tools"] = _tools_to_anthropic(tools)
         return kw
+
+    def _drop_temperature(self, kw: dict) -> bool:
+        """
+        Remove `temperature` from a request after the API rejected it.
+
+        Returns True when the kwargs changed (i.e. a retry is worthwhile).
+        """
+        if "temperature" not in kw:
+            return False
+        self._send_temperature = False
+        kw.pop("temperature")
+        return True
 
     def chat(
         self,
@@ -946,7 +994,12 @@ class AnthropicProvider(LLMProvider):
     ) -> BaseMessage:
         kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens)
         self._log_request(messages, tools, system_prompt)
-        response = self._client.messages.create(**kw)
+        try:
+            response = self._client.messages.create(**kw)
+        except Exception as e:
+            if not (_is_temperature_rejection(e) and self._drop_temperature(kw)):
+                raise
+            response = self._client.messages.create(**kw)
         result = _anthropic_response_to_lc(response)
         self._log_response(result)
         return result
@@ -963,7 +1016,12 @@ class AnthropicProvider(LLMProvider):
     ) -> BaseMessage:
         kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens)
         self._log_request(messages, tools, system_prompt)
-        response = await self._async_client.messages.create(**kw)
+        try:
+            response = await self._async_client.messages.create(**kw)
+        except Exception as e:
+            if not (_is_temperature_rejection(e) and self._drop_temperature(kw)):
+                raise
+            response = await self._async_client.messages.create(**kw)
         result = _anthropic_response_to_lc(response)
         self._log_response(result)
         return result
@@ -976,6 +1034,16 @@ class AnthropicProvider(LLMProvider):
         **kwargs: Any,
     ) -> Iterator[BaseMessage]:
         kw = self._build_kwargs(messages, tools, system_prompt, kwargs.pop("temperature", 0.0), None)
+        yielded = False
+        try:
+            with self._client.messages.stream(**kw) as stream:
+                for text in stream.text_stream:
+                    yielded = True
+                    yield AIMessageChunk(content=text)
+            return
+        except Exception as e:
+            if yielded or not (_is_temperature_rejection(e) and self._drop_temperature(kw)):
+                raise
         with self._client.messages.stream(**kw) as stream:
             for text in stream.text_stream:
                 yield AIMessageChunk(content=text)
@@ -988,6 +1056,16 @@ class AnthropicProvider(LLMProvider):
         **kwargs: Any,
     ) -> AsyncIterator[BaseMessage]:
         kw = self._build_kwargs(messages, tools, system_prompt, kwargs.pop("temperature", 0.0), None)
+        yielded = False
+        try:
+            async with self._async_client.messages.stream(**kw) as stream:
+                async for text in stream.text_stream:
+                    yielded = True
+                    yield AIMessageChunk(content=text)
+            return
+        except Exception as e:
+            if yielded or not (_is_temperature_rejection(e) and self._drop_temperature(kw)):
+                raise
         async with self._async_client.messages.stream(**kw) as stream:
             async for text in stream.text_stream:
                 yield AIMessageChunk(content=text)
