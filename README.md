@@ -1,17 +1,17 @@
 # Birdie
 
 ```
-      ___                       ___           ___                       ___     
-    /\  \          ___        /\  \         /\  \          ___        /\  \    
-   /::\  \        /\  \      /::\  \       /::\  \        /\  \      /::\  \   
-  /:/\:\  \       \:\  \    /:/\:\  \     /:/\:\  \       \:\  \    /:/\:\  \  
- /::\~\:\__\      /::\__\  /::\~\:\  \   /:/  \:\__\      /::\__\  /::\~\:\  \ 
+      ___                       ___           ___                       ___
+    /\  \          ___        /\  \         /\  \          ___        /\  \
+   /::\  \        /\  \      /::\  \       /::\  \        /\  \      /::\  \
+  /:/\:\  \       \:\  \    /:/\:\  \     /:/\:\  \       \:\  \    /:/\:\  \
+ /::\~\:\__\      /::\__\  /::\~\:\  \   /:/  \:\__\      /::\__\  /::\~\:\  \
 /:/\:\ \:|__|  __/:/\/__/ /:/\:\ \:\__\ /:/__/ \:|__|  __/:/\/__/ /:/\:\ \:\__\
 \:\~\:\/:/  / /\/:/  /    \/_|::\/:/  / \:\  \ /:/  / /\/:/  /    \:\~\:\ \/__/
- \:\ \::/  /  \::/__/        |:|::/  /   \:\  /:/  /  \::/__/      \:\ \:\__\  
-  \:\/:/  /    \:\__\        |:|\/__/     \:\/:/  /    \:\__\       \:\ \/__/  
-   \::/__/      \/__/        |:|  |        \::/__/      \/__/        \:\__\    
-    ~~                        \|__|         ~~                        \/__/    
+ \:\ \::/  /  \::/__/        |:|::/  /   \:\  /:/  /  \::/__/      \:\ \:\__\
+  \:\/:/  /    \:\__\        |:|\/__/     \:\/:/  /    \:\__\       \:\ \/__/
+   \::/__/      \/__/        |:|  |        \::/__/      \/__/        \:\__\
+    ~~                        \|__|         ~~                        \/__/
 ```
 
 A LangGraph-based agent that discovers capabilities at runtime from **SKILL.MD** and **AGENT.MD** files. Skills, tools, and sub-agents are all declared in plain Markdown - no code changes required to add new capabilities.
@@ -76,8 +76,8 @@ export LLM_MODEL=mistral-large-latest
 export MISTRAL_API_KEY=your-key-here
 birdie
 
-#Azure OpenAI
-export  LLM_VENDOR=azure
+# Azure OpenAI
+export LLM_VENDOR=azure
 export LLM_MODEL=your-deployment-name
 export AZURE_OPENAI_API_KEY=your-key-here
 export AZURE_OPENAI_ENDPOINT=your-base-url
@@ -147,7 +147,7 @@ See [doc/agents.md](doc/agents.md) for the full AGENT.MD format and how to write
 
 Birdie maintains three separate memory stores that work together to give the agent context across turns and sessions.
 
-**Short-term memory** is handled automatically by LangGraph's SQLite checkpointer. Every message is stored in `~/.birdie/sessions/<user>/checkpoints.db` and loaded at the start of each turn. The agent trims the loaded history to a 20-message context window before calling the LLM, so cost stays bounded even in very long sessions.
+**Short-term memory** is handled automatically by LangGraph's SQLite checkpointer. Every message is stored in `~/.birdie/sessions/<user>/checkpoints.db` and loaded at the start of each turn. The full history is sent to the LLM; once it grows past the compaction threshold (80 messages by default, or a configurable token budget), the oldest segment is summarised away in the background so cost stays bounded even in very long sessions.
 
 **Manual long-term memory** is written by you, explicitly. Use `/remember` to save any fact you want the agent to recall in future sessions:
 
@@ -156,9 +156,9 @@ Birdie maintains three separate memory stores that work together to give the age
 /remember The project uses Python 3.12 and pytest for tests
 ```
 
-Notes are stored in `~/.birdie/sessions/<user>/memory.json` and injected into the system prompt at the start of every turn, across all sessions.
+Notes are stored in `~/.birdie/sessions/<user>/memory.json` and injected into the model's context on every turn, across all sessions.
 
-**Automatic long-term memory** is written by the compaction pipeline. When a session grows beyond 100 messages, Birdie automatically summarises the oldest segment using the LLM, extracts structured facts, preferences, tool outcomes, and open tasks, and stores them in `~/.birdie/ltm/<user>.json`. On future turns, the top-5 most semantically relevant entries are retrieved and injected alongside your manual `/remember` notes.
+**Automatic long-term memory** is written by the compaction pipeline. When a session grows beyond 80 messages, Birdie summarises the oldest segment using the LLM in the background, extracts structured facts, preferences, tool outcomes, and open tasks, and stores them in `~/.birdie/ltm/<user>.json`. The summary also stays with the session as a rolling continuity bridge, and on future turns the top-5 most semantically relevant entries are retrieved and injected alongside your manual `/remember` notes.
 
 You can trigger compaction at any time with:
 
@@ -184,8 +184,12 @@ See [doc/architecture.md](doc/architecture.md) for a detailed explanation of how
 | `/agent enable <name>` | Enable a sub-agent for this session |
 | `/agent output short\|full\|off` | Control sub-agent transcript verbosity |
 | `/tool output short\|full\|off` | Control tool result verbosity |
+| `/skill reload` | Re-discover skills from disk |
+| `/skill new <name>` | Scaffold a new SKILL.MD |
 | `/remember <text>` | Save a note to long-term memory |
 | `/compact` | Summarise old messages into long-term memory now |
+| `/cost` | Show token usage and estimated cost |
+| `/history [N]` | Replay the last N messages of this session |
 | `/session new` | Start a new session |
 | `/session list` | List all sessions |
 | `/help` | Show all commands |
@@ -200,6 +204,7 @@ See [doc/architecture.md](doc/architecture.md) for a detailed explanation of how
 | [doc/skills.md](doc/skills.md) | SKILL.MD format, entrypoints, tool and knowledge skills, skill loading |
 | [doc/agents.md](doc/agents.md) | AGENT.MD format, sub-agent system, runtime controls, custom agents |
 | [doc/mcp.md](doc/mcp.md) | MCP integration, declaring MCP servers, writing MCP servers |
+| [doc/memory.md](doc/memory.md) | Short-term and long-term memory stores, compaction, session files |
 | [doc/architecture.md](doc/architecture.md) | Project layout, agent loop, system prompt, providers, conversation compaction, long-term memory store, sessions |
 
 ---
