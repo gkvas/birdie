@@ -8,6 +8,7 @@ At call time:
   4. The final AIMessage content is returned as the tool result.
 """
 
+import json
 import re
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -75,6 +76,59 @@ def _input_schema(params: List[AgentParam]) -> dict:
     if required:
         schema["required"] = required
     return schema
+
+
+_JSON_TYPE_CHECKS: Dict[str, Any] = {
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+    "array": list,
+    "object": dict,
+}
+
+
+def parse_agent_output(
+    agent_def: AgentDef, text: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Validate a sub-agent reply against its declared ``output_params``.
+
+    Extracts a JSON object from *text* (tolerating surrounding prose), checks
+    that every required declared field is present with the declared type, and
+    returns ``(canonical_json, None)`` on success or ``(None, error)`` with a
+    human-readable error the sub-agent can act on.
+    """
+    stripped = text.strip()
+    data: Any = None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        m = re.search(r'\{.*\}', stripped, re.DOTALL)
+        if m is None:
+            return None, "the reply contains no JSON object"
+        try:
+            data = json.loads(m.group())
+        except json.JSONDecodeError:
+            return None, "the reply is not valid JSON"
+
+    if not isinstance(data, dict):
+        return None, "the top-level JSON value must be an object"
+
+    errors: List[str] = []
+    for p in agent_def.output_params:
+        if p.name not in data:
+            if p.required:
+                errors.append(f"missing required field '{p.name}'")
+            continue
+        expected = _JSON_TYPE_CHECKS.get(p.type)
+        if expected is not None and not isinstance(data[p.name], expected):
+            errors.append(
+                f"field '{p.name}' must be of type {p.type}, "
+                f"got {type(data[p.name]).__name__}"
+            )
+    if errors:
+        return None, "; ".join(errors)
+    return json.dumps(data, ensure_ascii=False), None
 
 
 def _extract_text(content: Any) -> str:
@@ -247,13 +301,29 @@ def agentdef_to_langchain_tool(
             "configurable": {"max_tool_repetitions": agent_def.max_tool_repetitions},
         }
 
+        async def _finalize(text: str) -> str:
+            """Validate against output_params, retrying once on mismatch."""
+            if not agent_def.output_params:
+                return text
+            cleaned, err = parse_agent_output(agent_def, text)
+            if err is None:
+                return cleaned
+            retry = await sub_agent.invoke(
+                f"Your previous reply was invalid: {err}. Return ONLY a "
+                "single JSON object with exactly the required fields.",
+                thread_id=thread, config=invoke_config,
+            )
+            text = _extract_text(retry["messages"][-1].content)
+            cleaned, err = parse_agent_output(agent_def, text)
+            return cleaned if err is None else text
+
         if console is None:
             # Silent path: run to completion and return the last message.
             result = await sub_agent.invoke(
                 prompt, thread_id=thread, config=invoke_config,
             )
             last = result["messages"][-1]
-            return _extract_text(last.content)
+            return await _finalize(_extract_text(last.content))
 
         # Streaming path: collect messages, then print as one block.
         mode = get_tool_output_mode() if get_tool_output_mode else "off"
@@ -277,7 +347,7 @@ def agentdef_to_langchain_tool(
         if transcript and mode != "off":
             _print_agent_transcript(console, run_id, transcript, mode)
 
-        return final_content
+        return await _finalize(final_content)
 
     from .adapter import create_args_schema
     schema = _input_schema(agent_def.input_params)

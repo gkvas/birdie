@@ -58,6 +58,8 @@ HELP_TEXT = """
   [yellow]/cd <path>[/yellow]                    Change working directory (default: home)
   [yellow]/remember <text>[/yellow]              Save a note to long-term memory
   [yellow]/compact[/yellow]                      Force-compact conversation history into LTM now
+  [yellow]/cost[/yellow]                         Show token usage and estimated cost for this session
+  [yellow]/history \[N][/yellow]                  Show the last N messages of this session (default 10)
   [yellow]/info[/yellow]                         Show session info (user, session, provider)
 
   [bold]Tool commands[/bold]
@@ -72,6 +74,8 @@ HELP_TEXT = """
   [yellow]/skill list[/yellow]                   List all loaded skills with status
   [yellow]/skill enable <name>[/yellow]          Enable a skill (persists to session)
   [yellow]/skill disable <name>[/yellow]         Disable a skill (persists to session)
+  [yellow]/skill reload[/yellow]                 Re-discover skills from disk (picks up edits)
+  [yellow]/skill new <name>[/yellow]             Scaffold ~/.birdie/skills/<name>/SKILL.MD
 
   [bold]Agent commands[/bold]
   [yellow]/agent list[/yellow]                   List all loaded agents with status
@@ -126,6 +130,10 @@ class BirdieCLI:
         self._llm_log_handler: Optional[logging.FileHandler] = None
         self._orig_async_send = None
         self._orig_sync_send = None
+        self._active_status = None  # rich Status while a turn is streaming
+
+        # Route permission approvals for permissioned skills through the CLI.
+        agent.tool_approval_callback = self._approve_tool
 
         # Apply stored skill grants for the initial session
         self._apply_session_policy(session)
@@ -218,6 +226,40 @@ class BirdieCLI:
             self.agent.enable_agent(session.id, agent)
         for agent in session.disabled_agents:
             self.agent.disable_agent(session.id, agent)
+        for skill in session.approved_skills:
+            self.agent.policy.grant_permissions(session.id, skill)
+
+    # -- tool permission approval ---------------------------------------------
+
+    async def _approve_tool(
+        self, skill_name: str, permissions: list, tool_name: str, args: dict,
+    ) -> str:
+        """Interactive gate for tools of skills that declare permissions."""
+        status = self._active_status
+        if status is not None:
+            status.stop()
+        try:
+            args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            self.console.print(
+                f"[yellow]Skill [bold]{skill_name}[/bold] requests permissions:"
+                f"[/yellow] {', '.join(permissions)}\n"
+                f"[yellow]Tool call:[/yellow] {tool_name}({args_str})"
+            )
+            answer = (await asyncio.to_thread(
+                input, "Allow? [y]es once / [a]lways this session / [N]o: "
+            )).strip().lower()
+        finally:
+            if status is not None:
+                status.start()
+
+        if answer in ("a", "always"):
+            if skill_name not in self.session.approved_skills:
+                self.session.approved_skills.append(skill_name)
+                self.session_manager.save(self.session)
+            return "always"
+        if answer in ("y", "yes"):
+            return "allow"
+        return "deny"
 
     def _get_prompt(self):
         if self._ctrl_c_warned:
@@ -239,12 +281,74 @@ class BirdieCLI:
 
         buf.on_text_changed += _on_changed
 
-    def _switch_session(self, session: Session) -> None:
+    async def _switch_session(self, session: Session) -> None:
         """Replace the active session, apply its policy, and refresh the display."""
         self.session = session
         self._apply_session_policy(session)
         self.console.clear()
         self._print_welcome()
+        if session.turns > 0:
+            await self._print_history(session.id)
+
+    # -- history rendering ----------------------------------------------------
+
+    async def _print_history(self, thread_id: str, limit: int = 10) -> None:
+        """Replay the last *limit* checkpointed messages of a session."""
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        try:
+            snapshot = await self.agent.app.aget_state(
+                {"configurable": {"thread_id": thread_id}}
+            )
+            messages = list((snapshot.values or {}).get("messages", []))
+        except Exception as exc:
+            self.console.print(f"[dim]Could not load history: {exc}[/dim]")
+            return
+
+        if not messages:
+            self.console.print("[dim]No prior history in this session.[/dim]")
+            return
+
+        recent = messages[-limit:]
+        if len(messages) > len(recent):
+            self.console.print(
+                f"[dim]… showing the last {len(recent)} of "
+                f"{len(messages)} messages …[/dim]"
+            )
+
+        def _text(content) -> str:
+            if isinstance(content, list):
+                return "\n".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b)
+                    for b in content
+                )
+            return str(content)
+
+        for msg in recent:
+            if isinstance(msg, HumanMessage):
+                self.console.print(
+                    f"[bold cyan]you>[/bold cyan] {_text(msg.content)}",
+                    highlight=False,
+                )
+            elif isinstance(msg, AIMessage):
+                for tc in getattr(msg, "tool_calls", []):
+                    args_str = ", ".join(
+                        f"{k}={v!r}" for k, v in tc["args"].items()
+                    )
+                    self.console.print(
+                        f"[dim]🐦 {tc['name']}({args_str})[/dim]",
+                        highlight=False,
+                    )
+                text = _text(msg.content)
+                if text:
+                    self.console.print(f"🐦 {text}", highlight=False)
+            elif isinstance(msg, ToolMessage):
+                n = len(_text(msg.content).splitlines() or [""])
+                self.console.print(
+                    f"[dim]   ⎿ {msg.name or 'tool'}: "
+                    f"{n} line{'s' if n != 1 else ''}[/dim]"
+                )
+        self.console.print()
 
     # -- status toolbar -------------------------------------------------------
 
@@ -332,6 +436,26 @@ class BirdieCLI:
             return
         for tool in tools:
             self.console.print(f"  [bold cyan]{tool.name}[/bold cyan]  - {tool.description}")
+
+    def _show_cost(self) -> None:
+        """Print token usage and an estimated cost for the current session."""
+        from .core.pricing import estimate_cost
+
+        model = self.agent.provider.model_name
+        s_in = self.session.total_input_tokens
+        s_out = self.session.total_output_tokens
+        cost = estimate_cost(model, s_in, s_out)
+        cost_str = f"${cost:.4f}" if cost is not None else "unknown (no pricing data)"
+        self.console.print(
+            f"  [dim]model:[/dim]    {model}\n"
+            f"  [dim]session:[/dim]  ↑{s_in:,} in  ↓{s_out:,} out tokens\n"
+            f"  [dim]cost:[/dim]     ~{cost_str}"
+        )
+        if cost is not None:
+            self.console.print(
+                "  [dim]Estimate uses list prices without cache discounts - "
+                "treat as an upper bound.[/dim]"
+            )
 
     def _show_info(self) -> None:
         """Print current user, session, and provider info."""
@@ -577,9 +701,35 @@ class BirdieCLI:
                     self.session_manager.save(self.session)
                     self.console.print(f"[red]Disabled[/red] {resolved}")
 
+        elif subcmd == "reload":
+            try:
+                n = self.agent.reload_skills()
+            except Exception as exc:
+                self.console.print(f"[red]Reload failed:[/red] {exc}")
+            else:
+                self.console.print(f"[dim]Reloaded [bold]{n}[/bold] skills from disk.[/dim]")
+
+        elif subcmd == "new":
+            if not subarg:
+                self.console.print("[red]Usage: /skill new <SkillName>[/red]")
+            else:
+                from .core.loader import scaffold_skill
+                target_dir = Path.home() / ".birdie" / "skills"
+                try:
+                    path = scaffold_skill(str(target_dir), subarg)
+                except FileExistsError as exc:
+                    self.console.print(f"[red]{exc}[/red]")
+                else:
+                    self.console.print(
+                        f"[green]Created[/green] {path}\n"
+                        f"[dim]Edit it, then run /skill reload and "
+                        f"/skill enable {subarg}.[/dim]"
+                    )
+
         else:
             self.console.print(
-                "[red]Usage: /skill list | enable <name> | disable <name>[/red]"
+                "[red]Usage: /skill list | enable <name> | disable <name> "
+                "| reload | new <name>[/red]"
             )
 
     def _resolve_agent_name(self, name: str) -> Optional[str]:
@@ -663,7 +813,7 @@ class BirdieCLI:
 
         if subcmd == "new":
             new_session = self.session_manager.create(self.user_id)
-            self._switch_session(new_session)
+            await self._switch_session(new_session)
 
         elif subcmd == "switch":
             if not subarg:
@@ -671,7 +821,7 @@ class BirdieCLI:
                 return
             try:
                 loaded = self.session_manager.load(self.user_id, subarg)
-                self._switch_session(loaded)
+                await self._switch_session(loaded)
             except FileNotFoundError as exc:
                 self.console.print(f"[red]{exc}[/red]")
 
@@ -695,7 +845,7 @@ class BirdieCLI:
                 self.console.print(f"[dim]Deleted session {subarg}[/dim]")
                 if is_current:
                     new_session = self.session_manager.create(self.user_id)
-                    self._switch_session(new_session)
+                    await self._switch_session(new_session)
             except FileNotFoundError as exc:
                 self.console.print(f"[red]{exc}[/red]")
 
@@ -760,7 +910,7 @@ class BirdieCLI:
         elif cmd == "/new":
             # Legacy alias: same as /session new
             new_session = self.session_manager.create(self.user_id)
-            self._switch_session(new_session)
+            await self._switch_session(new_session)
 
         elif cmd == "/log":
             self._handle_log(arg)
@@ -781,6 +931,17 @@ class BirdieCLI:
                 self.user_memory.add(arg)
                 self.session_manager.save_user_memory(self.user_memory)
                 self.console.print("[dim]Remembered.[/dim]")
+
+        elif cmd == "/cost":
+            self._show_cost()
+
+        elif cmd == "/history":
+            try:
+                limit = int(arg) if arg.strip() else 10
+            except ValueError:
+                self.console.print("[red]Usage: /history [N][/red]")
+                return True
+            await self._print_history(self.session.id, limit=max(1, limit))
 
         elif cmd == "/info":
             self._show_info()
@@ -841,6 +1002,7 @@ class BirdieCLI:
         printed_any = False
         status = self.console.status("[dim]thinking…[/dim]", spinner="dots")
         status.start()
+        self._active_status = status
 
         try:
             async for update in self.agent.astream(
@@ -875,6 +1037,8 @@ class BirdieCLI:
                                     self._last_context = um.get("input_tokens", 0)
                                     self._total_in  += um.get("input_tokens", 0)
                                     self._total_out += um.get("output_tokens", 0)
+                                    self.session.total_input_tokens += um.get("input_tokens", 0)
+                                    self.session.total_output_tokens += um.get("output_tokens", 0)
                                 for tc in getattr(msg, "tool_calls", []):
                                     args_str = ", ".join(
                                         f"{k}={v!r}" for k, v in tc["args"].items()
@@ -900,6 +1064,7 @@ class BirdieCLI:
                                     printed_any = True
         finally:
             status.stop()
+            self._active_status = None
 
         if not printed_any:
             self.console.print("[dim](no response)[/dim]")
@@ -914,6 +1079,9 @@ class BirdieCLI:
     async def run(self) -> None:
         """Start the interactive REPL and block until the user quits."""
         self._print_welcome()
+        if self.session.turns > 0:
+            # Resumed session: replay the tail of the conversation.
+            await self._print_history(self.session.id)
 
         while True:
             try:

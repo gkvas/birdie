@@ -19,6 +19,9 @@ class SkillPolicy:
     def __init__(self) -> None:
         self._default_skills: Set[str] = set()
         self._session_skills: Dict[str, Set[str]] = {}
+        # Skills whose declared permissions the user has approved ("always")
+        # for a given session.  Checked by the graph's tool permission gate.
+        self._session_permission_grants: Dict[str, Set[str]] = {}
 
     def set_default_skills(self, skill_names: List[str]) -> None:
         """Seed the default set from an explicit list of skill names.
@@ -47,6 +50,14 @@ class SkillPolicy:
         if not session_id:
             return set(self._default_skills)
         return set(self._session(session_id))
+
+    def grant_permissions(self, session_id: str, skill_name: str) -> None:
+        """Record a standing permission approval for a skill in a session."""
+        self._session_permission_grants.setdefault(session_id, set()).add(skill_name)
+
+    def has_permission_grant(self, session_id: str, skill_name: str) -> bool:
+        """Return True if the skill's permissions were approved for the session."""
+        return skill_name in self._session_permission_grants.get(session_id, set())
 
     def _session(self, session_id: str) -> Set[str]:
         if session_id not in self._session_skills:

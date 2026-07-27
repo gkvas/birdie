@@ -111,6 +111,10 @@ class DynamicAgent:
         self.agents_dir = agents_dir
         self._agent_console = agent_console
         self.agent_output_mode: str = "off"
+        # Optional approval hook for tools of skills that declare permissions:
+        # callable(skill_name, permissions, tool_name, args) returning
+        # "allow" | "always" | "deny" (may be sync or async).  None = allow all.
+        self.tool_approval_callback = None
         self.registry = SkillRegistry()
         self.policy = SkillPolicy()
         self.mcp_manager = MCPClientManager()
@@ -345,6 +349,19 @@ class DynamicAgent:
         }
         self.agent_registry.set_default_agents(sorted(default_agents))
 
+    def reload_skills(self) -> int:
+        """Re-discover skills from disk, in place.  Returns the new skill count.
+
+        The registry and MCP manager objects are shared with the compiled
+        graph's closures, so they are mutated rather than replaced.  Default
+        grants are reseeded; per-session enable/disable sets are preserved
+        (they are plain name sets).
+        """
+        for skill in list(self.registry.list_skills()):
+            self.registry.unregister_skill(skill.name)
+        self._load_skills()
+        return len(self.registry.list_skills())
+
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""
         pass  # MCPClientManager uses per-call sessions; nothing to tear down
@@ -440,6 +457,8 @@ class DynamicAgent:
             "skill_decay_turns": self._skill_decay_turns,
             "skill_max_loaded": self._skill_max_loaded,
         }}
+        if self.tool_approval_callback is not None:
+            run_config["configurable"]["tool_approval_callback"] = self.tool_approval_callback
         if user_id:
             run_config["configurable"]["user_id"] = user_id
         if config:
@@ -482,6 +501,8 @@ class DynamicAgent:
             "skill_decay_turns": self._skill_decay_turns,
             "skill_max_loaded": self._skill_max_loaded,
         }}
+        if self.tool_approval_callback is not None:
+            run_config["configurable"]["tool_approval_callback"] = self.tool_approval_callback
         if user_id:
             run_config["configurable"]["user_id"] = user_id
         if config:

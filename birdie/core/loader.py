@@ -69,12 +69,20 @@ def parse_skill_markdown(content: str) -> Skill:
             schema_match = re.search(r'schema:(.*?)(?=\n### |\n## |\Z)', tool_content, re.DOTALL)
             schema = yaml.safe_load(schema_match.group(1)) if schema_match else {}
 
+            # timeout/retries only match before the schema block, so schema
+            # properties with those names are never misread as tool settings.
+            head = tool_content.split('\nschema:', 1)[0]
+            timeout_match = re.search(r'^timeout:\s*([\d.]+)', head, re.MULTILINE)
+            retries_match = re.search(r'^retries:\s*(\d+)', head, re.MULTILINE)
+
             tools.append(SkillTool(
                 name=tool_name,
                 description=description,
                 entrypoint=entrypoint,
                 schema=schema or {},
                 tags=frontmatter.get('tool_tags', []),
+                timeout=float(timeout_match.group(1)) if timeout_match else None,
+                retries=int(retries_match.group(1)) if retries_match else None,
             ))
 
     # -- 3. Permissions section -----------------------------------------------
@@ -148,6 +156,53 @@ def load_skill_from_markdown(path: str) -> Skill:
         ]
         skill = skill.model_copy(update={"mcp_server": skill.mcp_server.model_copy(update={"args": resolved})})
     return skill
+
+
+_SKILL_TEMPLATE = """\
+---
+name: {name}
+version: 1.0.0
+description: TODO - one-line description the model uses to pick this skill
+# enabled_by_default: true   # uncomment to grant to every session
+---
+
+TODO: Write the skill instructions here in Markdown.  This body is loaded on
+demand when the model calls get_skill.
+
+To expose callable tools instead, delete this prose and add a level-2
+"Tools" section containing one level-3 "<tool_name>" block per tool, each
+with:
+
+    description: What the tool does and when to call it
+    entrypoint: python:tools.my_function   (or bash:..., http:get ..., http:post ...)
+    schema:
+      type: object
+      properties:
+        arg:
+          type: string
+      required: [arg]
+
+Declare required capabilities in a level-2 "Permissions" section as a bullet
+list (for example "- network"); tools of permissioned skills ask the user
+for approval before running.
+"""
+
+
+def scaffold_skill(directory: str, name: str) -> Path:
+    """Create ``<directory>/<name>/SKILL.MD`` from the starter template.
+
+    Returns the path to the created file.
+
+    Raises:
+        FileExistsError: If the skill directory already contains a SKILL.MD.
+    """
+    skill_dir = Path(directory) / name
+    skill_md = skill_dir / "SKILL.MD"
+    if skill_md.exists():
+        raise FileExistsError(f"{skill_md} already exists")
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    skill_md.write_text(_SKILL_TEMPLATE.format(name=name), encoding="utf-8")
+    return skill_md
 
 
 def discover_skills_from_directory(directory: str) -> List[Skill]:

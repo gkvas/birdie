@@ -25,7 +25,9 @@ Key source locations:
 | `tests/` | pytest test suite |
 
 Agent-level config keys (extracted from JSON provider config, not forwarded to vendor):
-`tool_output_cap`, `skill_decay_turns`, `skill_max_loaded`, `ltm_max_age_days`, `ltm_max_entries`, `ltm_min_score`
+`tool_output_cap`, `skill_decay_turns`, `skill_max_loaded`, `compaction_token_threshold`, `ltm_max_age_days`, `ltm_max_entries`, `ltm_min_score`
+
+Provider-level extras: `prompt_cache` (Anthropic only, default true) toggles cache_control breakpoints.
 
 ## Python environment
 
