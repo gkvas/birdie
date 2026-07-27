@@ -116,13 +116,33 @@ async def _invoke_agent(agent_raw: dict, arguments: dict) -> str:
         "configurable": {"max_tool_repetitions": agent_def.max_tool_repetitions},
     }
     result = await sub_agent.invoke(prompt, thread_id=thread, config=invoke_config)
-    last = result["messages"][-1]
-    content = last.content
-    if isinstance(content, list):
-        return "\n".join(
-            b.get("text", "") if isinstance(b, dict) else str(b) for b in content
-        )
-    return str(content)
+
+    def _text(content) -> str:
+        if isinstance(content, list):
+            return "\n".join(
+                b.get("text", "") if isinstance(b, dict) else str(b)
+                for b in content
+            )
+        return str(content)
+
+    text = _text(result["messages"][-1].content)
+
+    # Validate declared structured output, retrying once on mismatch.
+    from birdie.core.agent_runner import parse_agent_output
+
+    if agent_def.output_params:
+        cleaned, err = parse_agent_output(agent_def, text)
+        if err is not None:
+            retry = await sub_agent.invoke(
+                f"Your previous reply was invalid: {err}. Return ONLY a "
+                "single JSON object with exactly the required fields.",
+                thread_id=thread, config=invoke_config,
+            )
+            text = _text(retry["messages"][-1].content)
+            cleaned, err = parse_agent_output(agent_def, text)
+        if err is None:
+            return cleaned
+    return text
 
 
 async def _run() -> None:

@@ -328,3 +328,92 @@ class TestSubAgentCaching:
         assert out2 == "reply to Echo two"
         assert len(constructed) == 1                      # built once
         assert len(set(invoked_threads)) == 2             # fresh thread per run
+
+
+class TestStructuredAgentOutput:
+    def _agent_def(self):
+        from birdie.core.models import AgentDef, AgentParam
+        return AgentDef(
+            name="S", description="t", prompt="Go {{ w }}",
+            output_params=[
+                AgentParam(name="summary", type="string", description="s"),
+                AgentParam(name="count", type="integer", description="c"),
+                AgentParam(name="notes", type="array", description="n", required=False),
+            ],
+        )
+
+    def test_parse_valid_output(self):
+        from birdie.core.agent_runner import parse_agent_output
+        cleaned, err = parse_agent_output(
+            self._agent_def(), '{"summary": "ok", "count": 3}'
+        )
+        assert err is None
+        import json
+        assert json.loads(cleaned) == {"summary": "ok", "count": 3}
+
+    def test_parse_json_embedded_in_prose(self):
+        from birdie.core.agent_runner import parse_agent_output
+        cleaned, err = parse_agent_output(
+            self._agent_def(), 'Here you go:\n{"summary": "ok", "count": 1}\nDone!'
+        )
+        assert err is None
+
+    def test_missing_required_field_reported(self):
+        from birdie.core.agent_runner import parse_agent_output
+        cleaned, err = parse_agent_output(self._agent_def(), '{"summary": "ok"}')
+        assert cleaned is None
+        assert "count" in err
+
+    def test_wrong_type_reported(self):
+        from birdie.core.agent_runner import parse_agent_output
+        cleaned, err = parse_agent_output(
+            self._agent_def(), '{"summary": "ok", "count": "three"}'
+        )
+        assert cleaned is None
+        assert "count" in err and "integer" in err
+
+    def test_no_json_reported(self):
+        from birdie.core.agent_runner import parse_agent_output
+        cleaned, err = parse_agent_output(self._agent_def(), "no json here")
+        assert cleaned is None
+
+    @pytest.mark.asyncio
+    async def test_runner_retries_once_on_invalid_output(self, tmp_path, monkeypatch):
+        from birdie.core import agent_runner
+        from birdie.core.models import AgentDef, AgentParam
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        replies = ['not json at all', '{"summary": "fixed", "count": 2}']
+        prompts = []
+
+        class _FakeAgent:
+            def enable_skills_for_session(self, thread, skills):
+                pass
+
+            async def invoke(self, prompt, thread_id="default", config=None):
+                prompts.append(prompt)
+                return {"messages": [HumanMessage(content=prompt),
+                                     AIMessage(content=replies.pop(0))]}
+
+        class _FakeDynamicAgent:
+            @classmethod
+            def from_config(cls, **kwargs):
+                return _FakeAgent()
+
+        import birdie.agent.run as run_mod
+        monkeypatch.setattr(run_mod, "DynamicAgent", _FakeDynamicAgent)
+
+        agent_def = AgentDef(
+            name="Retry", description="t", prompt="Go",
+            output_params=[
+                AgentParam(name="summary", type="string", description="s"),
+                AgentParam(name="count", type="integer", description="c"),
+            ],
+        )
+        tool = agent_runner.agentdef_to_langchain_tool(agent_def, skills_dir="s")
+        out = await tool.coroutine()
+
+        import json
+        assert json.loads(out) == {"summary": "fixed", "count": 2}
+        assert len(prompts) == 2
+        assert "invalid" in prompts[1]
