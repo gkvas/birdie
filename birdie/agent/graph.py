@@ -62,12 +62,15 @@ _RETRY_BASE_DELAY = 5.0   # base seconds for exponential backoff when no Retry-A
 
 
 def _is_retryable_error(exc: Exception) -> bool:
-    """Return True if *exc* is a transient provider error (HTTP 429/529)."""
+    """Return True for transient provider errors (rate limits, overload, 5xx)."""
     status = getattr(exc, 'status_code', None)
-    if status in (429, 529):
+    if status in (429, 500, 502, 503, 504, 529):
         return True
     name = type(exc).__name__
-    if any(k in name for k in ("RateLimit", "Overloaded", "TooManyRequests")):
+    if any(k in name for k in (
+        "RateLimit", "Overloaded", "TooManyRequests",
+        "InternalServerError", "ServiceUnavailable", "APIConnectionError",
+    )):
         return True
     msg = str(exc)
     return "429" in msg or "529" in msg or "rate_limit" in msg.lower()

@@ -1104,10 +1104,16 @@ class AnthropicProvider(LLMProvider):
                 yield AIMessageChunk(content=text)
 
     def list_models(self) -> list[ModelInfo]:
+        # Cached catalog (2026-07). Current-generation models have a 1M-token
+        # context window; Haiku 4.5 has 200K.
         _KNOWN = {
-            "claude-opus-4-7":          {"context_window": 200_000},
-            "claude-sonnet-4-6":        {"context_window": 200_000},
-            "claude-haiku-4-5-20251001":{"context_window": 200_000},
+            "claude-fable-5":            {"context_window": 1_000_000},
+            "claude-opus-5":             {"context_window": 1_000_000},
+            "claude-opus-4-8":           {"context_window": 1_000_000},
+            "claude-opus-4-7":           {"context_window": 1_000_000},
+            "claude-sonnet-5":           {"context_window": 1_000_000},
+            "claude-sonnet-4-6":         {"context_window": 1_000_000},
+            "claude-haiku-4-5-20251001": {"context_window": 200_000},
         }
         return [
             ModelInfo(

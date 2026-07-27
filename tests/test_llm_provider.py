@@ -1440,3 +1440,45 @@ class TestAnthropicToolResultTruncation:
         block = result[0]["content"][0]
         assert len(block["content"]) < len(big)
         assert "characters truncated" in block["content"]
+
+
+class TestAnthropicModelCatalog:
+    def test_current_generation_models_listed(self):
+        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
+            provider = AnthropicProvider(api_key="test")
+        ids = {m.id for m in provider.list_models()}
+        assert {"claude-fable-5", "claude-opus-5", "claude-opus-4-8",
+                "claude-sonnet-5", "claude-sonnet-4-6"} <= ids
+        by_id = {m.id: m for m in provider.list_models()}
+        assert by_id["claude-opus-5"].context_window == 1_000_000
+        assert by_id["claude-haiku-4-5-20251001"].context_window == 200_000
+
+
+class TestRetryableErrors:
+    def test_transient_5xx_is_retryable(self):
+        from birdie.agent.graph import _is_retryable_error
+
+        class _ServerError(Exception):
+            status_code = 500
+
+        class _Unavailable(Exception):
+            status_code = 503
+
+        assert _is_retryable_error(_ServerError("boom"))
+        assert _is_retryable_error(_Unavailable("down"))
+
+    def test_client_errors_not_retryable(self):
+        from birdie.agent.graph import _is_retryable_error
+
+        class _BadRequest(Exception):
+            status_code = 400
+
+        assert not _is_retryable_error(_BadRequest("bad"))
+
+    def test_connection_error_name_is_retryable(self):
+        from birdie.agent.graph import _is_retryable_error
+
+        class APIConnectionError(Exception):
+            pass
+
+        assert _is_retryable_error(APIConnectionError("net down"))
