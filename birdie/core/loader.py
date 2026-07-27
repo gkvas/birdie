@@ -69,12 +69,20 @@ def parse_skill_markdown(content: str) -> Skill:
             schema_match = re.search(r'schema:(.*?)(?=\n### |\n## |\Z)', tool_content, re.DOTALL)
             schema = yaml.safe_load(schema_match.group(1)) if schema_match else {}
 
+            # timeout/retries only match before the schema block, so schema
+            # properties with those names are never misread as tool settings.
+            head = tool_content.split('\nschema:', 1)[0]
+            timeout_match = re.search(r'^timeout:\s*([\d.]+)', head, re.MULTILINE)
+            retries_match = re.search(r'^retries:\s*(\d+)', head, re.MULTILINE)
+
             tools.append(SkillTool(
                 name=tool_name,
                 description=description,
                 entrypoint=entrypoint,
                 schema=schema or {},
                 tags=frontmatter.get('tool_tags', []),
+                timeout=float(timeout_match.group(1)) if timeout_match else None,
+                retries=int(retries_match.group(1)) if retries_match else None,
             ))
 
     # -- 3. Permissions section -----------------------------------------------

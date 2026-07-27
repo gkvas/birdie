@@ -26,12 +26,27 @@ def skilltool_to_langchain_tool(skill_tool: SkillTool) -> StructuredTool:
     """
     resolver = resolve_entrypoint(skill_tool.entrypoint)
 
+    # Retry policy: explicit `retries:` from SKILL.MD wins; otherwise
+    # idempotent http:get entrypoints get one automatic retry, others none.
+    retries = skill_tool.retries
+    if retries is None:
+        retries = 1 if skill_tool.entrypoint.startswith("http:get") else 0
+
     def _wrapped(**kwargs: Any) -> Any:
         if "required" in skill_tool.schema:
             for field in skill_tool.schema["required"]:
                 if field not in kwargs:
                     raise ValueError(f"Missing required field: {field}")
-        return resolver(skill_tool.entrypoint, **kwargs)
+        call_kwargs = dict(kwargs)
+        if skill_tool.timeout is not None:
+            call_kwargs["_timeout"] = skill_tool.timeout
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return resolver(skill_tool.entrypoint, **call_kwargs)
+            except Exception as exc:
+                last_exc = exc
+        raise last_exc
 
     return StructuredTool.from_function(
         func=_wrapped,

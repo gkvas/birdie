@@ -32,11 +32,12 @@ from typing import Callable, Any
 HTTP_TIMEOUT = 30.0
 
 
-def resolve_http_get(entrypoint: str, **kwargs: Any) -> Any:
+def resolve_http_get(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:
     """Execute an ``http:get`` entrypoint, passing kwargs as query parameters.
 
     Args:
         entrypoint: Full entrypoint string, e.g. ``http:get https://api.example.com/path``.
+        _timeout: Per-tool timeout override in seconds (default ``HTTP_TIMEOUT``).
         **kwargs: Key-value pairs appended as URL query parameters (None values omitted).
 
     Returns:
@@ -47,16 +48,20 @@ def resolve_http_get(entrypoint: str, **kwargs: Any) -> Any:
     """
     url = entrypoint.split(" ", 1)[1]
     params = {k: v for k, v in kwargs.items() if v is not None}
-    response = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+    response = requests.get(
+        url, params=params,
+        timeout=_timeout if _timeout is not None else HTTP_TIMEOUT,
+    )
     response.raise_for_status()
     return response.json()
 
 
-def resolve_http_post(entrypoint: str, **kwargs: Any) -> Any:
+def resolve_http_post(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:
     """Execute an ``http:post`` entrypoint, sending kwargs as a JSON body.
 
     Args:
         entrypoint: Full entrypoint string, e.g. ``http:post https://api.example.com/path``.
+        _timeout: Per-tool timeout override in seconds (default ``HTTP_TIMEOUT``).
         **kwargs: Key-value pairs serialised as the JSON request body (None values omitted).
 
     Returns:
@@ -67,12 +72,15 @@ def resolve_http_post(entrypoint: str, **kwargs: Any) -> Any:
     """
     url = entrypoint.split(" ", 1)[1]
     data = {k: v for k, v in kwargs.items() if v is not None}
-    response = requests.post(url, json=data, timeout=HTTP_TIMEOUT)
+    response = requests.post(
+        url, json=data,
+        timeout=_timeout if _timeout is not None else HTTP_TIMEOUT,
+    )
     response.raise_for_status()
     return response.json()
 
 
-def resolve_bash(entrypoint: str, **kwargs: Any) -> Any:
+def resolve_bash(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:
     """Execute a ``bash:`` entrypoint via a subprocess shell.
 
     The command template (everything after ``bash:``) is formatted with kwargs,
@@ -86,13 +94,15 @@ def resolve_bash(entrypoint: str, **kwargs: Any) -> Any:
 
     Args:
         entrypoint: Full entrypoint string, e.g. ``bash:cat {path}``.
+        _timeout: Per-tool timeout in seconds (None means no timeout).
         **kwargs: Named arguments substituted into the command template.
 
     Returns:
         Captured stdout as a string.
 
     Raises:
-        RuntimeError: If the process exits with a non-zero return code.
+        RuntimeError: If the process exits with a non-zero return code or
+            exceeds the timeout.
     """
     template = entrypoint.split(":", 1)[1].strip()
     if re.fullmatch(r'\{\w+\}', template):
@@ -100,17 +110,27 @@ def resolve_bash(entrypoint: str, **kwargs: Any) -> Any:
     else:
         quoted = {k: shlex.quote(str(v)) for k, v in kwargs.items()}
         command = template.format(**quoted)
-    result = subprocess.run(command, shell=True, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True,
+            timeout=_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Command timed out after {_timeout} seconds"
+        ) from None
     if result.returncode != 0:
         raise RuntimeError(f"Command failed: {result.stderr}")
     return result.stdout
 
 
-def resolve_python(entrypoint: str, **kwargs: Any) -> Any:
+def resolve_python(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:
     """Execute a ``python:`` entrypoint by importing and calling a function.
 
     Args:
         entrypoint: Full entrypoint string, e.g. ``python:birdie.skills.todo.tools.create_plan``.
+        _timeout: Accepted for resolver-signature uniformity; not enforced
+            for in-process calls.
         **kwargs: Passed directly as keyword arguments to the target function.
 
     Returns:
@@ -121,7 +141,7 @@ def resolve_python(entrypoint: str, **kwargs: Any) -> Any:
     return getattr(module, function_name)(**kwargs)
 
 
-def resolve_grpc(entrypoint: str, **kwargs: Any) -> Any:
+def resolve_grpc(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:
     """Stub for ``grpc:`` entrypoints - wire up a real gRPC channel here.
 
     Args:
@@ -135,7 +155,7 @@ def resolve_grpc(entrypoint: str, **kwargs: Any) -> Any:
     return {"grpc_method": method, "args": kwargs, "status": "mock_response"}
 
 
-def resolve_container(entrypoint: str, **kwargs: Any) -> Any:
+def resolve_container(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:
     """Stub for ``container:`` entrypoints - wire up Docker/Podman here.
 
     Args:

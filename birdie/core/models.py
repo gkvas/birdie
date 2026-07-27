@@ -65,12 +65,19 @@ class MCPServerConfig(BaseModel):
 class SkillTool(BaseModel):
     """
     A single tool within a skill that can be executed.
+
+    ``timeout`` bounds a single execution in seconds (None uses the
+    resolver's default).  ``retries`` is the number of automatic re-attempts
+    after a failure; None applies the default policy (1 for idempotent
+    ``http:get`` entrypoints, 0 otherwise).
     """
     name: str
     description: str
     entrypoint: str
     schema: Dict[str, Any]
     tags: List[str] = []
+    timeout: Optional[float] = None
+    retries: Optional[int] = None
     
 
 class AgentParam(BaseModel):
