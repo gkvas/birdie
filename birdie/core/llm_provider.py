@@ -194,8 +194,9 @@ class ProviderConfig(BaseModel):
         return cls.model_validate_json(Path(path).read_text())
 
     def to_json(self, **kwargs: Any) -> str:
-        """Serialise to a JSON string (``api_key`` excluded by default)."""
+        """Serialise to a JSON string (``api_key`` always excluded)."""
         data = self.model_dump(exclude_none=True, **kwargs)
+        data.pop("api_key", None)
         return json.dumps(data)
 
 
@@ -1868,13 +1869,20 @@ def agentdef_to_normalized_def(
     if required:
         schema["required"] = required
 
+    # Never serialise credentials into the tool def - it ends up in the MCP
+    # subprocess environment (BIRDIE_AGENTS_JSON) and may be logged.  The
+    # subprocess inherits the vendor env var (e.g. ANTHROPIC_API_KEY) instead.
+    sanitized_config = {
+        k: v for k, v in (provider_config or {}).items() if k != "api_key"
+    }
+
     d: NormalizedToolDef = {
         "name": agent_def.name,
         "description": agent_def.description,
         "parameters": schema,
         # Execution-context metadata consumed by acp_mcp_server._invoke_agent()
         "_agent_def": agent_def.model_dump(),
-        "_provider_config": provider_config or {},
+        "_provider_config": sanitized_config,
         "_skills_dir": skills_dir,
         "_agents_dir": agents_dir,
     }

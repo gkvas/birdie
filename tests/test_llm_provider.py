@@ -1123,7 +1123,11 @@ class TestAgentdefToNormalizedDef:
         cfg = {"vendor": "anthropic", "model": "claude-haiku-4-5-20251001", "api_key": "sk-test"}
         result = agentdef_to_normalized_def(agent_def, provider_config=cfg)
 
-        assert result["_provider_config"] == cfg
+        # api_key must never be serialised into the tool def (it lands in the
+        # MCP subprocess environment); everything else is forwarded.
+        assert result["_provider_config"] == {
+            "vendor": "anthropic", "model": "claude-haiku-4-5-20251001",
+        }
 
     def test_skills_dir_and_agents_dir_forwarded(self):
         from birdie.core.llm_provider import agentdef_to_normalized_def
@@ -1401,3 +1405,12 @@ class TestAcpMcpServerWithAgents:
 
         mock_resolve.assert_called_once_with("python:birdie.skills.duckduckgo.tools.search")
         mock_fn.assert_called_once_with("python:birdie.skills.duckduckgo.tools.search", query="python")
+
+
+class TestProviderConfigSecrets:
+    def test_to_json_always_excludes_api_key(self):
+        from birdie.core.llm_provider import ProviderConfig
+        cfg = ProviderConfig(vendor="openai", model="gpt-4o", api_key="sk-secret")
+        data = json.loads(cfg.to_json())
+        assert "api_key" not in data
+        assert data["model"] == "gpt-4o"
