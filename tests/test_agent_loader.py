@@ -287,3 +287,44 @@ class TestAgentLoadPrecedence:
         names = {a.name for a in agent.agent_registry.list_agents()}
         assert "Good" in names
         assert "BadVendor" not in names
+
+
+class TestSubAgentCaching:
+    @pytest.mark.asyncio
+    async def test_sub_agent_instance_reused_and_threads_isolated(self, tmp_path, monkeypatch):
+        """The DynamicAgent is constructed once; each run gets its own thread."""
+        from birdie.core import agent_runner
+        from birdie.core.models import AgentDef
+        from langchain_core.messages import AIMessage, HumanMessage
+
+        constructed = []
+        invoked_threads = []
+
+        class _FakeAgent:
+            def enable_skills_for_session(self, thread, skills):
+                pass
+
+            async def invoke(self, prompt, thread_id="default", config=None):
+                invoked_threads.append(thread_id)
+                return {"messages": [HumanMessage(content=prompt),
+                                     AIMessage(content=f"reply to {prompt}")]}
+
+        class _FakeDynamicAgent:
+            @classmethod
+            def from_config(cls, **kwargs):
+                constructed.append(kwargs)
+                return _FakeAgent()
+
+        import birdie.agent.run as run_mod
+        monkeypatch.setattr(run_mod, "DynamicAgent", _FakeDynamicAgent)
+
+        agent_def = AgentDef(name="Echoer", description="t", prompt="Echo {{ w }}")
+        tool = agent_runner.agentdef_to_langchain_tool(agent_def, skills_dir="s")
+
+        out1 = await tool.coroutine(w="one")
+        out2 = await tool.coroutine(w="two")
+
+        assert out1 == "reply to Echo one"
+        assert out2 == "reply to Echo two"
+        assert len(constructed) == 1                      # built once
+        assert len(set(invoked_threads)) == 2             # fresh thread per run
