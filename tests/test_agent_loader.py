@@ -240,3 +240,50 @@ class TestOutputParamsPromptRendering:
         from birdie.core.models import AgentDef
         agent = AgentDef(name="Plain", description="t", prompt="Say {{ word }}.")
         assert render_agent_prompt(agent, {"word": "hi"}) == "Say hi."
+
+
+def _write_agent(directory, name, description="test agent", extra_frontmatter=""):
+    agent_dir = Path(directory) / name.lower()
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "AGENT.MD").write_text(
+        f"---\nname: {name}\ndescription: {description}\n{extra_frontmatter}---\n\n"
+        "## Prompt\n\nDo the thing.\n"
+    )
+
+
+class TestAgentLoadPrecedence:
+    def test_primary_dir_wins_over_user_dir(self, tmp_path, monkeypatch):
+        from birdie.agent.run import DynamicAgent
+        from tests.test_integration import _NoopLLM
+
+        primary = tmp_path / "agents"
+        home = tmp_path / "home"
+        user_agents = home / ".birdie" / "agents"
+        _write_agent(primary, "Dup", description="from primary")
+        _write_agent(user_agents, "Dup", description="from user dir")
+        _write_agent(user_agents, "UserOnly", description="user only")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+
+        agent = DynamicAgent(_NoopLLM(), agents_dir=str(primary))
+        defs = {a.name: a for a in agent.agent_registry.list_agents()}
+        assert defs["Dup"].description == "from primary"
+        assert "UserOnly" in defs
+
+    def test_broken_agent_md_does_not_abort_startup(self, tmp_path, monkeypatch):
+        from birdie.agent.run import DynamicAgent
+        from tests.test_integration import _NoopLLM
+
+        primary = tmp_path / "agents"
+        # Vendor override differing from the parent config raises in
+        # agentdef_to_langchain_tool; it must be skipped, not fatal.
+        _write_agent(primary, "BadVendor", extra_frontmatter="vendor: mistral\n")
+        _write_agent(primary, "Good")
+        monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+
+        agent = DynamicAgent(
+            _NoopLLM(), agents_dir=str(primary),
+            provider_config={"vendor": "openai"},
+        )
+        names = {a.name for a in agent.agent_registry.list_agents()}
+        assert "Good" in names
+        assert "BadVendor" not in names

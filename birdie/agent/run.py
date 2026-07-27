@@ -288,7 +288,16 @@ class DynamicAgent:
 
 
     def _load_agents(self) -> None:
-        """Discover AGENT.MD files from all agent dirs and register them."""
+        """Discover AGENT.MD files from all agent dirs and register them.
+
+        Agents are loaded in priority order (highest to lowest), mirroring
+        ``_load_skills``: the explicit ``agents_dir`` (or bundled directory)
+        first, then ``~/.birdie/agents``.  The first definition of a name
+        wins.  A broken AGENT.MD (e.g. a disallowed vendor override) is
+        skipped with a warning instead of aborting startup.
+        """
+        import logging
+
         _bundled = Path(__file__).parent.parent / "agents"
         primary = self.agents_dir or (str(_bundled) if _bundled.is_dir() else None)
 
@@ -299,17 +308,27 @@ class DynamicAgent:
         if user_agents_dir.is_dir():
             dirs.append(str(user_agents_dir))
 
+        loaded_agents: set = set()
         for d in dirs:
             for agent_def in discover_agents_from_directory(d):
-                tool = agentdef_to_langchain_tool(
-                    agent_def,
-                    skills_dir=self.skills_dir,
-                    agents_dir=self.agents_dir,
-                    fallback_provider_config=self._provider_config,
-                    console=self._agent_console,
-                    get_tool_output_mode=lambda: self.agent_output_mode,
-                )
+                if agent_def.name in loaded_agents:
+                    continue
+                try:
+                    tool = agentdef_to_langchain_tool(
+                        agent_def,
+                        skills_dir=self.skills_dir,
+                        agents_dir=self.agents_dir,
+                        fallback_provider_config=self._provider_config,
+                        console=self._agent_console,
+                        get_tool_output_mode=lambda: self.agent_output_mode,
+                    )
+                except Exception as e:
+                    logging.warning(
+                        "Skipping agent '%s' from %s: %s", agent_def.name, d, e
+                    )
+                    continue
                 self.agent_registry.register(agent_def, tool)
+                loaded_agents.add(agent_def.name)
 
         # Default grants: explicit config plus agents flagged enabled_by_default.
         default_agents = set(self._agents_enabled) | {
