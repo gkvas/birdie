@@ -58,6 +58,7 @@ HELP_TEXT = """
   [yellow]/cd <path>[/yellow]                    Change working directory (default: home)
   [yellow]/remember <text>[/yellow]              Save a note to long-term memory
   [yellow]/compact[/yellow]                      Force-compact conversation history into LTM now
+  [yellow]/cost[/yellow]                         Show token usage and estimated cost for this session
   [yellow]/info[/yellow]                         Show session info (user, session, provider)
 
   [bold]Tool commands[/bold]
@@ -370,6 +371,26 @@ class BirdieCLI:
             return
         for tool in tools:
             self.console.print(f"  [bold cyan]{tool.name}[/bold cyan]  - {tool.description}")
+
+    def _show_cost(self) -> None:
+        """Print token usage and an estimated cost for the current session."""
+        from .core.pricing import estimate_cost
+
+        model = self.agent.provider.model_name
+        s_in = self.session.total_input_tokens
+        s_out = self.session.total_output_tokens
+        cost = estimate_cost(model, s_in, s_out)
+        cost_str = f"${cost:.4f}" if cost is not None else "unknown (no pricing data)"
+        self.console.print(
+            f"  [dim]model:[/dim]    {model}\n"
+            f"  [dim]session:[/dim]  ↑{s_in:,} in  ↓{s_out:,} out tokens\n"
+            f"  [dim]cost:[/dim]     ~{cost_str}"
+        )
+        if cost is not None:
+            self.console.print(
+                "  [dim]Estimate uses list prices without cache discounts - "
+                "treat as an upper bound.[/dim]"
+            )
 
     def _show_info(self) -> None:
         """Print current user, session, and provider info."""
@@ -820,6 +841,9 @@ class BirdieCLI:
                 self.session_manager.save_user_memory(self.user_memory)
                 self.console.print("[dim]Remembered.[/dim]")
 
+        elif cmd == "/cost":
+            self._show_cost()
+
         elif cmd == "/info":
             self._show_info()
 
@@ -914,6 +938,8 @@ class BirdieCLI:
                                     self._last_context = um.get("input_tokens", 0)
                                     self._total_in  += um.get("input_tokens", 0)
                                     self._total_out += um.get("output_tokens", 0)
+                                    self.session.total_input_tokens += um.get("input_tokens", 0)
+                                    self.session.total_output_tokens += um.get("output_tokens", 0)
                                 for tc in getattr(msg, "tool_calls", []):
                                     args_str = ", ".join(
                                         f"{k}={v!r}" for k, v in tc["args"].items()

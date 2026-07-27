@@ -84,6 +84,9 @@ class Session:
     disabled_agents: List[str]
     # Skills whose declared permissions the user approved with "always".
     approved_skills: List[str] = field(default_factory=list)
+    # Cumulative token usage across all turns of this session.
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
 
     def touch(self) -> None:
         """Increment turn counter and update the last-modified timestamp."""
@@ -176,6 +179,8 @@ class SessionManager:
             enabled_agents=data.get("enabled_agents", []),
             disabled_agents=data.get("disabled_agents", []),
             approved_skills=data.get("approved_skills", []),
+            total_input_tokens=data.get("total_input_tokens", 0),
+            total_output_tokens=data.get("total_output_tokens", 0),
         )
 
     def save(self, session: Session) -> None:
@@ -193,6 +198,8 @@ class SessionManager:
             "enabled_agents": session.enabled_agents,
             "disabled_agents": session.disabled_agents,
             "approved_skills": session.approved_skills,
+            "total_input_tokens": session.total_input_tokens,
+            "total_output_tokens": session.total_output_tokens,
         }
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
