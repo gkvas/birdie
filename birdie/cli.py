@@ -59,6 +59,7 @@ HELP_TEXT = """
   [yellow]/remember <text>[/yellow]              Save a note to long-term memory
   [yellow]/compact[/yellow]                      Force-compact conversation history into LTM now
   [yellow]/cost[/yellow]                         Show token usage and estimated cost for this session
+  [yellow]/history \[N][/yellow]                  Show the last N messages of this session (default 10)
   [yellow]/info[/yellow]                         Show session info (user, session, provider)
 
   [bold]Tool commands[/bold]
@@ -278,12 +279,74 @@ class BirdieCLI:
 
         buf.on_text_changed += _on_changed
 
-    def _switch_session(self, session: Session) -> None:
+    async def _switch_session(self, session: Session) -> None:
         """Replace the active session, apply its policy, and refresh the display."""
         self.session = session
         self._apply_session_policy(session)
         self.console.clear()
         self._print_welcome()
+        if session.turns > 0:
+            await self._print_history(session.id)
+
+    # -- history rendering ----------------------------------------------------
+
+    async def _print_history(self, thread_id: str, limit: int = 10) -> None:
+        """Replay the last *limit* checkpointed messages of a session."""
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+
+        try:
+            snapshot = await self.agent.app.aget_state(
+                {"configurable": {"thread_id": thread_id}}
+            )
+            messages = list((snapshot.values or {}).get("messages", []))
+        except Exception as exc:
+            self.console.print(f"[dim]Could not load history: {exc}[/dim]")
+            return
+
+        if not messages:
+            self.console.print("[dim]No prior history in this session.[/dim]")
+            return
+
+        recent = messages[-limit:]
+        if len(messages) > len(recent):
+            self.console.print(
+                f"[dim]… showing the last {len(recent)} of "
+                f"{len(messages)} messages …[/dim]"
+            )
+
+        def _text(content) -> str:
+            if isinstance(content, list):
+                return "\n".join(
+                    b.get("text", "") if isinstance(b, dict) else str(b)
+                    for b in content
+                )
+            return str(content)
+
+        for msg in recent:
+            if isinstance(msg, HumanMessage):
+                self.console.print(
+                    f"[bold cyan]you>[/bold cyan] {_text(msg.content)}",
+                    highlight=False,
+                )
+            elif isinstance(msg, AIMessage):
+                for tc in getattr(msg, "tool_calls", []):
+                    args_str = ", ".join(
+                        f"{k}={v!r}" for k, v in tc["args"].items()
+                    )
+                    self.console.print(
+                        f"[dim]🐦 {tc['name']}({args_str})[/dim]",
+                        highlight=False,
+                    )
+                text = _text(msg.content)
+                if text:
+                    self.console.print(f"🐦 {text}", highlight=False)
+            elif isinstance(msg, ToolMessage):
+                n = len(_text(msg.content).splitlines() or [""])
+                self.console.print(
+                    f"[dim]   ⎿ {msg.name or 'tool'}: "
+                    f"{n} line{'s' if n != 1 else ''}[/dim]"
+                )
+        self.console.print()
 
     # -- status toolbar -------------------------------------------------------
 
@@ -722,7 +785,7 @@ class BirdieCLI:
 
         if subcmd == "new":
             new_session = self.session_manager.create(self.user_id)
-            self._switch_session(new_session)
+            await self._switch_session(new_session)
 
         elif subcmd == "switch":
             if not subarg:
@@ -730,7 +793,7 @@ class BirdieCLI:
                 return
             try:
                 loaded = self.session_manager.load(self.user_id, subarg)
-                self._switch_session(loaded)
+                await self._switch_session(loaded)
             except FileNotFoundError as exc:
                 self.console.print(f"[red]{exc}[/red]")
 
@@ -754,7 +817,7 @@ class BirdieCLI:
                 self.console.print(f"[dim]Deleted session {subarg}[/dim]")
                 if is_current:
                     new_session = self.session_manager.create(self.user_id)
-                    self._switch_session(new_session)
+                    await self._switch_session(new_session)
             except FileNotFoundError as exc:
                 self.console.print(f"[red]{exc}[/red]")
 
@@ -819,7 +882,7 @@ class BirdieCLI:
         elif cmd == "/new":
             # Legacy alias: same as /session new
             new_session = self.session_manager.create(self.user_id)
-            self._switch_session(new_session)
+            await self._switch_session(new_session)
 
         elif cmd == "/log":
             self._handle_log(arg)
@@ -843,6 +906,14 @@ class BirdieCLI:
 
         elif cmd == "/cost":
             self._show_cost()
+
+        elif cmd == "/history":
+            try:
+                limit = int(arg) if arg.strip() else 10
+            except ValueError:
+                self.console.print("[red]Usage: /history [N][/red]")
+                return True
+            await self._print_history(self.session.id, limit=max(1, limit))
 
         elif cmd == "/info":
             self._show_info()
@@ -980,6 +1051,9 @@ class BirdieCLI:
     async def run(self) -> None:
         """Start the interactive REPL and block until the user quits."""
         self._print_welcome()
+        if self.session.turns > 0:
+            # Resumed session: replay the tail of the conversation.
+            await self._print_history(self.session.id)
 
         while True:
             try:
