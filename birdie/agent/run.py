@@ -478,7 +478,9 @@ class DynamicAgent:
         """
         run_config: Dict[str, Any] = {"configurable": {"thread_id": thread_id}}
         snapshot = await self.app.aget_state(run_config)
-        all_messages = list((snapshot.values or {}).get("messages", []))
+        values = snapshot.values or {}
+        all_messages = list(values.get("messages", []))
+        prior_summary = values.get("summary", "")
 
         ltm_store = None
         if self._ltm_store_factory and user_id:
@@ -489,9 +491,13 @@ class DynamicAgent:
             min_messages_auto=self._min_messages_auto,
             min_messages_forced=self._min_messages_forced,
             compression_window_size=self._compression_window_size,
+            prior_summary=prior_summary,
         )
 
         if removes:
-            await self.app.aupdate_state(run_config, {"messages": removes})
+            update: Dict[str, Any] = {"messages": removes}
+            if summary:
+                update["summary"] = summary
+            await self.app.aupdate_state(run_config, update)
 
         return len(removes), summary

@@ -23,6 +23,8 @@ import re
 from pathlib import Path
 from typing import TypedDict, List, Annotated, Sequence, Tuple, Optional, Callable
 
+from typing_extensions import NotRequired
+
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import StateGraph, START, END
@@ -139,6 +141,9 @@ Rules:
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    # Rolling summary of compacted-away conversation segments.  Kept in the
+    # checkpoint so continuity survives even when no LTM store is configured.
+    summary: NotRequired[str]
 
 
 def _msg_text(msg: BaseMessage) -> str:
@@ -185,8 +190,13 @@ async def compact_history(
     min_messages_auto: int = MIN_MESSAGES_AUTO,
     min_messages_forced: int = MIN_MESSAGES_FORCED,
     compression_window_size: int = COMPRESSION_WINDOW_SIZE,
+    prior_summary: str = "",
 ) -> Tuple[str, List[RemoveMessage]]:
     """Summarize the oldest conversation segment and store it in LTM.
+
+    ``prior_summary`` (the summary of previously compacted segments) is folded
+    into the transcript so the returned summary covers the whole compacted
+    history, not just the newest segment.
 
     Auto-compaction triggers when len(messages) >= min_messages_auto + compression_window_size.
     Forced compaction (``/compact``) runs regardless of history length and uses
@@ -244,6 +254,11 @@ async def compact_history(
             lines.append(f"Tool result ({msg.name}): {excerpt}")
 
     history_text = "\n".join(lines)
+    if prior_summary:
+        history_text = (
+            f"[Summary of earlier, already-compacted conversation]: {prior_summary}\n\n"
+            + history_text
+        )
     prompt = _COMPACTION_PROMPT.format(history=history_text)
 
     response = await _achat_with_retry(provider, messages=[HumanMessage(content=prompt)])
@@ -482,6 +497,7 @@ def create_agent_graph(
         state: AgentState,
         config: RunnableConfig,
         ltm_context: str = "",
+        summary_override: Optional[str] = None,
     ) -> str | None:
         """Assemble the system prompt for this turn from in-memory skill objects.
 
@@ -493,7 +509,8 @@ def create_agent_graph(
         - **Tier 2a** - full prose body for ``always_inject`` skills.
         - **Tier 2b** - full prose body for progressively-loaded freetext skills
           (those whose ``get_skill`` lease has not yet expired this session).
-        - **Tier 3** - long-term memory: manual entries from config plus
+        - **Tier 3** - rolling summary of compacted-away conversation segments.
+        - **Tier 4** - long-term memory: manual entries from config plus
           semantically retrieved compaction entries (``ltm_context``).
 
         Returns ``None`` when nothing would be included.
@@ -552,7 +569,20 @@ def create_agent_graph(
 
             parts.append(skill_block)
 
-        # Tier 3
+        # Tier 3: continuity bridge for compacted-away history.  The override
+        # carries a summary produced by a compaction earlier in this same turn
+        # (not yet visible in the checkpointed state).
+        rolling_summary = (
+            summary_override if summary_override is not None
+            else state.get("summary", "")
+        )
+        if rolling_summary:
+            parts.append(
+                "--- Earlier conversation (compacted) ---\n"
+                f"{rolling_summary}"
+            )
+
+        # Tier 4
         if manual_ltm or ltm_context:
             ltm_lines = ["--- Long-term memory ---"]
             if manual_ltm:
@@ -643,12 +673,14 @@ def create_agent_graph(
 
         # Compact history when it has grown beyond the auto threshold.
         compaction_removes: List[BaseMessage] = []
+        compaction_summary = ""
         if len(all_messages) >= min_messages_auto + compression_window_size:
-            _, compaction_removes = await compact_history(
+            compaction_summary, compaction_removes = await compact_history(
                 all_messages, provider, ltm_store=ltm_store,
                 min_messages_auto=min_messages_auto,
                 min_messages_forced=min_messages_forced,
                 compression_window_size=compression_window_size,
+                prior_summary=state.get("summary", ""),
             )
             if compaction_removes:
                 # Remove compacted messages from the local working copy.
@@ -720,7 +752,10 @@ def create_agent_graph(
         else:
             normalized_tools = None
 
-        system_prompt = _build_system_prompt(state, config, ltm_context=ltm_context)
+        system_prompt = _build_system_prompt(
+            state, config, ltm_context=ltm_context,
+            summary_override=compaction_summary or None,
+        )
 
         response = await _achat_with_retry(
             provider,
@@ -729,7 +764,10 @@ def create_agent_graph(
             system_prompt=system_prompt,
         )
 
-        return {"messages": compaction_removes + repair_msgs + [response]}
+        result: dict = {"messages": compaction_removes + repair_msgs + [response]}
+        if compaction_summary:
+            result["summary"] = compaction_summary
+        return result
 
     async def execute_tools(state: AgentState, config: RunnableConfig) -> dict:
         # Infinite loop guard: block any tool call that has appeared consecutively

@@ -315,3 +315,27 @@ def test_constants_sane():
     assert COMPRESSION_WINDOW_SIZE > MIN_MESSAGES_AUTO
     assert MIN_MESSAGES_AUTO >= MIN_MESSAGES_FORCED
     assert MIN_MESSAGES_FORCED > 0
+
+
+# ---------------------------------------------------------------------------
+# Rolling summary (continuity bridge)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_compact_history_folds_prior_summary_into_prompt():
+    """A prior rolling summary is included in the compaction prompt."""
+    msgs = _build_history(_TRIGGER // 2 + 1)
+    provider = _MockProvider()
+    await compact_history(msgs, provider, prior_summary="Earlier we fixed the parser.")
+    prompt_text = provider.calls[0][0].content
+    assert "Earlier we fixed the parser." in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_compact_history_no_prior_summary_marker_when_absent():
+    """Without a prior summary, no already-compacted marker appears in the prompt."""
+    msgs = _build_history(_TRIGGER // 2 + 1)
+    provider = _MockProvider()
+    await compact_history(msgs, provider)
+    prompt_text = provider.calls[0][0].content
+    assert "already-compacted" not in prompt_text
