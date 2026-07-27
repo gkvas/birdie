@@ -100,3 +100,30 @@ def test_cli_overrides_user():
 
         finally:
             run_module.Path = original_path
+
+
+class TestSkillEnabledByDefault:
+    def test_skill_frontmatter_enabled_by_default_parsed(self):
+        from birdie.core.loader import parse_skill_markdown
+        content = (
+            "---\n"
+            "name: AlwaysOn\n"
+            "description: default-granted skill\n"
+            "enabled_by_default: true\n"
+            "---\n\n"
+            "Some instructions.\n"
+        )
+        skill = parse_skill_markdown(content)
+        assert skill.enabled_by_default is True
+
+    def test_skill_enabled_by_default_defaults_false(self):
+        from birdie.core.loader import parse_skill_markdown
+        content = (
+            "---\n"
+            "name: OptIn\n"
+            "description: opt-in skill\n"
+            "---\n\n"
+            "Some instructions.\n"
+        )
+        skill = parse_skill_markdown(content)
+        assert skill.enabled_by_default is False

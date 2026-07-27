@@ -95,6 +95,7 @@ class AgentDef(BaseModel):
     model: Optional[str] = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
+    enabled_by_default: bool = False  # granted to every session without explicit config
     allowed_skills: List[str] = []
     recursion_limit: int = 25
     max_tool_repetitions: int = 3
@@ -118,6 +119,9 @@ class Skill(BaseModel):
     tags: List[str] = []
     triggers: List[str] = []  # deprecated: kept for backward compat, no longer used
     always_inject: bool = False   # inject body into system prompt every turn
+    enabled_by_default: bool = False  # granted to every session without explicit config
+    # Informational only: declared capability requirements from ## Permissions.
+    # Not enforced by the runtime (yet); surfaced for tooling and review.
     permissions: List[str] = []
     body: Optional[str] = None  # prose body loaded on demand via get_skill
     location: Optional[str] = None  # identifier used to load this skill; defaults to name

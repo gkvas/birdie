@@ -117,6 +117,7 @@ def parse_skill_markdown(content: str) -> Skill:
         tags=frontmatter.get('tags', []),
         triggers=frontmatter.get('triggers', []),
         always_inject=always_inject,
+        enabled_by_default=bool(frontmatter.get('enabled_by_default', False)),
         permissions=permissions,
         body=body,
         location=frontmatter.get('location', skill_name),

@@ -189,3 +189,54 @@ class TestDiscoverAgentsFromDirectory:
     def test_empty_directory(self, tmp_path):
         agents = discover_agents_from_directory(str(tmp_path))
         assert agents == []
+
+
+class TestEnabledByDefault:
+    def test_agent_frontmatter_enabled_by_default_parsed(self):
+        content = (
+            "---\n"
+            "name: Auto\n"
+            "description: always-on agent\n"
+            "enabled_by_default: true\n"
+            "---\n\n"
+            "## Prompt\n\nDo the thing.\n"
+        )
+        agent = parse_agent_markdown(content)
+        assert agent.enabled_by_default is True
+
+    def test_agent_enabled_by_default_defaults_false(self):
+        content = (
+            "---\n"
+            "name: Manual\n"
+            "description: opt-in agent\n"
+            "---\n\n"
+            "## Prompt\n\nDo the thing.\n"
+        )
+        agent = parse_agent_markdown(content)
+        assert agent.enabled_by_default is False
+
+
+class TestOutputParamsPromptRendering:
+    def test_output_params_appended_to_prompt(self):
+        from birdie.core.agent_runner import render_agent_prompt
+        from birdie.core.models import AgentDef, AgentParam
+        agent = AgentDef(
+            name="Summarizer",
+            description="t",
+            prompt="Summarize: {{ text }}",
+            output_params=[
+                AgentParam(name="summary", type="string", description="short summary"),
+                AgentParam(name="points", type="array", description="bullets"),
+            ],
+        )
+        prompt = render_agent_prompt(agent, {"text": "hello world"})
+        assert "Summarize: hello world" in prompt
+        assert '"summary" (string): short summary' in prompt
+        assert '"points" (array): bullets' in prompt
+        assert "JSON object" in prompt
+
+    def test_no_output_params_leaves_prompt_untouched(self):
+        from birdie.core.agent_runner import render_agent_prompt
+        from birdie.core.models import AgentDef
+        agent = AgentDef(name="Plain", description="t", prompt="Say {{ word }}.")
+        assert render_agent_prompt(agent, {"word": "hi"}) == "Say hi."

@@ -279,7 +279,11 @@ class DynamicAgent:
                 # Log error but continue with other directories
                 logging.warning(f"Failed to load skills from {skill_dir}: {str(e)}")
 
-        self.policy.set_default_skills(self._skills_enabled)
+        # Default grants: explicit config plus skills flagged enabled_by_default.
+        default_names = set(self._skills_enabled) | {
+            s.name for s in self.registry.list_skills() if s.enabled_by_default
+        }
+        self.policy.set_default_skills(sorted(default_names))
 
 
 
@@ -296,10 +300,6 @@ class DynamicAgent:
         if user_agents_dir.is_dir():
             dirs.append(str(user_agents_dir))
 
-        if not dirs:
-            self.agent_registry.set_default_agents(self._agents_enabled)
-            return
-
         for d in dirs:
             for agent_def in discover_agents_from_directory(d):
                 tool = agentdef_to_langchain_tool(
@@ -312,7 +312,11 @@ class DynamicAgent:
                 )
                 self.agent_registry.register(agent_def, tool)
 
-        self.agent_registry.set_default_agents(self._agents_enabled)
+        # Default grants: explicit config plus agents flagged enabled_by_default.
+        default_agents = set(self._agents_enabled) | {
+            a.name for a in self.agent_registry.list_agents() if a.enabled_by_default
+        }
+        self.agent_registry.set_default_agents(sorted(default_agents))
 
     async def shutdown(self) -> None:
         """Release resources - call when the agent is no longer needed."""

@@ -86,16 +86,10 @@ async def _invoke_agent(agent_raw: dict, arguments: dict) -> str:
     skills_dir: str = agent_raw.get("_skills_dir", "skills")
     agents_dir: str | None = agent_raw.get("_agents_dir")
 
-    # Build the prompt by substituting {{ param }} placeholders.
-    import re
+    # Build the prompt: {{ param }} substitution + output-format instructions.
+    from birdie.core.agent_runner import render_agent_prompt
 
-    def _substitute(template: str, params: dict) -> str:
-        def replace(m: re.Match) -> str:
-            key = m.group(1).strip()
-            return str(params.get(key, m.group(0)))
-        return re.sub(r'\{\{\s*(\w+)\s*\}\}', replace, template)
-
-    prompt = _substitute(agent_def.prompt, arguments)
+    prompt = render_agent_prompt(agent_def, arguments)
 
     sub_agent = DynamicAgent.from_config(
         provider_config=provider_config or None,

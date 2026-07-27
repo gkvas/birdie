@@ -178,32 +178,3 @@ class SkillRegistry:
         if allowed_skill_names is None:
             return True
         return self._tool_to_skill.get(tool_name) in allowed_skill_names
-
-    def find_skills_by_trigger(
-        self,
-        text: str,
-        allowed_skill_names: Optional[Set[str]] = None,
-    ) -> List[Skill]:
-        """Return freetext skills whose trigger keywords appear in *text*.
-
-        Only skills without tools (freetext skills) participate - structured
-        skills are never matched here.  Matching is case-insensitive substring.
-
-        Args:
-            text: The user's message text to search within.
-            allowed_skill_names: Optional allow-set; skills outside this set
-                are ignored even if their triggers match.
-
-        Returns:
-            List of matching freetext ``Skill`` objects.
-        """
-        lower = text.lower()
-        matched = []
-        for skill in self._skills.values():
-            if allowed_skill_names is not None and skill.name not in allowed_skill_names:
-                continue
-            if not skill.triggers or skill.tools:
-                continue
-            if any(trigger.lower() in lower for trigger in skill.triggers):
-                matched.append(skill)
-        return matched

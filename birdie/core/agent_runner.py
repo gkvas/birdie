@@ -34,6 +34,28 @@ def _substitute(template: str, params: Dict[str, Any]) -> str:
     return re.sub(r'\{\{\s*(\w+)\s*\}\}', replace, template)
 
 
+def render_agent_prompt(agent_def: AgentDef, params: Dict[str, Any]) -> str:
+    """Render the final sub-agent prompt from an AgentDef and input params.
+
+    Substitutes ``{{ param }}`` placeholders and, when the agent declares
+    ``output_params``, appends explicit output-format instructions so the
+    declared output schema actually shapes the reply.
+    """
+    prompt = _substitute(agent_def.prompt, params)
+    if agent_def.output_params:
+        lines = [
+            "",
+            "Return your final answer as a single JSON object with exactly "
+            "these fields:",
+        ]
+        for p in agent_def.output_params:
+            desc = f": {p.description}" if p.description else ""
+            lines.append(f'- "{p.name}" ({p.type}){desc}')
+        lines.append("Output only the JSON object, no other text.")
+        prompt += "\n".join(lines)
+    return prompt
+
+
 def _input_schema(params: List[AgentParam]) -> dict:
     """Build a JSON Schema object from a list of AgentParam objects."""
     _TYPE_MAP = {
@@ -198,7 +220,7 @@ def agentdef_to_langchain_tool(
 
     async def _run(**kwargs: Any) -> str:
 
-        prompt = _substitute(agent_def.prompt, kwargs)
+        prompt = render_agent_prompt(agent_def, kwargs)
 
         sub_agent = DynamicAgent.from_config(
             provider_config=config or None,

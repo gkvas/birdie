@@ -80,6 +80,7 @@ def parse_agent_markdown(content: str) -> AgentDef:
         model=frontmatter.get('model'),
         temperature=frontmatter.get('temperature'),
         max_tokens=frontmatter.get('max_tokens'),
+        enabled_by_default=bool(frontmatter.get('enabled_by_default', False)),
         allowed_skills=frontmatter.get('allowed_skills', []),
         recursion_limit=int(frontmatter.get('recursion_limit', 25)),
         max_tool_repetitions=int(frontmatter.get('max_tool_repetitions', 3)),
