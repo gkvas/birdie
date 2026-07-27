@@ -120,8 +120,9 @@ class Skill(BaseModel):
     triggers: List[str] = []  # deprecated: kept for backward compat, no longer used
     always_inject: bool = False   # inject body into system prompt every turn
     enabled_by_default: bool = False  # granted to every session without explicit config
-    # Informational only: declared capability requirements from ## Permissions.
-    # Not enforced by the runtime (yet); surfaced for tooling and review.
+    # Declared capability requirements from ## Permissions.  When a
+    # tool_approval_callback is configured (the CLI installs one), tools of a
+    # skill with permissions require user approval before they execute.
     permissions: List[str] = []
     body: Optional[str] = None  # prose body loaded on demand via get_skill
     location: Optional[str] = None  # identifier used to load this skill; defaults to name

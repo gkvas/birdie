@@ -126,6 +126,10 @@ class BirdieCLI:
         self._llm_log_handler: Optional[logging.FileHandler] = None
         self._orig_async_send = None
         self._orig_sync_send = None
+        self._active_status = None  # rich Status while a turn is streaming
+
+        # Route permission approvals for permissioned skills through the CLI.
+        agent.tool_approval_callback = self._approve_tool
 
         # Apply stored skill grants for the initial session
         self._apply_session_policy(session)
@@ -218,6 +222,40 @@ class BirdieCLI:
             self.agent.enable_agent(session.id, agent)
         for agent in session.disabled_agents:
             self.agent.disable_agent(session.id, agent)
+        for skill in session.approved_skills:
+            self.agent.policy.grant_permissions(session.id, skill)
+
+    # -- tool permission approval ---------------------------------------------
+
+    async def _approve_tool(
+        self, skill_name: str, permissions: list, tool_name: str, args: dict,
+    ) -> str:
+        """Interactive gate for tools of skills that declare permissions."""
+        status = self._active_status
+        if status is not None:
+            status.stop()
+        try:
+            args_str = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            self.console.print(
+                f"[yellow]Skill [bold]{skill_name}[/bold] requests permissions:"
+                f"[/yellow] {', '.join(permissions)}\n"
+                f"[yellow]Tool call:[/yellow] {tool_name}({args_str})"
+            )
+            answer = (await asyncio.to_thread(
+                input, "Allow? [y]es once / [a]lways this session / [N]o: "
+            )).strip().lower()
+        finally:
+            if status is not None:
+                status.start()
+
+        if answer in ("a", "always"):
+            if skill_name not in self.session.approved_skills:
+                self.session.approved_skills.append(skill_name)
+                self.session_manager.save(self.session)
+            return "always"
+        if answer in ("y", "yes"):
+            return "allow"
+        return "deny"
 
     def _get_prompt(self):
         if self._ctrl_c_warned:
@@ -841,6 +879,7 @@ class BirdieCLI:
         printed_any = False
         status = self.console.status("[dim]thinking…[/dim]", spinner="dots")
         status.start()
+        self._active_status = status
 
         try:
             async for update in self.agent.astream(
@@ -900,6 +939,7 @@ class BirdieCLI:
                                     printed_any = True
         finally:
             status.stop()
+            self._active_status = None
 
         if not printed_any:
             self.console.print("[dim](no response)[/dim]")

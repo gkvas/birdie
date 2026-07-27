@@ -154,6 +154,10 @@ class SkillRegistry:
             tool for name, tool in self._tools.items() if name in tool_names
         ]
 
+    def skill_for_tool(self, tool_name: str) -> Optional[str]:
+        """Return the name of the skill that owns *tool_name*, or None."""
+        return self._tool_to_skill.get(tool_name)
+
     def get_tool(self, name: str) -> Optional[SkillTool]:
         """Look up a tool by name.
 

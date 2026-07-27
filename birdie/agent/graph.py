@@ -17,6 +17,7 @@ Per-invocation context (session identity, long-term memory) is passed via
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -896,6 +897,45 @@ def create_agent_graph(
                         )
                         for t in getattr(last_ai, "tool_calls", [])
                     ]}
+
+        # Permission gate: tools owned by skills that declare permissions
+        # require approval via the configurable ``tool_approval_callback``
+        # ("allow" once, "always" for the session, anything else denies).
+        # Without a callback (library default) execution proceeds unchecked.
+        approval_cb = config.get("configurable", {}).get("tool_approval_callback")
+        if approval_cb is not None and isinstance(last_ai, AIMessage):
+            session_id = _session_id(config)
+            denied_ids: set = set()
+            for tc in getattr(last_ai, "tool_calls", []):
+                owner = registry.skill_for_tool(tc["name"])
+                skill = registry.get_skill(owner) if owner else None
+                if not skill or not skill.permissions:
+                    continue
+                if policy.has_permission_grant(session_id, skill.name):
+                    continue
+                decision = approval_cb(
+                    skill.name, list(skill.permissions), tc["name"], tc["args"],
+                )
+                if inspect.isawaitable(decision):
+                    decision = await decision
+                if decision == "always":
+                    policy.grant_permissions(session_id, skill.name)
+                elif decision != "allow":
+                    denied_ids.add(tc["id"])
+            if denied_ids:
+                return {"messages": [
+                    ToolMessage(
+                        content=(
+                            "Error: the user denied permission to run this tool."
+                            if t["id"] in denied_ids else
+                            "Not executed: another tool call in this batch was "
+                            "denied by the user. Retry it separately if still needed."
+                        ),
+                        tool_call_id=t["id"],
+                        name=t["name"],
+                    )
+                    for t in getattr(last_ai, "tool_calls", [])
+                ]}
 
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
