@@ -86,6 +86,7 @@ class DynamicAgent:
         tool_output_cap: int = MAX_TOOL_OUTPUT_CAP,
         skill_decay_turns: int = SKILL_DECAY_TURNS,
         skill_max_loaded: int = SKILL_MAX_LOADED,
+        compaction_token_threshold: Optional[int] = None,
         skills_enabled: Optional[List[str]] = None,
         agents_enabled: Optional[List[str]] = None,
     ) -> None:
@@ -102,6 +103,7 @@ class DynamicAgent:
         self._tool_output_cap = tool_output_cap
         self._skill_decay_turns = skill_decay_turns
         self._skill_max_loaded = skill_max_loaded
+        self._compaction_token_threshold = compaction_token_threshold
         self._skills_enabled: List[str] = skills_enabled or []
         self._agents_enabled: List[str] = agents_enabled or []
 
@@ -124,6 +126,7 @@ class DynamicAgent:
             min_messages_auto=self._min_messages_auto,
             min_messages_forced=self._min_messages_forced,
             compression_window_size=self._compression_window_size,
+            compaction_token_threshold=self._compaction_token_threshold,
             skills_dir=self.skills_dir,
             agents_dir=self.agents_dir,
             provider_config=self._provider_config,
@@ -192,6 +195,7 @@ class DynamicAgent:
         # These must not be forwarded to vendor SDKs.
         _AGENT_FIELDS = {
             "min_messages_auto", "min_messages_forced", "compression_window_size",
+            "compaction_token_threshold",
             "tool_output_cap", "skill_decay_turns", "skill_max_loaded",
             "skills_enabled", "agents_enabled",
             "ltm_max_age_days", "ltm_max_entries", "ltm_min_score",
@@ -202,6 +206,10 @@ class DynamicAgent:
         tool_output_cap = int(config_dict.get("tool_output_cap") or MAX_TOOL_OUTPUT_CAP)
         skill_decay_turns = int(config_dict.get("skill_decay_turns") or SKILL_DECAY_TURNS)
         skill_max_loaded = int(config_dict.get("skill_max_loaded") or SKILL_MAX_LOADED)
+        _raw_token_threshold = config_dict.get("compaction_token_threshold")
+        compaction_token_threshold = (
+            int(_raw_token_threshold) if _raw_token_threshold else None
+        )
         skills_enabled: List[str] = config_dict.get("skills_enabled") or []
         agents_enabled: List[str] = config_dict.get("agents_enabled") or []
         ltm_max_age_days = int(config_dict.get("ltm_max_age_days") or LTMStore.DEFAULT_MAX_AGE_DAYS)
@@ -225,6 +233,7 @@ class DynamicAgent:
                    compression_window_size=compression_window_size,
                    tool_output_cap=tool_output_cap,
                    skill_decay_turns=skill_decay_turns, skill_max_loaded=skill_max_loaded,
+                   compaction_token_threshold=compaction_token_threshold,
                    skills_enabled=skills_enabled, agents_enabled=agents_enabled)
 
     # -- skill management ---------------------------------------------------

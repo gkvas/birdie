@@ -160,6 +160,15 @@ class ProviderConfig(BaseModel):
             "None uses the built-in default (60)."
         ),
     )
+    compaction_token_threshold: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "Also trigger auto-compaction when the last model call consumed at "
+            "least this many input tokens, regardless of message count.  "
+            "None (default) disables the token-based trigger."
+        ),
+    )
     tool_output_cap: Optional[int] = Field(
         default=None,
         gt=0,

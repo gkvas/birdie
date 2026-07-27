@@ -386,3 +386,70 @@ async def test_auto_compaction_runs_in_background_and_applies_next_turn():
 
     assert len(result["messages"]) < 14  # compacted prefix was removed
     assert result.get("summary") == "Summary of earlier conversation."
+
+
+@pytest.mark.asyncio
+async def test_token_threshold_triggers_compaction_below_message_count():
+    import asyncio
+    from birdie.agent.run import DynamicAgent
+    from birdie.core.llm_provider import LLMProvider
+
+    class _HeavyProvider:
+        """Reports a huge input-token footprint on every normal reply."""
+
+        def supports_tools(self):
+            return False
+
+        async def achat(self, messages, tools=None, system_prompt=None, **kw):
+            text = str(messages[0].content) if messages else ""
+            if "memory compaction system" in text:
+                return AIMessage(content=_MockProvider._DEFAULT_JSON)
+            return AIMessage(
+                content="ok",
+                usage_metadata={"input_tokens": 150_000, "output_tokens": 5,
+                                "total_tokens": 150_005},
+            )
+
+    LLMProvider.register(_HeavyProvider)
+
+    agent = DynamicAgent(_HeavyProvider(), compaction_token_threshold=100_000)
+
+    # Far below the message-count trigger (4 turns = 8 messages < 80), but the
+    # reported input tokens exceed the threshold after turn 1.
+    for i in range(4):
+        await agent.invoke(f"turn {i}", thread_id="heavy")
+    for _ in range(10):
+        await asyncio.sleep(0)
+    result = await agent.invoke("final", thread_id="heavy")
+
+    assert result.get("summary") == "Summary of earlier conversation."
+
+
+@pytest.mark.asyncio
+async def test_no_token_trigger_without_threshold():
+    import asyncio
+    from birdie.agent.run import DynamicAgent
+    from birdie.core.llm_provider import LLMProvider
+
+    class _HeavyProvider2:
+        def supports_tools(self):
+            return False
+
+        async def achat(self, messages, tools=None, system_prompt=None, **kw):
+            return AIMessage(
+                content="ok",
+                usage_metadata={"input_tokens": 150_000, "output_tokens": 5,
+                                "total_tokens": 150_005},
+            )
+
+    LLMProvider.register(_HeavyProvider2)
+    agent = DynamicAgent(_HeavyProvider2())
+
+    for i in range(4):
+        await agent.invoke(f"turn {i}", thread_id="light")
+    for _ in range(10):
+        await asyncio.sleep(0)
+    result = await agent.invoke("final", thread_id="light")
+
+    assert "summary" not in result
+    assert len(result["messages"]) == 10

@@ -281,6 +281,16 @@ async def compact_history(
     return summary_text, remove_msgs
 
 
+def _last_input_tokens(messages: list) -> int:
+    """Return input_tokens of the most recent AIMessage carrying usage metadata."""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            usage = getattr(msg, "usage_metadata", None)
+            if usage:
+                return usage.get("input_tokens", 0) or 0
+    return 0
+
+
 def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
     """Count how many consecutive recent agent cycles included (name, args) in their tool calls.
 
@@ -383,6 +393,7 @@ def create_agent_graph(
     min_messages_auto: int = MIN_MESSAGES_AUTO,
     min_messages_forced: int = MIN_MESSAGES_FORCED,
     compression_window_size: int = COMPRESSION_WINDOW_SIZE,
+    compaction_token_threshold: Optional[int] = None,
     skills_dir: str = "skills",
     agents_dir: Optional[str] = None,
     provider_config: Optional[dict] = None,
@@ -711,17 +722,29 @@ def create_agent_graph(
                     all_messages = [
                         m for m in all_messages if m.id not in remove_ids
                     ]
-        elif (
-            compaction_task is None
-            and len(all_messages) >= min_messages_auto + compression_window_size
-        ):
-            _compaction_tasks[thread] = asyncio.create_task(compact_history(
-                list(all_messages), provider, ltm_store=ltm_store,
-                min_messages_auto=min_messages_auto,
-                min_messages_forced=min_messages_forced,
-                compression_window_size=compression_window_size,
-                prior_summary=state.get("summary", ""),
-            ))
+        elif compaction_task is None:
+            # Two triggers: message count, or (optionally) the input-token
+            # footprint of the last model call - message counts say nothing
+            # about actual context size.
+            msgs_trigger = (
+                len(all_messages) >= min_messages_auto + compression_window_size
+            )
+            tokens_trigger = (
+                compaction_token_threshold is not None
+                and _last_input_tokens(all_messages) >= compaction_token_threshold
+            )
+            if msgs_trigger or tokens_trigger:
+                _compaction_tasks[thread] = asyncio.create_task(compact_history(
+                    list(all_messages), provider, ltm_store=ltm_store,
+                    min_messages_auto=min_messages_auto,
+                    min_messages_forced=min_messages_forced,
+                    compression_window_size=compression_window_size,
+                    prior_summary=state.get("summary", ""),
+                    # The token trigger may fire on short-but-heavy histories
+                    # below the message-count floor; force uses the smaller
+                    # forced floor so compaction actually happens.
+                    force=not msgs_trigger,
+                ))
 
         # Send the full non-compacted history to the LLM.  Compaction already
         # bounds the checkpoint size; trimming further would discard context
