@@ -166,11 +166,11 @@ Startup
        └─ MCPClientManager.register_server(name, MCPServerConfig)
 
 First tool call (lazy connection)
-  └─ MCPClientManager.get_tools()
+  └─ MCPClientManager.get_tools(allowed)
        └─ MultiServerMCPClient.get_tools()
             └─ spawns server process (stdio) or connects (SSE/HTTP)
             └─ calls tools/list  → gets tool names + schemas
-            └─ returns List[BaseTool]  (cached for process lifetime)
+            └─ returns List[BaseTool]  (cached per enabled-server set)
 
 Every call_model() invocation
   └─ skill tools  (SkillTool objects from registry)  → NormalizedToolDef list

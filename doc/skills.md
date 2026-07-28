@@ -5,8 +5,8 @@ The skill system is built in three layers, each sitting on top of the one below:
 ```
 ┌──────────────────────────────────────────────────────┐
 │  Knowledge skills  (freetext SKILL.MD)               │
-│  Domain know-how injected on trigger.                │
-│  The LLM uses whatever tool skills are enabled.      │
+│  Domain know-how loaded on demand: the LLM calls     │
+│  get_skill(...) when the catalog entry looks useful. │
 ├──────────────────────────────────────────────────────┤
 │  Tool skills  (structured SKILL.MD)                  │
 │  Named, schema-typed tools the LLM can call.         │
@@ -36,14 +36,11 @@ birdie/skills/ssh/SKILL.MD
 ---                          ← frontmatter start
 name: ssh                    ← parsed into Skill.name        (used by code)
 description: SSH connections ← parsed into Skill.description (used by code)
-triggers:                    ← parsed into Skill.triggers    (used by code)
-  - ssh
-  - remote server
 ---                          ← frontmatter end / body start
 # SSH Skill                  ←
                              ←  stored verbatim in Skill.body
-## Capabilities              ←  appended to system prompt
-- Establish SSH connections  ←  only when triggered
+## Capabilities              ←  injected into the context only
+- Establish SSH connections  ←  after the LLM calls get_skill
 ...                          ←
 ─────────────────────────────────────────────────────────
 ```
@@ -113,6 +110,21 @@ schema:
 | `description` | yes | Shown to the LLM as the tool's purpose |
 | `entrypoint` | yes | `scheme:target` - see Layer 1 |
 | `schema` | yes | JSON Schema object describing the tool's arguments |
+| `timeout` | no | Seconds a single execution may take (enforced for `bash:` and `http:` entrypoints) |
+| `retries` | no | Automatic re-attempts after a failure. Defaults to `1` for idempotent `http:get` entrypoints, `0` otherwise |
+
+### Permissions
+
+A skill may declare the capabilities its tools require in a `## Permissions` section (a bullet list after the tools):
+
+```markdown
+## Permissions
+
+- network
+- filesystem
+```
+
+When the host application installs a `tool_approval_callback` (the CLI does), any tool of a permissioned skill asks the user for approval before it runs - once, always for the session, or deny. Session-wide approvals are persisted in the session file. Without a callback (plain library use), permissioned tools execute normally.
 
 ### The `always_inject` exception
 
@@ -128,11 +140,6 @@ Knowledge skills carry no tools. Their SKILL.MD is frontmatter plus free-form Ma
 ---
 name: ssh
 description: Establish and manage SSH connections to remote machines.
-triggers:
-  - ssh
-  - remote server
-  - remote connection
-  - secure shell
 ---
 
 # SSH Skill
@@ -149,15 +156,19 @@ triggers:
 |---|---|---|
 | `name` | yes | Unique skill identifier |
 | `description` | yes | One-line summary included in the skill catalog - always sent to the LLM |
-| `triggers` | yes | Keyword phrases; any case-insensitive substring match in the user's message injects the body |
+| `location` | no | Identifier shown in the catalog's `[load: <name>]` hint (defaults to `name`); `get_skill` accepts either |
 
-### How trigger injection works
+> The legacy `triggers:` field is still parsed for backward compatibility but no longer used - keyword-based injection was replaced by progressive loading.
 
-At startup, every enabled knowledge skill's body sits in memory. On each `call_model` invocation, the agent checks whether any trigger phrase appears as a substring of the most recent `HumanMessage` (case-insensitive). If none match, the body is not sent. If any match, the full `Skill.body` is appended to the system prompt for that turn only.
+### How progressive loading works
 
-This keeps the baseline system prompt small while making full knowledge available on-demand. A session with 10 knowledge skills enabled pays the prose cost only for the skills relevant to each turn.
+The skill catalog (sent every turn) lists each enabled knowledge skill with a `[load: <name>]` hint and exposes a single `get_skill` tool. When the model decides a skill is relevant, it calls `get_skill(skill_name=<name>)`; from the next model call onward the full `Skill.body` is injected into the model's context.
 
-The LLM is then responsible for connecting the knowledge to the tools: when the ssh body is injected, the LLM reads it and uses the available tool skills (e.g. Shell's `run_bash`) to construct the appropriate commands.
+A loaded skill stays injected for `skill_decay_turns` human turns (default 5) after the most recent `get_skill` call, subject to an LRU cap of `skill_max_loaded` (default 3) simultaneously loaded skills. Both are configurable in the provider JSON config. Calling `get_skill` again refreshes the lease.
+
+This keeps the baseline prompt small while making full knowledge available on demand: a session with 10 knowledge skills enabled pays the prose cost only for the skills the model actually loaded.
+
+The LLM is then responsible for connecting the knowledge to the tools: when the ssh body is loaded, the LLM reads it and uses the available tool skills (e.g. Shell's `run_bash`) to construct the appropriate commands.
 
 > Ensure the Shell skill (or another execution skill) is enabled when using knowledge skills that require command execution.
 
@@ -165,12 +176,15 @@ The LLM is then responsible for connecting the knowledge to the tools: when the 
 
 ## Skill directories
 
-Birdie loads skills from two locations on every startup:
+Birdie loads skills from up to three locations, in priority order (highest first):
 
-1. **Bundled skills** - `birdie/skills/` shipped inside the package. Always present after `pip install birdie-agent`.
-2. **User skills** - `~/.birdie/skills/` on your home directory, if it exists. Drop a subdirectory with a `SKILL.MD` there and it is picked up automatically on next start.
+1. **Explicit directory** - the `--skills-dir PATH` flag (or the `skills_dir` argument to `DynamicAgent`), when given.
+2. **User skills** - `~/.birdie/skills/`, if it exists. Drop a subdirectory with a `SKILL.MD` there and it is picked up on the next start (or `/skill reload`).
+3. **Bundled skills** - `birdie/skills/` shipped inside the package.
 
-To use a completely different directory instead of the bundled one, pass `--skills-dir PATH`. The user skills directory `~/.birdie/skills/` is always also loaded on top of whichever primary directory is used.
+When two directories define a skill with the same name, the **first** (higher-priority) definition wins. Nothing is ever loaded implicitly from the current working directory.
+
+Use `/skill new <name>` to scaffold a starter SKILL.MD under `~/.birdie/skills/<name>/`, and `/skill reload` to re-discover skills without restarting.
 
 ## Built-in skills
 
@@ -202,5 +216,7 @@ All built-in skills are **disabled by default**. Enable them per session:
 **Lazy - happens on every agent turn:**
 
 1. **Tool schema and execution wiring.** `StructuredTool` wrappers are created fresh each turn from the policy-resolved allowed set. A skill can be enabled or disabled between turns.
-2. **Trigger matching and body injection.** The prose in `Skill.body` is never sent automatically. It is injected only when a trigger keyword matches the current user message.
-3. **MCP tool discovery.** `MCPClientManager.get_tools()` connects to the MCP server on the first call and caches the result for the process lifetime.
+2. **Knowledge body injection.** The prose in `Skill.body` is never sent automatically (unless `always_inject: true`). It is injected only after the model loads the skill with `get_skill`, and it decays after `skill_decay_turns` human turns without a refresh.
+3. **MCP tool discovery.** `MCPClientManager.get_tools()` connects to the MCP servers on the first call and caches the result per enabled-server set for the process lifetime.
+
+`/skill reload` re-runs the eager phase in place without restarting the process.

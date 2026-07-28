@@ -106,8 +106,8 @@ python examples/03_web_search.py
 - `DynamicAgent(llm, skills_dir=...)` - pass any LangChain `BaseChatModel`
 
 **Skill access control**
-- `agent.enable_skill_for_user(session_id, skill_name)` - grant a skill for a session
-- `agent.disable_skill_for_user(session_id, skill_name)` - block a skill
+- `agent.enable_skill(session_id, skill_name)` - grant a skill for a session
+- `agent.disable_skill(session_id, skill_name)` - block a skill
 - `agent.enable_skills_for_session(session_id, [skill_names])` - fixed skill set
 - `agent.registry` / `agent.policy` - inspect loaded skills and current grants
 
@@ -117,7 +117,7 @@ python examples/03_web_search.py
 
 **Memory**
 - `thread_id` - identifies the session; the checkpointer loads prior history automatically
-- `long_term_memory=[...]` - strings injected into the system prompt every turn
+- `long_term_memory=[...]` - strings injected into the model's context every turn
 - `AsyncSqliteSaver` - persist history to SQLite across process restarts
 
 **Extensibility**

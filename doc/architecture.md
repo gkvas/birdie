@@ -19,17 +19,20 @@ birdie/
 ├── cli.py              # Interactive REPL
 ├── core/
 │   ├── models.py       # Skill, SkillTool, AgentDef, MCPServerConfig data models
-│   ├── loader.py       # SKILL.MD parser
+│   ├── loader.py       # SKILL.MD parser + scaffolding
 │   ├── agent_loader.py # AGENT.MD parser
 │   ├── agent_registry.py # In-memory agent index and session policy
 │   ├── agent_runner.py # AgentDef → async LangChain StructuredTool
 │   ├── registry.py     # In-memory skill/tool index
-│   ├── policy.py       # Per-session skill access control
-│   ├── session.py      # Session persistence (history, LTM, skill/agent grants)
+│   ├── policy.py       # Per-session skill access control + permission grants
+│   ├── session.py      # Session persistence (metadata, memory, grants)
 │   ├── adapter.py      # SkillTool → LangChain StructuredTool
 │   ├── entrypoints.py  # bash / http / python / grpc resolvers
 │   ├── mcp_client.py   # MCP client manager (wraps langchain-mcp-adapters)
+│   ├── acp_mcp_server.py # MCP bridge exposing skills/agents to ACP providers
 │   ├── llm_provider.py # Vendor-agnostic LLM abstraction
+│   ├── pricing.py      # Model pricing table + cost estimation
+│   ├── errors.py       # Birdie-level exceptions
 │   ├── ltm.py          # LTM store: per-user JSON persistence + semantic query
 │   └── retrieval.py    # Embedding and cosine similarity primitives
 └── skills/
@@ -74,13 +77,14 @@ START
 │   agent node    call_model()             │
 │                                          │
 │   1. query LTM for semantic context      │
-│   2. compact history (if ≥ MAX_MESSAGES) │
+│   2. apply / start background compaction │
 │   3. build context window                │
 │      (full history, starts at HumanMsg) │
 │   4. repair dangling tool calls          │
 │   5. resolve skill + agent tools         │
 │   6. fetch MCP tools                     │
-│   7. build system prompt (Tiers 0-3)     │
+│   7. build stable system prompt +        │
+│      ephemeral session-context message   │
 │   8. call provider.achat()               │
 │   9. append removes + AIMessage to state │
 └──────────────────┬───────────────────────┘
@@ -97,11 +101,13 @@ START
 │                                          │
 │   1. check for repeated tool calls       │
 │      (max_tool_repetitions guard)        │
-│   2. resolve skill + agent tools         │
-│   3. fetch MCP tools                     │
-│   4. build LangChain ToolNode            │
-│   5. execute called tool(s)              │
-│   6. append ToolMessage(s) to state      │
+│   2. permission gate for skills that     │
+│      declare ## Permissions              │
+│   3. resolve skill + agent tools         │
+│   4. fetch MCP tools                     │
+│   5. build LangChain ToolNode            │
+│   6. execute called tool(s)              │
+│   7. append ToolMessage(s) to state      │
 └──────────────────┬───────────────────────┘
                    │
                    └─────────────────► agent node (loop)
@@ -115,15 +121,19 @@ The loop continues until the model returns a message with no `tool_calls`. The c
 ```python
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
+    summary: NotRequired[str]   # rolling summary of compacted-away history
 ```
 
 `Annotated[..., add_messages]` is LangGraph's reducer pattern. When a node returns
 `{"messages": [new_msg]}`, LangGraph calls `add_messages(current, [new_msg])` to **append**, not
 replace. If the node returns `RemoveMessage` objects (see *Conversation compaction* below),
 LangGraph instead **deletes** the matching rows from the checkpoint before appending anything else.
+`summary` is a plain last-value channel: a node that returns it overwrites the previous value, and
+nodes that omit it leave it unchanged.
 
-The state is intentionally minimal: only `messages`. Session ID, long-term memory, user identity,
-and skill policy key all flow through `config["configurable"]`, not through state.
+The state is intentionally minimal: the conversation plus its compaction summary. Session ID,
+long-term memory, user identity, and skill policy key all flow through `config["configurable"]`,
+not through state.
 
 ### Per-turn context via RunnableConfig
 
@@ -165,16 +175,19 @@ If `user_id` is set in `config["configurable"]`, the node looks up (or creates) 
 `LTMStore` in a per-graph `_ltm_cache` dictionary. It then extracts the text of the most recent
 `HumanMessage` and calls `ltm_store.query(user_text, k=5)` to retrieve the five most relevant
 prior compaction entries by cosine similarity. These are formatted with
-`ltm_store.format_for_prompt()` and held in a local variable for Tier 3 injection. If `user_id`
+`ltm_store.format_for_prompt()` and held for injection into the session-context message. If `user_id`
 is empty, this step is skipped entirely.
 
-**Step 2 - Compact history if needed.**
-The full message list is loaded from the LangGraph checkpointer into `all_messages`. If
-`len(all_messages) >= MAX_MESSAGES` (100), `compact_history()` is called. This function summarises
-the oldest segment of the conversation, stores the result in the LTM store, and returns a list of
-`RemoveMessage` objects identifying which messages to delete. The removes are collected and will be
-included in the node's return value at the end of this function. See *Conversation compaction*
-for the full algorithm.
+**Step 2 - Apply or start background compaction.**
+The full message list is loaded from the LangGraph checkpointer into `all_messages`. If a
+background compaction task for this thread finished since the last turn, its results are applied
+now: the `RemoveMessage` list is filtered against the still-present messages, the removals join
+the node's return value, and the new rolling summary is written to the `summary` state channel.
+If no task is running and a trigger fires - the history reached
+`min_messages_auto + compression_window_size` messages (80 by default), or the last model call's
+input tokens reached `compaction_token_threshold` - a new `compact_history()` task is started with
+`asyncio.create_task()`. The current turn proceeds at full context; the extra summarisation LLM
+call never blocks it. See *Conversation compaction* for the full algorithm.
 
 **Step 3 - Build the context window.**
 The full non-compacted checkpoint is forwarded to the LLM. Because compaction already trims old
@@ -196,8 +209,10 @@ boundaries, so the first message retained in the checkpoint after any compaction
 If the process was killed or crashed after an `AIMessage` with `tool_calls` was written to the
 checkpoint but before the corresponding `ToolMessage` was written, the checkpoint is in a state
 that providers reject. The `_repair_dangling_tool_calls()` helper scans the context window for
-exactly this condition and inserts placeholder `ToolMessage`s. These repair messages are included
-in the node's return value so the checkpoint is healed permanently.
+exactly this condition and inserts placeholder `ToolMessage`s into the **working copy** sent to
+the provider. The repairs are deliberately *not* written back to the checkpoint (appending them
+at the tail would mis-order them again); they are re-derived cheaply on every turn until the
+conversation moves past the broken segment.
 
 **Step 5 - Resolve skill and agent tools.**
 The node calls into `core/registry.py` and `core/agent_registry.py` to collect all tools that the
@@ -208,21 +223,24 @@ or disabling a skill mid-session takes effect immediately.
 The `MCPClientManager` in `core/mcp_client.py` connects to any configured MCP servers and returns
 their tool schemas as LangChain-compatible objects.
 
-**Step 7 - Build the system prompt.**
-The five-tier prompt assembly (see *System prompt* below) happens here, incorporating skill
-catalog, always-injected skill bodies, triggered skill bodies, manual LTM, and the semantic LTM
-entries retrieved in Step 1.
+**Step 7 - Build the stable system prompt and the session-context message.**
+The system prompt (see *System prompt and session context* below) carries only content that is
+byte-identical across turns: custom instructions, the skill catalog, and `always_inject` skill
+bodies. Everything volatile - progressively loaded skill bodies, the rolling compaction summary,
+manual LTM, and the semantic LTM entries retrieved in Step 1 - is packed into an ephemeral
+`<session_context>` message appended after the conversation. That message is sent to the provider
+but never written to the checkpoint, so the cached prompt prefix stays stable.
 
 **Step 8 - Call the provider.**
-`provider.achat()` receives the trimmed context window, the full tool list, and the assembled
-system prompt. If the provider returns HTTP 429 (rate limit), the call is retried with exponential
-backoff: 5 seconds, then 15 seconds, then 45 seconds, then a hard failure.
+`provider.achat()` receives the context window, the full tool list, and the assembled system
+prompt. Transient errors (HTTP 429/529, 5xx, connection failures) are retried up to three times
+with exponential backoff, honouring the provider's `Retry-After` header when present.
 
 **Step 9 - Return the state delta.**
-The node returns `{"messages": compaction_removes + repair_msgs + [response]}`. LangGraph processes
-`RemoveMessage` entries first (deleting rows from SQLite), then appends the new messages. This is
-atomic from the application's perspective: the checkpoint either contains the full delta or none
-of it.
+The node returns `{"messages": compaction_removes + [response]}` plus, when a compaction finished
+this turn, the new rolling `summary`. LangGraph processes `RemoveMessage` entries first (deleting
+rows from SQLite), then appends the new messages. This is atomic from the application's
+perspective: the checkpoint either contains the full delta or none of it.
 
 ### Infinite loop guard
 
@@ -240,9 +258,12 @@ the checkpoint ends up with an `AIMessage` whose `tool_calls` have no matching `
 Providers like Mistral reject this as a protocol violation.
 
 At the start of every `call_model` invocation, `_repair_dangling_tool_calls()` in
-`birdie/agent/graph.py` scans the loaded message list, finds any unanswered tool calls, and inserts
-placeholder `ToolMessage`s immediately after the offending `AIMessage`. The repair messages are
-returned as part of the state delta and written back to the checkpoint, healing it permanently.
+`birdie/agent/graph.py` scans the loaded message list, finds any unanswered or misplaced tool
+results, and produces a patched working copy with placeholder `ToolMessage`s inserted immediately
+after the offending `AIMessage`. The patched list is what the provider sees; the checkpoint itself
+is left untouched (writing the repairs back would append them at the tail and mis-order them on
+the next turn), and the repair is re-derived on each turn until compaction removes the broken
+segment.
 
 ### ToolNode
 
@@ -286,21 +307,35 @@ information is not simply discarded - it remains available for semantic retrieva
 Three constants in `birdie/agent/graph.py` control when and how much is compacted:
 
 ```python
-MIN_MESSAGES = 20       # minimum messages to retain after compaction
-MAX_MESSAGES = 100      # trigger compaction when stored history reaches this
-COMPRESSION_WINDOW = 60 # maximum number of oldest messages to compress per run
+MIN_MESSAGES_AUTO = 20        # auto-compaction floor: minimum messages to retain
+MIN_MESSAGES_FORCED = 4       # /compact floor: minimum messages to retain
+COMPRESSION_WINDOW_SIZE = 60  # maximum number of oldest messages to compress per run
 ```
 
-These are deliberately conservative: compaction only fires when the history is long enough that
-there is a meaningful "old" segment to compress, and it always leaves a generous tail of recent
-context intact. The invariant after any compaction run is:
+Automatic compaction triggers when the stored history reaches
+`MIN_MESSAGES_AUTO + COMPRESSION_WINDOW_SIZE` messages (80 by default), or - when the optional
+`compaction_token_threshold` is configured - when the last model call's reported input tokens
+reach that threshold. The invariant after any compaction run is:
 
 ```
-remaining_messages >= MIN_MESSAGES
-compressed_messages <= COMPRESSION_WINDOW
+remaining_messages >= floor          (MIN_MESSAGES_AUTO, or MIN_MESSAGES_FORCED when forced)
+compressed_messages <= COMPRESSION_WINDOW_SIZE
 ```
 
-All three constants can be overridden at runtime. See *Configuring compaction thresholds* below.
+All constants can be overridden at runtime. See *Configuring compaction thresholds* below.
+
+### Background execution and the rolling summary
+
+Automatic compaction runs as an `asyncio` background task, one per thread. The turn that crosses
+the threshold only *starts* the task; the first `call_model` invocation after the task finishes
+applies its results - the `RemoveMessage` deletions (filtered against messages still present, in
+case a forced `/compact` raced it) and the new narrative summary.
+
+The summary is kept in a `summary` channel on `AgentState`, checkpointed with the session, and
+injected into the model's context every turn as `--- Earlier conversation (compacted) ---`. Later
+compactions receive the prior summary as input and fold it in, so one rolling summary always
+covers everything compacted away. This continuity bridge exists even when no LTM store is
+configured.
 
 ### How the split point is found
 
@@ -311,14 +346,16 @@ together. Splitting there would corrupt the LLM's context on the next call. Inst
 
 The algorithm inside `compact_history()` in `birdie/agent/graph.py`:
 
-1. Collect all indices where a `HumanMessage` appears in `all_messages`.
-2. Compute `max_split = min(compression_window, len(all_messages) - min_messages)`. This ensures
-   that after removing the first `split_at` messages, at least `min_messages` remain.
+1. Collect all indices where a `HumanMessage` appears in `all_messages`. Fewer than two human
+   messages means there is nothing meaningful to compact - return immediately.
+2. Compute `max_split = min(compression_window_size, len(all_messages) - floor)`, where the floor
+   is `min_messages_auto` (or `min_messages_forced` for a forced run). This ensures that after
+   removing the first `split_at` messages, at least the floor remains.
 3. Walk the `HumanMessage` indices in reverse, finding the largest index that is `> 0` and
    `<= max_split`. This becomes `split_at`.
 4. Take `all_messages[:split_at]` as the segment to compress.
-5. If fewer than `min_messages // 2` messages fall in this segment, skip compaction - the
-   overhead of an extra LLM call is not worth it for a small saving.
+5. If the segment holds fewer than two messages, skip compaction - the overhead of an extra LLM
+   call is not worth it for a trivial saving.
 
 ### The compaction prompt
 
@@ -372,63 +409,56 @@ After a successful compaction:
 remove_msgs = [RemoveMessage(id=m.id) for m in old_msgs if m.id is not None]
 ```
 
-3. The node returns `{"messages": compaction_removes + repair_msgs + [response]}`. LangGraph
-   processes the `RemoveMessage` entries first (deleting rows from the checkpoint) and then appends
-   the new messages. Both operations happen in the same checkpoint write.
+3. The node applying the finished background task returns
+   `{"messages": compaction_removes + [response]}`. LangGraph processes the `RemoveMessage`
+   entries first (deleting rows from the checkpoint) and then appends the new messages. Both
+   operations happen in the same checkpoint write.
 
 ### Configuring compaction thresholds
 
-The three thresholds (`min_messages`, `max_messages`, `compression_window`) can be set in the
-JSON provider config file passed to `DynamicAgent.from_config()`:
+The thresholds can be set in the JSON provider config file passed to
+`DynamicAgent.from_config()`:
 
 ```json
 {
   "vendor": "anthropic",
   "model": "claude-sonnet-4-6",
-  "min_messages": 10,
-  "max_messages": 50,
-  "compression_window": 30
+  "min_messages_auto": 10,
+  "compression_window_size": 30,
+  "compaction_token_threshold": 60000
 }
 ```
 
-They are extracted from the config dict in `DynamicAgent.from_config()` before the remaining
-config is forwarded to the vendor SDK (see `birdie/agent/run.py`), so they never pollute the LLM
-provider:
-
-```python
-_AGENT_FIELDS = {"min_messages", "max_messages", "compression_window"}
-min_messages = int(config_dict.get("min_messages") or MIN_MESSAGES)
-max_messages = int(config_dict.get("max_messages") or MAX_MESSAGES)
-compression_window = int(config_dict.get("compression_window") or COMPRESSION_WINDOW)
-provider_config_clean = {k: v for k, v in config_dict.items() if k not in _AGENT_FIELDS}
-```
-
-The values are also wired through `DynamicAgent.__init__()`, `create_agent_graph()`, and
-`compact_history()` so all compaction paths - automatic and manual - honour the same settings.
+They belong to the `_AGENT_FIELDS` set that `DynamicAgent.from_config()` extracts from the config
+dict before the remaining config is forwarded to the vendor SDK (see `birdie/agent/run.py`), so
+they never pollute the LLM provider. The values are wired through `DynamicAgent.__init__()`,
+`create_agent_graph()`, and `compact_history()` so all compaction paths - automatic and manual -
+honour the same settings.
 
 | Field | Default | Effect |
 |---|---|---|
-| `min_messages` | `20` | Minimum messages to retain in the checkpoint after any compaction run |
-| `max_messages` | `100` | Trigger automatic compaction when stored history reaches this count |
-| `compression_window` | `60` | Maximum number of oldest messages to compress in a single run |
+| `min_messages_auto` | `20` | Minimum messages to retain after automatic compaction |
+| `min_messages_forced` | `4` | Minimum messages to retain after a forced `/compact` |
+| `compression_window_size` | `60` | Maximum number of oldest messages to compress in a single run |
+| `compaction_token_threshold` | - | Also trigger when the last model call used at least this many input tokens (disabled when unset) |
 
-A low `max_messages` (e.g. 30) is useful for agents that need very tight context budgets.
-A high `min_messages` (close to `max_messages`) reduces how aggressively old context is pruned.
+A low `min_messages_auto` + small window compacts earlier and more aggressively; a token
+threshold catches short-but-heavy histories that a message count never would.
 
 ### Automatic vs manual compaction
 
-**Automatic compaction** is triggered inside `call_model()` whenever
-`len(all_messages) >= MAX_MESSAGES`. The user sees no interruption; the compaction happens
-silently before the LLM is called for the current turn. From the user's perspective, the
-conversation simply continues; behind the scenes the checkpoint has shrunk.
+**Automatic compaction** is started inside `call_model()` as a background task whenever a trigger
+fires (see *Thresholds* above). The user sees no interruption and pays no extra latency; the
+removals and the updated rolling summary are applied on the first turn after the summarisation
+call completes.
 
 **Manual compaction** is triggered by the `/compact` slash command in `birdie/cli.py`. The CLI
 calls `DynamicAgent.compact_session(thread_id, user_id)`, which:
 
 1. Loads the current checkpoint with `app.aget_state(run_config)`.
 2. Calls `compact_history(all_messages, provider, ltm_store=ltm_store, force=True)`. The
-   `force=True` flag bypasses the `MAX_MESSAGES` threshold so compaction runs regardless of
-   history length.
+   `force=True` flag bypasses the automatic trigger (and uses the smaller `min_messages_forced`
+   floor) so compaction runs regardless of history length.
 3. Writes the `RemoveMessage` list back to the checkpoint with
    `app.aupdate_state(run_config, {"messages": removes})`.
 4. Returns `(n_removed, summary_text)` to the CLI, which displays the result to the user.
@@ -438,17 +468,23 @@ and dispatched from the main input loop.
 
 ---
 
-## System prompt
+## System prompt and session context
 
-Each `call_model()` invocation in `birdie/agent/graph.py` assembles the system prompt fresh from
-five tiers. This is done by `_build_system_prompt()`. The tiers are evaluated in order and
-concatenated; absent tiers are omitted without leaving a gap.
+Each `call_model()` invocation in `birdie/agent/graph.py` splits the model's non-conversation
+context into two carriers with different stability guarantees:
 
-### Tier 0 - custom instructions
+- the **system prompt** (`_build_system_prompt()`) - only content that is byte-identical across
+  turns, so the provider's prompt-cache prefix (tools + system + history) survives from turn to
+  turn;
+- the **session-context message** (`_build_volatile_context()`) - everything that changes
+  per turn, wrapped in `<session_context>` tags and appended as an ephemeral `HumanMessage`
+  after the real conversation. It is sent to the provider but never written to the checkpoint.
 
-If `.birdie/system_prompt.md` exists in the current working directory, its contents are prepended
-before all skill context. The file is re-read on every turn, so changes take effect immediately
-without restarting the agent.
+### Stable system prompt
+
+**Tier 0 - custom instructions.** If `.birdie/system_prompt.md` exists in the current working
+directory, its contents are prepended before all skill context. The file is re-read on every
+turn, so changes take effect immediately without restarting the agent.
 
 ```bash
 cat > .birdie/system_prompt.md << 'EOF'
@@ -461,42 +497,39 @@ This is the recommended way to give the agent project-specific instructions. The
 intentionally project-local (`.birdie/`, which should be in `.gitignore`) so different projects
 can have different personas without touching global config.
 
-### Tier 1 - skill catalog (always present)
-
-A compact bullet list of every skill currently allowed for the session:
+**Tier 1 - skill catalog (always present).** A compact bullet list of every skill currently
+allowed for the session. Knowledge skills carry a `[load: <name>]` hint:
 
 ```
 You have access to the following skills:
 
 - **Shell**: Execute arbitrary shell commands on the local machine.
-- **ssh**: Establish and manage SSH connections...  triggers: ssh, remote server, ...
+- **ssh**: Establish and manage SSH connections... [load: ssh]
+
+Knowledge skills show [load: <name>] - call get_skill(skill_name=<name>) to load full instructions.
 ```
 
 This tier is generated from the in-memory `SkillRegistry` (`core/registry.py`) filtered through
 the session's `SkillPolicy` (`core/policy.py`). Skills that are disabled for the current session
 are not listed here, so the model does not attempt to call tools it cannot use.
 
-### Tier 2a - always_inject skill bodies
+**Tier 2 - always_inject skill bodies.** Skills with `always_inject: true` in their SKILL.MD
+frontmatter have their full prose body appended on every turn, regardless of what the user said.
+This is useful for planning or meta skills whose instructions must always be present.
 
-Skills with `always_inject: true` in their SKILL.MD frontmatter have their full prose body
-appended on every turn, regardless of what the user said. This is useful for planning or meta
-skills whose instructions must always be present in the model's context (for example, a skill
-that defines how the agent should break down complex tasks).
+### Ephemeral session context
 
-### Tier 2b - freetext skill body (on trigger only)
+**Loaded knowledge-skill bodies.** When the model calls `get_skill(skill_name=...)`, the skill's
+full Markdown body is injected here from the next model call onward. The lease lasts
+`skill_decay_turns` human turns (default 5) after the most recent load, with an LRU cap of
+`skill_max_loaded` (default 3) simultaneous skills; expired or evicted bodies simply stop being
+injected. The `get_skill` tool result itself is only a short acknowledgment, so the body is never
+billed twice.
 
-When the most recent `HumanMessage` contains any of a knowledge skill's trigger keywords (a
-case-insensitive substring match against the `triggers:` list in the SKILL.MD frontmatter), the
-skill's full Markdown body is appended for that turn only. On turns where the keyword is not
-present, the body is omitted to save context tokens.
+**Rolling compaction summary.** The `--- Earlier conversation (compacted) ---` block carries the
+narrative summary of everything compaction has removed (see *Conversation compaction*).
 
-This design keeps the context window lean: large reference documents are only loaded when the
-model is likely to need them.
-
-### Tier 3 - long-term memory (manual and semantic, merged)
-
-Two sources are merged into a single `--- Long-term memory ---` block at the end of the system
-prompt:
+**Long-term memory.** Two sources merge into a `--- Long-term memory ---` block:
 
 1. **Manual entries**: strings passed via `config["configurable"]["long_term_memory"]`. These come
    from the user's `memory.json` file, populated by the `/remember` command in the CLI. They are
@@ -504,8 +537,6 @@ prompt:
 2. **Semantic entries**: the top-5 most relevant `LTMEntry` objects retrieved from the `LTMStore`
    via cosine similarity on the current user message (see *Long-term memory store* below). These
    are structured compaction results and are formatted by `ltm_store.format_for_prompt()`.
-
-Example output when both sources are present:
 
 ```
 --- Long-term memory ---
@@ -515,8 +546,16 @@ Example output when both sources are present:
   Preferences: wants root cause, not workarounds             ← compaction entry
 ```
 
-Both sources are always included when available. If neither is set (no `/remember` entries, no
-compaction results, or no `user_id`), the tier is omitted entirely.
+Blocks that have no content are omitted; when nothing is volatile at all, no session-context
+message is appended.
+
+### Prompt caching
+
+Because the system prompt is stable and the session context rides at the very end of the
+request, the Anthropic provider can place `cache_control` breakpoints on the last tool
+definition, the system block, and the last stable message. Tools, system prompt, and the growing
+conversation history are then served from the provider prompt cache on every subsequent turn.
+Disable with `"prompt_cache": false` in the provider config.
 
 ---
 
@@ -562,9 +601,10 @@ class LTMEntry:
     created_at: str         # ISO 8601 UTC timestamp
 ```
 
-The `embedding` field is computed at write time by passing the entry's `summary` through the
-`embed()` function from `core/retrieval.py`. It is stored in the JSON file so retrieval does not
-require re-embedding on every query.
+The `embedding` field is computed at write time by passing the concatenation of the entry's
+`summary` and all list fields through the `embed()` function from `core/retrieval.py`, so a
+query can match on facts or tool outcomes, not just the narrative. It is stored in the JSON
+file so retrieval does not require re-embedding on every query.
 
 ### LTMStore persistence (`birdie/core/ltm.py`)
 
@@ -652,8 +692,8 @@ On every `call_model()` invocation in `birdie/agent/graph.py`:
    `ltm_store.query(user_text, k=5)`.
 4. `LTMStore.query()` embeds the query text, then scores every stored `LTMEntry` by cosine
    similarity against the entry's pre-computed embedding, and returns the top `k` entries.
-5. The top-5 entries are formatted with `ltm_store.format_for_prompt()` and injected into Tier 3
-   of the system prompt alongside the manual `/remember` entries.
+5. The top-5 entries are formatted with `ltm_store.format_for_prompt()` and injected into the
+   ephemeral session-context message alongside the manual `/remember` entries.
 
 If `user_id` is empty, or no `ltm_factory` was provided to `create_agent_graph()`, this entire
 step is skipped.
@@ -683,17 +723,6 @@ agent = DynamicAgent.from_config(config, ltm_store_factory=custom_factory)
 Pass `ltm_store_factory=None` (or construct `DynamicAgent` directly without one) to disable the
 LTM store entirely. When disabled, compaction still fires and removes messages from the checkpoint,
 but the structured summaries are not saved anywhere.
-
----
-
-## System prompt
-
-Each `call_model()` invocation in `birdie/agent/graph.py` assembles the system prompt fresh from
-five tiers. This is done by `_build_system_prompt()`. The tiers are evaluated in order and
-concatenated; absent tiers are omitted without leaving a gap.
-
-The prompt is rebuilt on every turn. This means enabling a skill, updating `.birdie/system_prompt.md`,
-or adding a `/remember` entry all take effect on the very next message without restarting the agent.
 
 ---
 
@@ -758,6 +787,12 @@ when a session is first created. The policy is consulted on every `call_model()`
 
 `AgentRegistry` provides the equivalent for sub-agents: session-scoped enable/disable sets,
 identical semantics to `SkillPolicy`.
+
+Beyond enablement, `SkillPolicy` also tracks **permission grants**: when a skill declares a
+`## Permissions` section and the host application installs a `tool_approval_callback` (the CLI
+does), `execute_tools()` asks the callback before running that skill's tools. An "always"
+answer records a standing grant for the session; the CLI persists it in the session file
+(`approved_skills`) and restores it on resume.
 
 In the CLI, the **session ID** is used as the policy key. Each session has fully independent
 skill and agent grants, persisted to the session JSON file and restored when the session is
@@ -830,8 +865,9 @@ list of timestamped entries:
 
 At the start of each turn the CLI reads `memory.json` and forwards the contents as
 `long_term_memory` through `config["configurable"]`. These are injected as the manual part of
-Tier 3 of the system prompt. Long-term memory is never written into the checkpoint and never
-mixed with message history; it is injected fresh on every turn.
+the long-term-memory block in the ephemeral session-context message. Long-term memory is never
+written into the checkpoint and never mixed with message history; it is injected fresh on every
+turn.
 
 ### Automatic long-term memory - compaction and `ltm.json`
 
@@ -847,7 +883,8 @@ semantic retrieval. The compaction pipeline writes here automatically whenever i
 segment of conversation history; the user does not manage this file directly.
 
 The two stores serve different purposes and are never merged on disk. At prompt-injection time
-both are read and combined into a single Tier 3 block. The distinction matters because:
+both are read and combined into a single long-term-memory block in the session context. The
+distinction matters because:
 
 - `memory.json` entries are permanent until the user deletes them - they represent explicit
   user intent.
@@ -869,7 +906,10 @@ and agent grants and administrative metadata.
   "enabled_skills": ["Shell", "Filesystem"],
   "disabled_skills": [],
   "enabled_agents": ["CVulnAnalyst"],
-  "disabled_agents": []
+  "disabled_agents": [],
+  "approved_skills": ["MyNetworkSkill"],
+  "total_input_tokens": 45120,
+  "total_output_tokens": 8630
 }
 ```
 
@@ -974,7 +1014,8 @@ reached. The implementation in `birdie/agent/run.py`:
    `app.aupdate_state(run_config, {"messages": removes})`.
 4. Returns `(len(removes), summary_text)`.
 
-Returns `(0, "")` when there is nothing to compact (history is shorter than `MIN_MESSAGES // 2`).
+Returns `(0, "")` when there is nothing to compact (fewer than two human turns, or no split point
+that keeps at least `min_messages_forced` messages).
 
 ### Custom LTM factory
 
@@ -1000,7 +1041,8 @@ async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as cp:
     result = await agent.invoke("hello", thread_id="my-session", user_id="alice")
 ```
 
-When no checkpointer is provided, `DynamicAgent.from_config()` creates an
-`AsyncSqliteSaver` pointing at `~/.birdie/sessions/<user_id>/checkpoints.db` automatically. The
-explicit form above is useful when you want the database at a custom path, or when you want to
-share a single checkpointer across multiple `DynamicAgent` instances.
+When no checkpointer is provided, `DynamicAgent` falls back to an in-memory `MemorySaver` -
+history lives only for the lifetime of the process, which suits tests and one-shot scripts. The
+CLI passes an `AsyncSqliteSaver` pointing at `~/.birdie/sessions/<user_id>/checkpoints.db`, which
+is what makes its sessions durable; embedders that want the same behaviour must do likewise (as
+in the example above).

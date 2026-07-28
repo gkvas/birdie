@@ -437,7 +437,7 @@ All notable changes to this project are documented here.
 - `/log http on|off` - monkey-patch `httpx.AsyncClient.send` /
   `httpx.Client.send` to capture full JSON request and response bodies to
   `~/.birdie/http.log`; streaming responses are noted but not reassembled
-  (ACP traffic uses stdio, so use `/log llm` for that provider instead)    
+  (ACP traffic uses stdio, so use `/log llm` for that provider instead)
 
 ## [0.2.6] - 2026-05-05
 

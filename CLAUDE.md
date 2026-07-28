@@ -20,6 +20,7 @@ Key source locations:
 | `birdie/core/policy.py` | `SkillPolicy` - per-session skill access control |
 | `birdie/core/ltm.py` | `LTMStore` - persistent long-term memory |
 | `birdie/core/retrieval.py` | Hash-trick bag-of-ngrams embedder (512-dim) |
+| `birdie/core/pricing.py` | Model pricing table and cost estimation |
 | `birdie/core/llm_provider.py` | Vendor-agnostic LLM interface (OpenAI, Anthropic, Mistral) |
 | `birdie/skills/` | Built-in skill definitions |
 | `tests/` | pytest test suite |

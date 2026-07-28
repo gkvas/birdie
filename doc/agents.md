@@ -1,6 +1,6 @@
 # Sub-agents
 
-Sub-agents are self-contained AI agents defined by **AGENT.MD** files. When enabled, a sub-agent appears to the calling LLM as a regular tool. Calling it spins up an ephemeral `DynamicAgent`, runs it to completion with a rendered prompt, and returns its final reply as the tool result.
+Sub-agents are self-contained AI agents defined by **AGENT.MD** files. When enabled, a sub-agent appears to the calling LLM as a regular tool. Calling it runs an inner `DynamicAgent` to completion with a rendered prompt and returns its final reply as the tool result. The inner agent instance is cached across invocations (skills are not re-parsed per call); each invocation runs on a fresh conversation thread, so runs never see each other's history.
 
 Sub-agents differ from skills in a few key ways:
 
@@ -61,8 +61,10 @@ Summarize the following text concisely. Return at most {{ max_points }} bullet p
 | `version` | no | Semver string (default `1.0.0`) |
 | `description` | yes | One-line summary - the calling LLM uses this to decide when to invoke the agent |
 | `enabled_by_default` | no | If `true`, enabled for all sessions without an explicit grant (default `false`) |
-| `vendor` | no | Override the LLM vendor for this agent (default: inherits from the calling agent) |
+| `vendor` | no | Must match the calling agent's vendor when set - a differing value is a load error. Use `model` to pick a different model within the same vendor. |
 | `model` | no | Override the LLM model for this agent |
+| `temperature` | no | Override the sampling temperature for this agent |
+| `max_tokens` | no | Override the completion token cap for this agent |
 | `allowed_skills` | no | List of skill names the sub-agent may use (default `[]`) |
 | `recursion_limit` | no | Maximum LangGraph steps for the inner agent loop (default `25`) |
 | `max_tool_repetitions` | no | Block a tool call if it appears this many times consecutively with identical args (default `3`) |
@@ -79,7 +81,7 @@ Each `### ParameterName` block under `## Input` becomes a typed argument on the 
 
 ### Output parameters
 
-`## Output` documents what the agent returns. These are informational only - the actual return value is always the agent's final AI message text.
+`## Output` declares the structured result of the agent. When output parameters are present, Birdie appends explicit JSON output instructions to the rendered prompt, parses the agent's final reply as a JSON object (tolerating surrounding prose), and validates that every required field is present with the declared type. On a mismatch the sub-agent receives one corrective follow-up before the (validated, canonical-JSON) result is returned. Without an `## Output` section, the raw final message text is returned unchanged.
 
 ### Prompt template
 
@@ -100,12 +102,12 @@ Source:
 
 ## Agent directories
 
-Birdie loads agents from two locations on every startup:
+Birdie loads agents from two locations on every startup, in priority order:
 
-1. **Bundled agents** - `birdie/agents/` shipped inside the package.
-2. **User agents** - `~/.birdie/agents/` on your home directory, if it exists. Drop a subdirectory with an `AGENT.MD` file there and it is picked up automatically on next start.
+1. **Primary directory** - `--agents-dir PATH` when given, otherwise the bundled `birdie/agents/`.
+2. **User agents** - `~/.birdie/agents/`, if it exists. Drop a subdirectory with an `AGENT.MD` file there and it is picked up automatically on next start.
 
-To use a completely different directory instead of the bundled one, pass `--agents-dir PATH`. The user agents directory `~/.birdie/agents/` is always also loaded on top.
+When both directories define an agent with the same name, the primary (first) definition wins. A broken AGENT.MD is skipped with a warning; it never prevents startup.
 
 ## Bundled agents
 
@@ -220,16 +222,15 @@ The calling LLM will invoke `MyAnalyst` with the file contents and filename as a
 
 ---
 
-## Vendor and model overrides
+## Model overrides
 
 By default a sub-agent uses the same LLM as the calling agent. To use a different model for a specific sub-agent (e.g. a cheaper model for summarisation, a stronger one for security analysis):
 
 ```yaml
-vendor: anthropic
 model: claude-haiku-4-5-20251001
 ```
 
-These fields override the calling agent's provider for that specific sub-agent only.
+`model`, `temperature`, and `max_tokens` may be overridden per sub-agent; the **vendor and API key are always inherited** from the calling agent. Setting `vendor:` to a value that differs from the parent's vendor is rejected when the agent is loaded (the agent is skipped with a warning).
 
 ---
 
