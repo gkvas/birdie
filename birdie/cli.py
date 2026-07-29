@@ -355,7 +355,7 @@ class BirdieCLI:
     def _get_toolbar(self) -> HTML:
         """Render the bottom status bar for prompt_toolkit."""
         vendor = self.agent.provider.vendor_name
-        model  = self.agent.provider.model_name
+        model  = self.session.model or self.agent.provider.model_name
         ctx    = f"{self._last_context:,}" if self._last_context else "-"
         spent  = f"↑{self._total_in:,}  ↓{self._total_out:,}"
         try:
