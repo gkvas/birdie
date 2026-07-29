@@ -76,3 +76,35 @@ async def test_history_empty_session():
     cli, console = _make_cli([])
     await cli._print_history("2026-07-27_1")
     assert "No prior history" in console.export_text()
+
+
+class TestToolbar:
+    def test_toolbar_renders_with_real_session(self, tmp_path):
+        """Regression: the status bar must render with an actual Session object.
+
+        A change once referenced session.model, which does not exist on the
+        Session dataclass - the AttributeError fired on the first prompt
+        render and crashed the CLI at startup.
+        """
+        from rich.console import Console
+        from birdie.core.session import SessionManager
+
+        mgr = SessionManager(sessions_root=tmp_path)
+        session = mgr.create("alice")
+
+        agent = MagicMock()
+        agent._tool_output_cap = 0
+        agent.provider.vendor_name = "anthropic"
+        agent.provider.model_name = "claude-sonnet-4-6"
+
+        cli = BirdieCLI(
+            agent,
+            session_manager=mgr,
+            session=session,
+            user_id="alice",
+            user_memory=MagicMock(),
+            console=Console(record=True, width=120),
+        )
+        toolbar = cli._get_toolbar()
+        assert "claude-sonnet-4-6" in toolbar.value
+        assert session.id in toolbar.value
