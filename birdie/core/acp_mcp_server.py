@@ -19,10 +19,21 @@ DynamicAgent in-process.
 import asyncio
 import json
 import os
+import sys
 
-import mcp.server.stdio
-import mcp.types as types
-from mcp.server import Server
+try:
+    import mcp.server.stdio
+    import mcp.types as types
+    from mcp.server import Server
+except ImportError:  # pragma: no cover - exercised only in bare installs
+    if __name__ == "__main__":
+        print(
+            "birdie: MCP support is not installed. "
+            "Install the optional extra: pip install 'birdie-agent[mcp]'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    raise
 
 from birdie.core.entrypoints import resolve_entrypoint
 
