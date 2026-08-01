@@ -74,7 +74,7 @@ mcp_server:
 
 ## Writing an MCP server
 
-An MCP server can be written in any language that has an MCP SDK. The Python SDK makes it compact using `FastMCP`:
+An MCP server can be written in any language that has an MCP SDK. With mcp 1.x, the Python SDK makes it compact using `FastMCP`:
 
 ```python
 from mcp.server.fastmcp import FastMCP
@@ -92,31 +92,13 @@ if __name__ == "__main__":
 
 The function's name, docstring, and type annotations become the tool name, description, and argument schema automatically.
 
+> `FastMCP` left the `mcp` package in 2.0 (it lives on as the separate `fastmcp` project). Servers that must run under both mcp 1.x and 2.x should use the low-level `Server` API instead - see the demo server below for the pattern.
+
 ---
 
 ## The demo server
 
-`birdie/skills/mcp_demo/` contains a minimal working example:
-
-```python
-# birdie/skills/mcp_demo/server.py
-from mcp.server.fastmcp import FastMCP
-
-mcp = FastMCP("mcp_demo")
-
-@mcp.tool()
-def echo(message: str) -> str:
-    """Return the message unchanged."""
-    return message
-
-@mcp.tool()
-def reverse_string(text: str) -> str:
-    """Return the text with characters in reverse order."""
-    return text[::-1]
-
-if __name__ == "__main__":
-    mcp.run(transport="stdio")
-```
+`birdie/skills/mcp_demo/server.py` contains a minimal working example built on the low-level `Server` API, so it runs under both mcp 1.x and 2.x. It exposes two tools (`echo` and `reverse_string`) with hand-written JSON schemas, registering its handlers via decorators on 1.x and via constructor callbacks (`on_list_tools=` / `on_call_tool=`) on 2.x.
 
 The matching SKILL.MD:
 
