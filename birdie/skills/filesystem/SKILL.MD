@@ -1,7 +1,7 @@
 ---
 name: Filesystem
 version: 1.0.0
-description: Read, write, and manage local files and directories.
+description: Read, write, edit, and manage local files and directories.
 tags: [local, fs, system]
 enabled_by_default: false
 ---
@@ -44,6 +44,27 @@ schema:
       type: string
       description: Content to write; avoid quotes, backslashes, and newlines
   required: [path, content]
+
+### edit_file
+description: Replace an exact string in a file. This is the preferred way to modify an existing file - arguments are passed as real values, so old_string/new_string may safely contain quotes, backslashes, and newlines. old_string must match the file content exactly (including whitespace and indentation) and must be unique in the file unless replace_all is true; read the relevant part of the file first and copy it verbatim.
+entrypoint: python:birdie.skills.filesystem.tools.edit_file
+schema:
+  type: object
+  properties:
+    path:
+      type: string
+      description: Path to the file to edit
+    old_string:
+      type: string
+      description: Exact existing text to replace, copied verbatim from the file
+    new_string:
+      type: string
+      description: The replacement text
+    replace_all:
+      type: boolean
+      description: Replace every occurrence instead of requiring old_string to be unique (default false)
+      default: false
+  required: [path, old_string, new_string]
 
 ### append_file
 description: Append content to the end of a file. Same quoting limitations as write_file - content with quotes, backslashes, or newlines will be corrupted. Use the Shell skill with a heredoc for complex content.
