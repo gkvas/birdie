@@ -23,9 +23,9 @@ def edit_file(
 
     Args:
         path: Path to the file to edit.
-        old_string: Exact text to find, including whitespace and indentation.
+        old_string: Exact text to find, including whitespace/indentation.
         new_string: Replacement text.
-        replace_all: Replace every occurrence instead of requiring a unique one.
+        replace_all: Replace every occurrence instead of a unique one.
         **_: Ignored extra kwargs from the StructuredTool wrapper.
 
     Returns:
@@ -40,21 +40,27 @@ def edit_file(
     if not target.is_file():
         raise ValueError(f"File not found: {path}")
     if not old_string:
-        raise ValueError("old_string must not be empty; use write_file to create content.")
+        raise ValueError(
+            "old_string must not be empty; use write_file to create content."
+        )
     if old_string == new_string:
-        raise ValueError("old_string and new_string are identical - nothing to change.")
+        raise ValueError(
+            "old_string and new_string are identical - nothing to change."
+        )
 
     content = target.read_text()
     count = content.count(old_string)
     if count == 0:
         raise ValueError(
-            f"old_string not found in {path}. It must match the file exactly, "
-            "including whitespace and indentation - re-read the file and retry."
+            f"old_string not found in {path}. It must match the file "
+            "exactly, including whitespace and indentation - re-read the "
+            "file and retry."
         )
     if count > 1 and not replace_all:
         raise ValueError(
-            f"old_string occurs {count} times in {path}. Add surrounding lines "
-            "to make it unique, or pass replace_all=true to replace every occurrence."
+            f"old_string occurs {count} times in {path}. Add surrounding "
+            "lines to make it unique, or pass replace_all=true to replace "
+            "every occurrence."
         )
 
     target.write_text(content.replace(old_string, new_string))
