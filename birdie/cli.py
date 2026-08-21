@@ -497,6 +497,58 @@ class BirdieCLI:
             )
         self.console.print()
 
+    def _make_acp_tool_renderer(self, status):
+        """Build a callback that renders ACP tool_call session updates live.
+
+        ACP providers execute tools inside the agent subprocess, so the
+        graph's tools node never runs.  This callback mirrors the native
+        rendering: a bold header when a call starts, dim output when it
+        completes (respecting the /tool output mode).
+        """
+        from rich.markup import escape
+
+        titles: dict[str, str] = {}
+        announced_input: set[str] = set()
+        finished: set[str] = set()
+
+        def _render(event: dict) -> None:
+            tool_id = event.get("id", "")
+            if event["event"] == "tool_call":
+                title = event.get("title") or event.get("kind") or "tool"
+                titles[tool_id] = title
+                self.console.print(
+                    f"🐦 [bold]{escape(title)}[/bold]", highlight=False
+                )
+                status.update("[dim]running tools…[/dim]")
+
+            # The call arguments often arrive only in a later update
+            # (e.g. claude-agent-acp sends tool_call with empty rawInput).
+            raw = event.get("raw_input")
+            if isinstance(raw, dict) and raw and tool_id not in announced_input:
+                announced_input.add(tool_id)
+                cmd = raw.get("command")
+                if cmd:
+                    line = f"$ {cmd}"
+                    desc = raw.get("description")
+                    if desc:
+                        line += f"  ({desc})"
+                else:
+                    line = ", ".join(f"{k}={v!r}" for k, v in raw.items())
+                self.console.print(
+                    f"   [dim]{escape(line)}[/dim]", highlight=False
+                )
+
+            if event.get("status") in ("completed", "failed") and tool_id not in finished:
+                finished.add(tool_id)
+                if event.get("status") == "failed":
+                    self.console.print("[red]   ✗ failed[/red]")
+                output = event.get("output") or ""
+                if output:
+                    self._render_tool_output(titles.get(tool_id, "tool"), output)
+                status.update("[dim]thinking…[/dim]")
+
+        return _render
+
     # -- logging --------------------------------------------------------------
 
     def _handle_log(self, arg: str) -> None:
@@ -1004,6 +1056,11 @@ class BirdieCLI:
         status.start()
         self._active_status = status
 
+        provider = self.agent.provider
+        has_tool_events = hasattr(provider, "tool_event_callback")
+        if has_tool_events:
+            provider.tool_event_callback = self._make_acp_tool_renderer(status)
+
         try:
             async for update in self.agent.astream(
                 message,
@@ -1063,6 +1120,8 @@ class BirdieCLI:
                                     self.console.print()
                                     printed_any = True
         finally:
+            if has_tool_events:
+                provider.tool_event_callback = None
             status.stop()
             self._active_status = None
 
