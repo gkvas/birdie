@@ -80,6 +80,13 @@ class TestSaveLoad:
         assert loaded.enabled_skills == ["Filesystem"]
         assert loaded.disabled_skills == ["SSH"]
 
+    def test_roundtrip_total_cost(self, manager):
+        s = manager.create("alice")
+        s.total_cost_usd = 1.25
+        manager.save(s)
+        loaded = manager.load("alice", s.id)
+        assert loaded.total_cost_usd == 1.25
+
     def test_load_unknown_session_raises(self, manager):
         with pytest.raises(FileNotFoundError, match="Unknown session"):
             manager.load("alice", "2000-01-01_99")

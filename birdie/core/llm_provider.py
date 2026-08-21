@@ -1513,6 +1513,42 @@ class ACPProvider(LLMProvider):
         except Exception:
             log.debug("tool_event_callback raised", exc_info=True)
 
+    def _extract_usage(self, params: dict) -> dict | None:
+        """Normalize a usage_update session/update notification.
+
+        Returns a dict with any of the keys ``used`` (tokens in context),
+        ``size`` (context window) and ``cost`` ({amount, currency}) that the
+        agent reported, or None for other update types.
+        """
+        update = params.get("update", {})
+        if update.get("sessionUpdate") != "usage_update":
+            return None
+        usage = {k: update[k] for k in ("used", "size") if update.get(k) is not None}
+        cost = update.get("cost")
+        if isinstance(cost, dict) and cost.get("amount") is not None:
+            usage["cost"] = cost
+        return usage
+
+    def _build_ai_message(self, text: str, usage: dict | None) -> AIMessage:
+        """Build the final turn message, attaching agent-reported usage if any.
+
+        ACP reports context tokens in use rather than an input/output split,
+        so ``used`` maps to input_tokens and output_tokens stays 0.
+        """
+        if not usage:
+            return AIMessage(content=text)
+        used = int(usage.get("used") or 0)
+        response_metadata: dict = {}
+        if usage.get("size") is not None:
+            response_metadata["context_window"] = usage["size"]
+        if usage.get("cost") is not None:
+            response_metadata["cost"] = usage["cost"]
+        return AIMessage(
+            content=text,
+            usage_metadata={"input_tokens": used, "output_tokens": 0, "total_tokens": used},
+            response_metadata=response_metadata,
+        )
+
     # -- sync low-level -----------------------------------------------------
 
     def _sync_send(self, stdin: Any, msg: dict) -> None:
@@ -1627,10 +1663,11 @@ class ACPProvider(LLMProvider):
             })
 
             text_parts: list[str] = []
+            usage: dict | None = None
             while True:
                 msg = self._sync_recv(proc.stdout)
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
-                    return AIMessage(content="".join(text_parts))
+                    return self._build_ai_message("".join(text_parts), usage)
                 if "id" in msg and "method" in msg:
                     self._sync_handle_agent_request(proc.stdin, msg, mcp_mode=mcp_mode)
                 elif "method" in msg and "id" not in msg:
@@ -1638,6 +1675,10 @@ class ACPProvider(LLMProvider):
                     chunk = self._extract_chunk_text(params)
                     if chunk:
                         text_parts.append(chunk)
+                        continue
+                    update = self._extract_usage(params)
+                    if update is not None:
+                        usage = {**(usage or {}), **update}
                     else:
                         self._emit_tool_event(params)
         finally:
@@ -1795,10 +1836,11 @@ class ACPProvider(LLMProvider):
             })
 
             text_parts: list[str] = []
+            usage: dict | None = None
             while True:
                 msg = await self._async_recv(proc.stdout, buf=buf)
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
-                    result = AIMessage(content="".join(text_parts))
+                    result = self._build_ai_message("".join(text_parts), usage)
                     log.debug("RESPONSE  acp=%s\n  content: %s", self._command[0], result.content[:2000])
                     return result
                 if "id" in msg and "method" in msg:
@@ -1808,6 +1850,10 @@ class ACPProvider(LLMProvider):
                     chunk = self._extract_chunk_text(params)
                     if chunk:
                         text_parts.append(chunk)
+                        continue
+                    update = self._extract_usage(params)
+                    if update is not None:
+                        usage = {**(usage or {}), **update}
                     else:
                         self._emit_tool_event(params)
         finally:
