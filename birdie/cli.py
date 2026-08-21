@@ -1287,6 +1287,90 @@ class BirdieCLI:
 
     # -- main loop ------------------------------------------------------------
 
+    async def run_non_interactive(self, prompt: str) -> None:
+        """Run a single non-interactive turn and print the AI response to stdout."""
+        from langchain_core.messages import AIMessage, ToolMessage
+        
+        # Non-interactive mode: clean output to stdout, no interactive elements
+        
+        ltm = self.user_memory.as_strings()
+        
+        try:
+            # Collect all output parts (AI messages and tool calls)
+            output_parts = []
+            
+            async for update in self.agent.astream(
+                prompt,
+                thread_id=self.session.id,
+                user_id=self.user_id,
+                long_term_memory=ltm if ltm else None,
+                config={"configurable": {"tool_output_cap": self._tool_output_cap}},
+            ):
+                for node_name, node_output in update.items():
+                    msgs = node_output.get("messages", [])
+                    
+                    if node_name == "tools":
+                        for msg in msgs:
+                            if isinstance(msg, ToolMessage):
+                                name = msg.name or ""
+                                # Check if this is a sub-agent (they print their own transcript)
+                                is_agent = self.agent.agent_registry.get_agent(name) is not None
+                                if not is_agent:  # Regular skill tool - include in output
+                                    content = str(msg.content) if msg.content else ""
+                                    if content:
+                                        output_parts.append(f"🐦 {name}: {content}")
+                    
+                    elif node_name == "agent":
+                        for msg in msgs:
+                            if isinstance(msg, AIMessage):
+                                # Update token usage tracking
+                                um = getattr(msg, "usage_metadata", None)
+                                if um:
+                                    self._last_context = um.get("input_tokens", 0)
+                                    self._total_in += um.get("input_tokens", 0)
+                                    self._total_out += um.get("output_tokens", 0)
+                                    self.session.total_input_tokens += um.get("input_tokens", 0)
+                                    self.session.total_output_tokens += um.get("output_tokens", 0)
+                                
+                                rm = getattr(msg, "response_metadata", None) or {}
+                                if rm.get("context_window"):
+                                    self._context_window = rm["context_window"]
+                                rm_cost = rm.get("cost")
+                                if isinstance(rm_cost, dict) and rm_cost.get("amount"):
+                                    self.session.total_cost_usd += float(rm_cost["amount"])
+                                
+                                # Handle tool calls
+                                for tc in getattr(msg, "tool_calls", []):
+                                    args_str = ", ".join(
+                                        f"{k}={v!r}" for k, v in tc["args"].items()
+                                    )
+                                    output_parts.append(f"🐦 {tc['name']}({args_str})")
+                                
+                                # Collect AI content
+                                content = msg.content
+                                if isinstance(content, list):
+                                    content = "\n".join(
+                                        b.get("text", "") if isinstance(b, dict) else str(b)
+                                        for b in content
+                                    )
+                                if content:
+                                    output_parts.append(str(content))
+            
+            # Print the collected output to stdout
+            if output_parts:
+                print("\n".join(output_parts))
+            else:
+                print("(no response)")
+                
+        except Exception as exc:
+            # Print errors to stderr and exit with non-zero code
+            print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            # Update session metadata
+            self.session.touch()
+            self.session_manager.save(self.session)
+
     async def run(self) -> None:
         """Start the interactive REPL and block until the user quits."""
         self._print_welcome()
@@ -1375,6 +1459,12 @@ def main() -> None:
         default=None,
         help="Path to a JSON provider config file (overrides LLM_VENDOR / LLM_MODEL env vars)",
     )
+    parser.add_argument(
+        "-p", "--prompt",
+        metavar="PROMPT",
+        default=None,
+        help="Run non-interactively with the given prompt and print the AI response to stdout",
+    )
     args = parser.parse_args()
 
     user_id = (
@@ -1387,7 +1477,7 @@ def main() -> None:
     agents_dir = args.agents_dir or os.path.join(os.path.dirname(__file__), "agents")
     provider_config = Path(args.config) if args.config else None
 
-    asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config))
+    asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config, args.prompt))
 
 
 _PROVIDER_HELP = """
@@ -1435,6 +1525,7 @@ async def _async_main(
     skills_dir: str,
     agents_dir: Optional[str],
     provider_config,
+    prompt: Optional[str] = None,
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -1485,7 +1576,13 @@ async def _async_main(
             user_memory=user_memory,
             console=console,
         )
-        await cli.run()
+        
+        if prompt is not None:
+            # Non-interactive mode: run single prompt and output to stdout
+            await cli.run_non_interactive(prompt)
+        else:
+            # Interactive mode: start the REPL
+            await cli.run()
 
 
 if __name__ == "__main__":
