@@ -461,14 +461,14 @@ class TestAzureOpenAIProvider:
 
 class TestACPProvider:
 
-    def _make_proc(self, *response_lines):
+    def _make_proc(self, *response_lines, session_result=None):
         """Return a mock Popen whose stdout yields initialize + session/new + response lines."""
         init_resp = json.dumps({
             "jsonrpc": "2.0", "id": 0,
             "result": {"protocolVersion": 1, "agentInfo": {"name": "test-agent", "version": "1.0.0"}, "agentCapabilities": {}},
         }) + "\n"
         session_resp = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "result": {"sessionId": "sess_test123"},
+            "jsonrpc": "2.0", "id": 1, "result": session_result or {"sessionId": "sess_test123"},
         }) + "\n"
         lines = [init_resp.encode(), session_resp.encode()] + [
             (json.dumps(r) + "\n").encode() for r in response_lines
@@ -497,6 +497,27 @@ class TestACPProvider:
             result = provider.chat(sample_messages)
         assert isinstance(result, AIMessage)
         assert result.content == "Hi there"
+
+    def test_chat_captures_model_name(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        session_result = {
+            "sessionId": "sess_test123",
+            "models": {"availableModels": [], "currentModelId": "claude-fable-5"},
+        }
+        mock_proc = self._make_proc(self._prompt_result(), session_result=session_result)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            assert provider.model_name == "unknown"
+            provider.chat(sample_messages)
+        assert provider.model_name == "claude-fable-5"
+
+    def test_chat_without_model_info_keeps_unknown(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(self._prompt_result())
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.chat(sample_messages)
+        assert provider.model_name == "unknown"
 
     def test_chat_sends_correct_rpc(self, sample_messages):
         from birdie.core.llm_provider import ACPProvider
@@ -704,13 +725,15 @@ class TestACPProvider:
         assert "error" in responses[0]
         assert responses[0]["error"]["code"] == -32601
 
-    def _make_async_proc(self, *response_lines):
+    def _make_async_proc(self, *response_lines, session_result=None):
         """Build a mock async ACP subprocess whose stdout yields the given JSON lines."""
         init_resp = json.dumps({
             "jsonrpc": "2.0", "id": 0,
             "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
         }).encode() + b"\n"
-        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s_async"}}).encode() + b"\n"
+        session_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "result": session_result or {"sessionId": "s_async"},
+        }).encode() + b"\n"
         lines = [init_resp, session_resp] + [(json.dumps(r) + "\n").encode() for r in response_lines]
         idx = 0
 
@@ -752,6 +775,19 @@ class TestACPProvider:
         assert "-m" in entry["args"]
         assert "birdie.core.acp_mcp_server" in entry["args"]
         assert any(e["name"] == "BIRDIE_TOOLS_JSON" for e in entry["env"])
+
+    @pytest.mark.asyncio
+    async def test_achat_captures_model_name(self):
+        from birdie.core.llm_provider import ACPProvider
+        session_result = {
+            "sessionId": "s_async",
+            "models": {"availableModels": [], "currentModelId": "claude-fable-5"},
+        }
+        mock_proc = self._make_async_proc(self._prompt_result(), session_result=session_result)
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            await provider.achat([HumanMessage(content="hi")])
+        assert provider.model_name == "claude-fable-5"
 
     @pytest.mark.asyncio
     async def test_astream_chat_with_tools_rejects_terminal_create(self):
