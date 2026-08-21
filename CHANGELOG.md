@@ -1,3 +1,8 @@
+## [Unreleased]
+
+### Added
+- Non-interactive mode via `-p`/`--prompt` CLI argument: allows passing a prompt directly to birdie, which then runs once and outputs the AI response to stdout (similar to Claude Code's `-p` flag). Works with all existing CLI options like `--config`, `--user`, and `--session-id`.
+
 ## [0.8.0] - 2026-08-21
 
 ### Added
