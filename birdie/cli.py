@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -102,6 +103,66 @@ HELP_TEXT = """
 _TOOL_OUTPUT_MODES = ("full", "short", "off")
 _AGENT_OUTPUT_MODES = ("full", "short", "off")
 
+# The status bar re-renders on every keystroke, so git state is cached
+# and refreshed at most once per TTL (see BirdieCLI._git_segment).
+_GIT_TTL_SECONDS = 3.0
+
+
+def _format_git_segment(porcelain: str) -> str:
+    """Format ``git status --porcelain=v2 --branch`` output for the toolbar.
+
+    Returns e.g. ``⎇ main``, ``⎇ main*`` (dirty), ``⎇ main* ↑2↓1``
+    (ahead/behind upstream), ``⎇ (3f2c1ab)`` (detached HEAD), or ``""``
+    when the output carries no branch information.
+    """
+    branch = ""
+    oid = ""
+    ahead = behind = 0
+    dirty = False
+    for line in porcelain.splitlines():
+        if line.startswith("# branch.head "):
+            branch = line[len("# branch.head "):]
+        elif line.startswith("# branch.oid "):
+            oid = line[len("# branch.oid "):]
+        elif line.startswith("# branch.ab "):
+            for part in line[len("# branch.ab "):].split():
+                if part.startswith("+"):
+                    ahead = int(part[1:])
+                elif part.startswith("-"):
+                    behind = int(part[1:])
+        elif not line.startswith("#"):
+            # Any non-header line is a changed/untracked/unmerged entry.
+            dirty = True
+    if branch == "(detached)":
+        branch = f"({oid[:7]})" if oid and oid != "(initial)" else "(detached)"
+    if not branch:
+        return ""
+    segment = f"⎇ {branch}"
+    if dirty:
+        segment += "*"
+    arrows = (f"↑{ahead}" if ahead else "") + (f"↓{behind}" if behind else "")
+    if arrows:
+        segment += f" {arrows}"
+    return segment
+
+
+def _read_git_status(cwd: str) -> str:
+    """Return the git toolbar segment for *cwd*, or ``""`` outside a repo.
+
+    Never raises: a missing git binary, a non-repo directory, or a slow
+    filesystem (1 s timeout) all degrade to an empty segment.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "status",
+             "--porcelain=v2", "--branch"],
+            cwd=cwd, capture_output=True, text=True, timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return _format_git_segment(proc.stdout)
 
 
 class BirdieCLI:
@@ -141,6 +202,8 @@ class BirdieCLI:
         self._ctrl_c_warned: bool = False
         # State for /cd Tab cycling
         self._cd_cycle: dict = {"completions": [], "index": -1, "path": None}
+        # TTL cache for the toolbar's git segment, keyed on cwd
+        self._git_cache: dict = {"cwd": None, "at": 0.0, "text": ""}
 
         kb = KeyBindings()
 
@@ -352,8 +415,22 @@ class BirdieCLI:
 
     # -- status toolbar -------------------------------------------------------
 
+    def _git_segment(self) -> str:
+        """Return the cached git status segment for the current directory."""
+        cwd = str(Path.cwd())
+        now = time.monotonic()
+        cache = self._git_cache
+        if cache["cwd"] != cwd or now - cache["at"] >= _GIT_TTL_SECONDS:
+            cache.update(cwd=cwd, at=now, text=_read_git_status(cwd))
+        return cache["text"]
+
     def _get_toolbar(self) -> HTML:
-        """Render the bottom status bar for prompt_toolkit."""
+        """Render the bottom status bar for prompt_toolkit.
+
+        Left side: provider, cwd, session, and token info.  Right side:
+        git status, padded flush-right when the terminal is wide enough,
+        otherwise appended as a regular segment.
+        """
         vendor = self.agent.provider.vendor_name
         model  = self.agent.provider.model_name
         ctx    = f"{self._last_context:,}" if self._last_context else "-"
@@ -363,13 +440,31 @@ class BirdieCLI:
             cwd_str = f"~/{cwd}"
         except ValueError:
             cwd_str = str(Path.cwd())
-        return HTML(
-            f" <b>{vendor}</b> · {model}"
+        rest = (
+            f" · {model}"
             f"   │   {cwd_str}"
             f"   │   session: {self.session.id}"
             f"   │   ctx: {ctx} tok"
             f"   │   spent: {spent} tok"
         )
+        left_html = f" <b>{vendor}</b>{rest}"
+        git = self._git_segment()
+        if not git:
+            return HTML(left_html)
+        # Branch names may contain characters with meaning in PT's HTML.
+        git_html = (
+            git.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+        try:
+            from prompt_toolkit.application import get_app
+            width = get_app().output.get_size().columns
+        except Exception:
+            width = 0
+        left_len = len(f" {vendor}{rest}")
+        pad = width - left_len - len(git) - 1
+        if pad >= 3:
+            return HTML(left_html + " " * pad + git_html + " ")
+        return HTML(f"{left_html}   │   {git_html}")
 
     # -- display helpers ------------------------------------------------------
 
