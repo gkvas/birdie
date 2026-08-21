@@ -185,6 +185,7 @@ class BirdieCLI:
         self._total_in: int = 0
         self._total_out: int = 0
         self._last_context: int = 0
+        self._context_window: int = 0
         self._tool_output_mode: str = "short"
         self._agent_output_mode: str = "off"
         self._tool_output_cap: int = agent._tool_output_cap
@@ -434,6 +435,8 @@ class BirdieCLI:
         vendor = self.agent.provider.vendor_name
         model  = self.agent.provider.model_name
         ctx    = f"{self._last_context:,}" if self._last_context else "-"
+        if self._context_window and self._last_context:
+            ctx = f"{ctx}/{self._context_window:,}"
         spent  = f"↑{self._total_in:,}  ↓{self._total_out:,}"
         try:
             cwd = Path.cwd().relative_to(Path.home())
@@ -539,6 +542,13 @@ class BirdieCLI:
         model = self.agent.provider.model_name
         s_in = self.session.total_input_tokens
         s_out = self.session.total_output_tokens
+        if self.session.total_cost_usd:
+            self.console.print(
+                f"  [dim]model:[/dim]    {model}\n"
+                f"  [dim]session:[/dim]  ↑{s_in:,} in  ↓{s_out:,} out tokens\n"
+                f"  [dim]cost:[/dim]     ${self.session.total_cost_usd:.4f} (reported by agent)"
+            )
+            return
         cost = estimate_cost(model, s_in, s_out)
         cost_str = f"${cost:.4f}" if cost is not None else "unknown (no pricing data)"
         self.console.print(
@@ -1191,6 +1201,12 @@ class BirdieCLI:
                                     self._total_out += um.get("output_tokens", 0)
                                     self.session.total_input_tokens += um.get("input_tokens", 0)
                                     self.session.total_output_tokens += um.get("output_tokens", 0)
+                                rm = getattr(msg, "response_metadata", None) or {}
+                                if rm.get("context_window"):
+                                    self._context_window = rm["context_window"]
+                                rm_cost = rm.get("cost")
+                                if isinstance(rm_cost, dict) and rm_cost.get("amount"):
+                                    self.session.total_cost_usd += float(rm_cost["amount"])
                                 for tc in getattr(msg, "tool_calls", []):
                                     args_str = ", ".join(
                                         f"{k}={v!r}" for k, v in tc["args"].items()

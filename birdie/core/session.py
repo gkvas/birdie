@@ -87,6 +87,8 @@ class Session:
     # Cumulative token usage across all turns of this session.
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Cumulative agent-reported cost in USD (ACP providers only).
+    total_cost_usd: float = 0.0
 
     def touch(self) -> None:
         """Increment turn counter and update the last-modified timestamp."""
@@ -181,6 +183,7 @@ class SessionManager:
             approved_skills=data.get("approved_skills", []),
             total_input_tokens=data.get("total_input_tokens", 0),
             total_output_tokens=data.get("total_output_tokens", 0),
+            total_cost_usd=data.get("total_cost_usd", 0.0),
         )
 
     def save(self, session: Session) -> None:
@@ -200,6 +203,7 @@ class SessionManager:
             "approved_skills": session.approved_skills,
             "total_input_tokens": session.total_input_tokens,
             "total_output_tokens": session.total_output_tokens,
+            "total_cost_usd": session.total_cost_usd,
         }
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")

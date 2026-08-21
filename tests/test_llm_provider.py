@@ -656,6 +656,107 @@ class TestACPProvider:
             result = provider.chat(sample_messages)
         assert result.content == "Done"
 
+    def _usage_notification(self, used=None, size=None, cost=None):
+        update = {"sessionUpdate": "usage_update"}
+        if used is not None:
+            update["used"] = used
+        if size is not None:
+            update["size"] = size
+        if cost is not None:
+            update["cost"] = cost
+        return {"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "sess_test123", "update": update}}
+
+    def test_extract_usage(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        params = self._usage_notification(
+            used=53_000, size=200_000, cost={"amount": 0.045, "currency": "USD"},
+        )["params"]
+        usage = provider._extract_usage(params)
+        assert usage == {"used": 53_000, "size": 200_000,
+                         "cost": {"amount": 0.045, "currency": "USD"}}
+        assert provider._extract_usage(self._chunk_notification("hi")["params"]) is None
+        assert provider._extract_usage({}) is None
+
+    def test_chat_attaches_usage_metadata(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._chunk_notification("Done"),
+            self._usage_notification(used=41_000, size=200_000),
+            self._usage_notification(used=42_000, cost={"amount": 0.05, "currency": "USD"}),
+            self._prompt_result(),
+        )
+        events = []
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.tool_event_callback = events.append
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        assert result.usage_metadata["input_tokens"] == 42_000
+        assert result.usage_metadata["output_tokens"] == 0
+        assert result.usage_metadata["total_tokens"] == 42_000
+        assert result.response_metadata["context_window"] == 200_000
+        assert result.response_metadata["cost"] == {"amount": 0.05, "currency": "USD"}
+        # usage updates must not be routed to the tool event callback
+        assert events == []
+
+    def test_chat_without_usage_has_no_usage_metadata(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(self._chunk_notification("Hi"), self._prompt_result())
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            result = provider.chat(sample_messages)
+        assert result.usage_metadata is None
+
+    @pytest.mark.asyncio
+    async def test_achat_attaches_usage_metadata(self):
+        from birdie.core.llm_provider import ACPProvider
+
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
+        }).encode() + b"\n"
+        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s1"}}).encode() + b"\n"
+        chunk_msg = json.dumps(self._chunk_notification("Done")).encode() + b"\n"
+        usage_msg = json.dumps(self._usage_notification(
+            used=12_345, size=200_000, cost={"amount": 0.01, "currency": "USD"},
+        )).encode() + b"\n"
+        final = json.dumps(self._prompt_result()).encode() + b"\n"
+
+        mock_stdin = AsyncMock()
+        mock_stdin.write = MagicMock()
+        mock_stdin.drain = AsyncMock()
+        mock_stdin.close = MagicMock()
+
+        read_lines = [init_resp, session_resp, chunk_msg, usage_msg, final]
+        read_idx = 0
+
+        async def fake_read(n=-1):
+            nonlocal read_idx
+            if read_idx < len(read_lines):
+                line = read_lines[read_idx]
+                read_idx += 1
+                return line
+            return b""
+
+        mock_stdout = AsyncMock()
+        mock_stdout.read = fake_read
+
+        mock_proc = AsyncMock()
+        mock_proc.stdin = mock_stdin
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            result = await provider.achat([HumanMessage(content="List files")])
+
+        assert result.content == "Done"
+        assert result.usage_metadata["input_tokens"] == 12_345
+        assert result.response_metadata["context_window"] == 200_000
+        assert result.response_metadata["cost"] == {"amount": 0.01, "currency": "USD"}
+
     @pytest.mark.asyncio
     async def test_achat_fires_tool_event_callback(self):
         from birdie.core.llm_provider import ACPProvider
