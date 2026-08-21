@@ -1,3 +1,37 @@
+## [0.8.0] - 2026-08-21
+
+### Added
+- ACP tool-call streaming: `tool_call` / `tool_call_update` session updates
+  from the ACP agent subprocess are rendered live in the CLI while the turn
+  is streaming, instead of the agent's tool activity being invisible.
+- ACP usage reporting: `usage_update` notifications (context tokens used,
+  context window size, cumulative cost) are captured by `ACPProvider` and
+  attached to the returned message as `usage_metadata` /
+  `response_metadata`. The CLI status bar shows context as used/window,
+  `/cost` prefers the agent-reported cost over the pricing-table estimate,
+  and cumulative cost is persisted per session as `total_cost_usd`. As a
+  side effect, `compaction_token_threshold` now also works for ACP
+  sessions.
+- ACP permission gate: `session/request_permission` is routed through an
+  optional `permission_callback` (sync or async, returning
+  allow / allow_always / deny; errors fail closed) instead of being
+  auto-allowed. The CLI prompts interactively and persists "always"
+  approvals per session in `approved_acp_tools`, keyed by the agent's
+  allow_always option label, so they survive the per-turn subprocess
+  respawn. Library users without a callback keep the auto-allow behaviour.
+- The CLI status bar shows the current git branch and working-tree status
+  on the right.
+
+### Changed
+- Documentation synced with the current code.
+
+### Fixed
+- CLI crashed at startup while rendering the status bar.
+- The status bar displayed "unknown" instead of the ACP agent's active
+  model; it now shows the model reported by the agent session.
+- Pinned the `mcp` dependency to `<2.0` to stay compatible with the
+  current API.
+
 ## [0.7.0] - 2026-07-27
 
 ### Added
