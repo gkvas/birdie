@@ -757,6 +757,146 @@ class TestACPProvider:
         assert result.response_metadata["context_window"] == 200_000
         assert result.response_metadata["cost"] == {"amount": 0.01, "currency": "USD"}
 
+    def _permission_request(self, req_id=10, options=None, title="Bash: ls"):
+        if options is None:
+            options = [
+                {"kind": "allow_always", "name": "Always allow Bash", "optionId": "allow_always"},
+                {"kind": "allow_once", "name": "Allow", "optionId": "allow"},
+                {"kind": "reject_once", "name": "Reject", "optionId": "reject"},
+            ]
+        return {"jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
+                "params": {"sessionId": "sess_test123",
+                           "toolCall": {"toolCallId": "call_1", "title": title,
+                                        "kind": "execute", "rawInput": {"command": "ls"}},
+                           "options": options}}
+
+    def test_normalize_permission_request(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        request = provider._normalize_permission_request(self._permission_request()["params"])
+        assert request["title"] == "Bash: ls"
+        assert request["kind"] == "execute"
+        assert request["raw_input"] == {"command": "ls"}
+        assert request["options"][0] == {
+            "id": "allow_always", "name": "Always allow Bash", "kind": "allow_always"}
+
+    def test_permission_outcome_mapping(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        params = self._permission_request()["params"]
+        assert provider._permission_outcome(params, "allow") == {
+            "outcome": {"outcome": "selected", "optionId": "allow"}}
+        assert provider._permission_outcome(params, "allow_always")["outcome"]["optionId"] == "allow_always"
+        assert provider._permission_outcome(params, "deny")["outcome"]["optionId"] == "reject"
+        # no options offered: fall back to the legacy hard-coded ids
+        assert provider._permission_outcome({}, "allow")["outcome"]["optionId"] == "allow"
+        assert provider._permission_outcome({}, "deny")["outcome"]["optionId"] == "reject"
+
+    def _permission_response(self, mock_proc, idx=3):
+        return json.loads(mock_proc.stdin.write.call_args_list[idx][0][0].decode())
+
+    def test_chat_auto_allows_permission_without_callback(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._permission_request(),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        resp = self._permission_response(mock_proc)
+        assert resp["id"] == 10
+        assert resp["result"]["outcome"] == {"outcome": "selected", "optionId": "allow"}
+
+    def test_chat_permission_callback_denies(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._permission_request(),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+        seen = []
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.permission_callback = lambda req: (seen.append(req), "deny")[1]
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        assert seen[0]["title"] == "Bash: ls"
+        resp = self._permission_response(mock_proc)
+        assert resp["result"]["outcome"]["optionId"] == "reject"
+
+    def test_chat_permission_callback_error_fails_closed(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._permission_request(),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+
+        def boom(req):
+            raise RuntimeError("gate crashed")
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.permission_callback = boom
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        resp = self._permission_response(mock_proc)
+        assert resp["result"]["outcome"]["optionId"] == "reject"
+
+    @pytest.mark.asyncio
+    async def test_achat_awaits_async_permission_callback(self):
+        from birdie.core.llm_provider import ACPProvider
+
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
+        }).encode() + b"\n"
+        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s1"}}).encode() + b"\n"
+        perm_msg = json.dumps(self._permission_request()).encode() + b"\n"
+        chunk_msg = json.dumps(self._chunk_notification("Done")).encode() + b"\n"
+        final = json.dumps(self._prompt_result()).encode() + b"\n"
+
+        mock_stdin = AsyncMock()
+        mock_stdin.write = MagicMock()
+        mock_stdin.drain = AsyncMock()
+        mock_stdin.close = MagicMock()
+
+        read_lines = [init_resp, session_resp, perm_msg, chunk_msg, final]
+        read_idx = 0
+
+        async def fake_read(n=-1):
+            nonlocal read_idx
+            if read_idx < len(read_lines):
+                line = read_lines[read_idx]
+                read_idx += 1
+                return line
+            return b""
+
+        mock_stdout = AsyncMock()
+        mock_stdout.read = fake_read
+
+        mock_proc = AsyncMock()
+        mock_proc.stdin = mock_stdin
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        async def gate(request):
+            assert request["title"] == "Bash: ls"
+            return "allow_always"
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.permission_callback = gate
+            result = await provider.achat([HumanMessage(content="List files")])
+
+        assert result.content == "Done"
+        resp = json.loads(mock_stdin.write.call_args_list[3][0][0].decode())
+        assert resp["id"] == 10
+        assert resp["result"]["outcome"]["optionId"] == "allow_always"
+
     @pytest.mark.asyncio
     async def test_achat_fires_tool_event_callback(self):
         from birdie.core.llm_provider import ACPProvider

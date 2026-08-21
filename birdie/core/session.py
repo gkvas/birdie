@@ -84,6 +84,9 @@ class Session:
     disabled_agents: List[str]
     # Skills whose declared permissions the user approved with "always".
     approved_skills: List[str] = field(default_factory=list)
+    # ACP permission requests the user approved with "always", keyed by the
+    # agent's allow_always option label (e.g. "Always allow Bash").
+    approved_acp_tools: List[str] = field(default_factory=list)
     # Cumulative token usage across all turns of this session.
     total_input_tokens: int = 0
     total_output_tokens: int = 0
@@ -181,6 +184,7 @@ class SessionManager:
             enabled_agents=data.get("enabled_agents", []),
             disabled_agents=data.get("disabled_agents", []),
             approved_skills=data.get("approved_skills", []),
+            approved_acp_tools=data.get("approved_acp_tools", []),
             total_input_tokens=data.get("total_input_tokens", 0),
             total_output_tokens=data.get("total_output_tokens", 0),
             total_cost_usd=data.get("total_cost_usd", 0.0),
@@ -201,6 +205,7 @@ class SessionManager:
             "enabled_agents": session.enabled_agents,
             "disabled_agents": session.disabled_agents,
             "approved_skills": session.approved_skills,
+            "approved_acp_tools": session.approved_acp_tools,
             "total_input_tokens": session.total_input_tokens,
             "total_output_tokens": session.total_output_tokens,
             "total_cost_usd": session.total_cost_usd,

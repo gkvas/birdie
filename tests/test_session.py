@@ -80,6 +80,13 @@ class TestSaveLoad:
         assert loaded.enabled_skills == ["Filesystem"]
         assert loaded.disabled_skills == ["SSH"]
 
+    def test_roundtrip_approved_acp_tools(self, manager):
+        s = manager.create("alice")
+        s.approved_acp_tools = ["Always allow Bash"]
+        manager.save(s)
+        loaded = manager.load("alice", s.id)
+        assert loaded.approved_acp_tools == ["Always allow Bash"]
+
     def test_roundtrip_total_cost(self, manager):
         s = manager.create("alice")
         s.total_cost_usd = 1.25
