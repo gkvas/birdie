@@ -10,6 +10,7 @@ never touches a vendor SDK directly.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -1333,7 +1334,8 @@ class ACPProvider(LLMProvider):
       3. session/prompt - send user message, receive streaming updates + final response
 
     The provider also handles incoming requests from the agent:
-      - session/request_permission -> auto-allow
+      - session/request_permission -> routed through ``permission_callback``
+        when set (see :meth:`_permission_outcome`), otherwise auto-allowed
       - fs/read_text_file / fs/write_text_file -> perform local I/O
       - terminal/create -> run the command and return output
 
@@ -1361,6 +1363,10 @@ class ACPProvider(LLMProvider):
         # Optional observer for tool_call / tool_call_update session updates.
         # Set by the CLI so the agent's tool activity can be rendered live.
         self.tool_event_callback: Any | None = None
+        # Optional gate for session/request_permission.  Receives a normalized
+        # request dict and returns "allow", "allow_always" or "deny" (may be a
+        # coroutine on the async paths).  When None, requests are auto-allowed.
+        self.permission_callback: Any | None = None
 
     def supports_tools(self) -> bool:
         return True
@@ -1513,6 +1519,40 @@ class ACPProvider(LLMProvider):
         except Exception:
             log.debug("tool_event_callback raised", exc_info=True)
 
+    def _normalize_permission_request(self, params: dict) -> dict:
+        """Flatten a session/request_permission payload for permission_callback."""
+        tool_call = params.get("toolCall") or {}
+        return {
+            "title": tool_call.get("title"),
+            "kind": tool_call.get("kind"),
+            "raw_input": tool_call.get("rawInput"),
+            "options": [
+                {"id": o.get("optionId"), "name": o.get("name"), "kind": o.get("kind")}
+                for o in params.get("options") or []
+                if isinstance(o, dict)
+            ],
+        }
+
+    def _permission_outcome(self, params: dict, decision: Any) -> dict:
+        """Map an allow/allow_always/deny decision onto the offered options.
+
+        Selects the first option whose ACP kind matches the decision, falling
+        back to the plain "allow"/"reject" optionIds when the agent offered no
+        options (as the previous hard-coded auto-allow did).
+        """
+        if decision == "allow_always":
+            kinds, fallback = ("allow_always", "allow_once"), "allow"
+        elif decision in ("allow", True):
+            kinds, fallback = ("allow_once", "allow_always"), "allow"
+        else:
+            kinds, fallback = ("reject_once", "reject_always"), "reject"
+        options = [o for o in params.get("options") or [] if isinstance(o, dict)]
+        for kind in kinds:
+            for option in options:
+                if option.get("kind") == kind:
+                    return {"outcome": {"outcome": "selected", "optionId": option.get("optionId")}}
+        return {"outcome": {"outcome": "selected", "optionId": fallback}}
+
     def _extract_usage(self, params: dict) -> dict | None:
         """Normalize a usage_update session/update notification.
 
@@ -1573,9 +1613,16 @@ class ACPProvider(LLMProvider):
             return
 
         if method == "session/request_permission":
+            decision: Any = "allow"
+            if self.permission_callback is not None:
+                try:
+                    decision = self.permission_callback(self._normalize_permission_request(params))
+                except Exception:
+                    log.debug("permission_callback raised; denying", exc_info=True)
+                    decision = "deny"
             self._sync_send(stdin, {
                 "jsonrpc": "2.0", "id": req_id,
-                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}},
+                "result": self._permission_outcome(params, decision),
             })
 
         elif method == "fs/read_text_file":
@@ -1737,9 +1784,18 @@ class ACPProvider(LLMProvider):
             return
 
         if method == "session/request_permission":
+            decision: Any = "allow"
+            if self.permission_callback is not None:
+                try:
+                    decision = self.permission_callback(self._normalize_permission_request(params))
+                    if inspect.isawaitable(decision):
+                        decision = await decision
+                except Exception:
+                    log.debug("permission_callback raised; denying", exc_info=True)
+                    decision = "deny"
             await self._async_send(stdin, {
                 "jsonrpc": "2.0", "id": req_id,
-                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}},
+                "result": self._permission_outcome(params, decision),
             })
 
         elif method == "fs/read_text_file":

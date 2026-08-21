@@ -325,6 +325,42 @@ class BirdieCLI:
             return "allow"
         return "deny"
 
+    async def _approve_acp_permission(self, request: dict) -> str:
+        """Interactive gate for ACP session/request_permission requests."""
+        always_opt = next(
+            (o for o in request.get("options", []) if o.get("kind") == "allow_always"),
+            None,
+        )
+        always_key = (always_opt or {}).get("name") or request.get("title") or ""
+        if always_key and always_key in self.session.approved_acp_tools:
+            return "allow_always"
+
+        status = self._active_status
+        if status is not None:
+            status.stop()
+        try:
+            title = request.get("title") or "unknown tool"
+            raw = request.get("raw_input")
+            self.console.print(
+                f"[yellow]ACP agent requests permission:[/yellow] [bold]{title}[/bold]"
+                + (f"\n[dim]{raw}[/dim]" if raw else "")
+            )
+            answer = (await asyncio.to_thread(
+                input, "Allow? [y]es once / [a]lways this session / [N]o: "
+            )).strip().lower()
+        finally:
+            if status is not None:
+                status.start()
+
+        if answer in ("a", "always"):
+            if always_key and always_key not in self.session.approved_acp_tools:
+                self.session.approved_acp_tools.append(always_key)
+                self.session_manager.save(self.session)
+            return "allow_always"
+        if answer in ("y", "yes"):
+            return "allow"
+        return "deny"
+
     def _get_prompt(self):
         if self._ctrl_c_warned:
             return [
@@ -1165,6 +1201,9 @@ class BirdieCLI:
         has_tool_events = hasattr(provider, "tool_event_callback")
         if has_tool_events:
             provider.tool_event_callback = self._make_acp_tool_renderer(status)
+        has_permission_gate = hasattr(provider, "permission_callback")
+        if has_permission_gate:
+            provider.permission_callback = self._approve_acp_permission
 
         try:
             async for update in self.agent.astream(
@@ -1233,6 +1272,8 @@ class BirdieCLI:
         finally:
             if has_tool_events:
                 provider.tool_event_callback = None
+            if has_permission_gate:
+                provider.permission_callback = None
             status.stop()
             self._active_status = None
 
