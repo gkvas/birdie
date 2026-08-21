@@ -1358,6 +1358,9 @@ class ACPProvider(LLMProvider):
     ) -> None:
         self._command = [command] if isinstance(command, str) else list(command)
         self._cwd = cwd or os.getcwd()
+        # Optional observer for tool_call / tool_call_update session updates.
+        # Set by the CLI so the agent's tool activity can be rendered live.
+        self.tool_event_callback: Any | None = None
 
     def supports_tools(self) -> bool:
         return True
@@ -1467,6 +1470,48 @@ class ACPProvider(LLMProvider):
         if isinstance(content, dict) and content.get("type") == "text":
             return content.get("text") or None
         return None
+
+    def _extract_tool_event(self, params: dict) -> dict | None:
+        """Normalize a tool_call / tool_call_update session/update notification.
+
+        Returns a dict with keys: event ("tool_call" or "tool_call_update"),
+        id, title, kind, status, raw_input, output - or None for other updates.
+        """
+        update = params.get("update", {})
+        event = update.get("sessionUpdate")
+        if event not in ("tool_call", "tool_call_update"):
+            return None
+        texts: list[str] = []
+        for item in update.get("content") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "content":
+                block = item.get("content", {})
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    texts.append(block["text"])
+            elif item.get("type") == "diff":
+                texts.append(f"[diff] {item.get('path', '')}")
+        return {
+            "event": event,
+            "id": update.get("toolCallId", ""),
+            "title": update.get("title"),
+            "kind": update.get("kind"),
+            "status": update.get("status"),
+            "raw_input": update.get("rawInput"),
+            "output": "\n".join(texts),
+        }
+
+    def _emit_tool_event(self, params: dict) -> None:
+        """Invoke tool_event_callback for tool-related session updates, if set."""
+        if self.tool_event_callback is None:
+            return
+        event = self._extract_tool_event(params)
+        if event is None:
+            return
+        try:
+            self.tool_event_callback(event)
+        except Exception:
+            log.debug("tool_event_callback raised", exc_info=True)
 
     # -- sync low-level -----------------------------------------------------
 
@@ -1589,9 +1634,12 @@ class ACPProvider(LLMProvider):
                 if "id" in msg and "method" in msg:
                     self._sync_handle_agent_request(proc.stdin, msg, mcp_mode=mcp_mode)
                 elif "method" in msg and "id" not in msg:
-                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    params = msg.get("params", {})
+                    chunk = self._extract_chunk_text(params)
                     if chunk:
                         text_parts.append(chunk)
+                    else:
+                        self._emit_tool_event(params)
         finally:
             try:
                 proc.stdin.close()
@@ -1756,9 +1804,12 @@ class ACPProvider(LLMProvider):
                 if "id" in msg and "method" in msg:
                     await self._async_handle_agent_request(proc.stdin, msg, mcp_mode=mcp_mode)
                 elif "method" in msg and "id" not in msg:
-                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    params = msg.get("params", {})
+                    chunk = self._extract_chunk_text(params)
                     if chunk:
                         text_parts.append(chunk)
+                    else:
+                        self._emit_tool_event(params)
         finally:
             proc.stdin.close()
             await proc.wait()
@@ -1846,9 +1897,12 @@ class ACPProvider(LLMProvider):
                     else:
                         await self._async_handle_agent_request(proc.stdin, msg)
                 elif "method" in msg and "id" not in msg:
-                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    params = msg.get("params", {})
+                    chunk = self._extract_chunk_text(params)
                     if chunk:
                         yield AIMessageChunk(content=chunk)
+                    else:
+                        self._emit_tool_event(params)
         finally:
             proc.stdin.close()
             await proc.wait()

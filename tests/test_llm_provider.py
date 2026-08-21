@@ -574,6 +574,137 @@ class TestACPProvider:
         params2 = {"update": {"sessionUpdate": "tool_call_update"}}
         assert provider._extract_chunk_text(params2) is None
 
+    def _tool_call_notification(self, tool_id="call_1", title="List files", status="pending", raw_input=None):
+        update = {
+            "sessionUpdate": "tool_call", "toolCallId": tool_id,
+            "title": title, "kind": "execute", "status": status,
+        }
+        if raw_input is not None:
+            update["rawInput"] = raw_input
+        return {"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "sess_test123", "update": update}}
+
+    def _tool_update_notification(self, tool_id="call_1", status="completed", output=None):
+        update = {"sessionUpdate": "tool_call_update", "toolCallId": tool_id, "status": status}
+        if output is not None:
+            update["content"] = [{"type": "content", "content": {"type": "text", "text": output}}]
+        return {"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "sess_test123", "update": update}}
+
+    def test_extract_tool_event(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        params = self._tool_call_notification(raw_input={"command": "ls -la"})["params"]
+        event = provider._extract_tool_event(params)
+        assert event["event"] == "tool_call"
+        assert event["id"] == "call_1"
+        assert event["title"] == "List files"
+        assert event["kind"] == "execute"
+        assert event["status"] == "pending"
+        assert event["raw_input"] == {"command": "ls -la"}
+        assert event["output"] == ""
+
+    def test_extract_tool_event_collects_output(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        params = self._tool_update_notification(output="file1.py\nfile2.py")["params"]
+        params["update"]["content"].append({"type": "diff", "path": "/tmp/x.py"})
+        event = provider._extract_tool_event(params)
+        assert event["event"] == "tool_call_update"
+        assert event["status"] == "completed"
+        assert event["output"] == "file1.py\nfile2.py\n[diff] /tmp/x.py"
+
+    def test_extract_tool_event_ignores_other_updates(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        chunk_params = self._chunk_notification("hi")["params"]
+        assert provider._extract_tool_event(chunk_params) is None
+        assert provider._extract_tool_event({}) is None
+
+    def test_chat_fires_tool_event_callback(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._tool_call_notification(raw_input={"command": "ls"}),
+            self._tool_update_notification(output="file1.py"),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+        events = []
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.tool_event_callback = events.append
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        assert [e["event"] for e in events] == ["tool_call", "tool_call_update"]
+        assert events[0]["title"] == "List files"
+        assert events[1]["output"] == "file1.py"
+
+    def test_chat_callback_exception_does_not_break_turn(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._tool_call_notification(),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+
+        def boom(event):
+            raise RuntimeError("render failed")
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.tool_event_callback = boom
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+
+    @pytest.mark.asyncio
+    async def test_achat_fires_tool_event_callback(self):
+        from birdie.core.llm_provider import ACPProvider
+
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
+        }).encode() + b"\n"
+        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s1"}}).encode() + b"\n"
+        tool_call = json.dumps(self._tool_call_notification(raw_input={"command": "ls"})).encode() + b"\n"
+        tool_update = json.dumps(self._tool_update_notification(output="file1.py")).encode() + b"\n"
+        chunk_msg = json.dumps(self._chunk_notification("Done")).encode() + b"\n"
+        final = json.dumps(self._prompt_result()).encode() + b"\n"
+
+        mock_stdin = AsyncMock()
+        mock_stdin.write = MagicMock()
+        mock_stdin.drain = AsyncMock()
+        mock_stdin.close = MagicMock()
+
+        read_lines = [init_resp, session_resp, tool_call, tool_update, chunk_msg, final]
+        read_idx = 0
+
+        async def fake_read(n=-1):
+            nonlocal read_idx
+            if read_idx < len(read_lines):
+                line = read_lines[read_idx]
+                read_idx += 1
+                return line
+            return b""
+
+        mock_stdout = AsyncMock()
+        mock_stdout.read = fake_read
+
+        mock_proc = AsyncMock()
+        mock_proc.stdin = mock_stdin
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        events = []
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.tool_event_callback = events.append
+            result = await provider.achat([HumanMessage(content="List files")])
+
+        assert result.content == "Done"
+        assert [e["event"] for e in events] == ["tool_call", "tool_call_update"]
+        assert events[0]["raw_input"] == {"command": "ls"}
+        assert events[1]["output"] == "file1.py"
+
     def test_chat_includes_tool_messages_in_history(self):
         from birdie.core.llm_provider import ACPProvider
         mock_proc = self._make_proc(self._prompt_result())
