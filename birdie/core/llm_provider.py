@@ -1368,6 +1368,12 @@ class ACPProvider(LLMProvider):
     def supports_json_mode(self) -> bool:
         return False
 
+    def _capture_model(self, session_result: dict) -> None:
+        """Remember the agent's active model from a session/new response."""
+        model_id = (session_result.get("models") or {}).get("currentModelId")
+        if model_id:
+            self._model = model_id
+
     # -- MCP bridge ---------------------------------------------------------
 
     def _mcp_server_entry(self, tools: list[NormalizedToolDef]) -> dict | None:
@@ -1562,7 +1568,9 @@ class ACPProvider(LLMProvider):
                 "params": session_params,
             })
             session_resp = self._sync_recv(proc.stdout)
-            session_id = session_resp.get("result", {}).get("sessionId", "")
+            session_result = session_resp.get("result", {})
+            session_id = session_result.get("sessionId", "")
+            self._capture_model(session_result)
 
             # Phase 3: session/prompt
             self._sync_send(proc.stdin, {
@@ -1703,7 +1711,9 @@ class ACPProvider(LLMProvider):
             "params": session_params,
         })
         session_resp = await self._async_recv(proc.stdout, timeout=30, buf=buf)
-        return session_resp.get("result", {}).get("sessionId", "")
+        session_result = session_resp.get("result", {})
+        self._capture_model(session_result)
+        return session_result.get("sessionId", "")
 
     async def achat(
         self,
