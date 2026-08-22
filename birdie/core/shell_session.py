@@ -26,6 +26,13 @@ The session is shared process-wide (one CLI process == one conversation;
 sub-agents and the ACP server share it).  Calls are serialized with a lock,
 so concurrent tool calls queue like a human typing into one terminal.
 
+Interrupt and shutdown: a call runs in a worker thread, and neither Ctrl+C
+nor the event loop closing can reach into it, so both go through the shell
+instead.  ``interrupt()`` kills the running command and keeps the session;
+``close()`` kills the shell itself.  Neither waits for the call lock -- the
+in-flight ``_exchange`` is exactly what would be holding it, and killing the
+process is what lets it return.
+
 Not used on Windows, where bash is not guaranteed; ``resolve_bash`` falls
 back to one-shot execution there and wherever BIRDIE_PERSISTENT_SHELL=0.
 """
@@ -155,7 +162,7 @@ class ShellSession:
             return
         try:
             proc.stdin.close()
-        except OSError:
+        except (OSError, ValueError):
             pass
         if proc.poll() is None:
             try:
@@ -172,8 +179,32 @@ class ShellSession:
             pass
 
     def close(self) -> None:
-        with self._lock:
+        """Kill the shell.  Never waits for an in-flight call.
+
+        Called from atexit and from the CLI's shutdown path, where the lock
+        is likely held by a worker thread parked in a long command: waiting
+        for it would stall interpreter shutdown for the rest of that
+        command's timeout.  Killing the shell is what unblocks that thread --
+        its ``_exchange`` sees the dead process and returns.
+        """
+        acquired = self._lock.acquire(blocking=False)
+        try:
             self._hard_reset()
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def interrupt(self) -> None:
+        """Stop whatever the shell is running now; keep the session.
+
+        The in-flight ``_exchange`` gets its sentinel as soon as the killed
+        command's ``eval`` returns, so a cancelled tool call stops within
+        moments instead of running out its timeout in a background thread.
+        Exports, cwd and functions survive, like Ctrl+C in a terminal.
+        """
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            _kill_descendants(proc.pid)
 
     # -- execution ---------------------------------------------------------
 
@@ -288,6 +319,16 @@ def get_default_session() -> ShellSession:
         if _default is None:
             _default = ShellSession()
             atexit.register(_default.close)
+        return _default
+
+
+def peek_default_session() -> "ShellSession | None":
+    """The default session if one was ever started, without starting one.
+
+    Shutdown and interrupt paths use this: they must not spawn a shell just
+    to discover there was nothing to kill.
+    """
+    with _default_lock:
         return _default
 
 

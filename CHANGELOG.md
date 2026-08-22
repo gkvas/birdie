@@ -1,3 +1,18 @@
+## [0.13.1] - 2026-08-22
+
+### Fixed
+- Ctrl+C during a `bash:` tool call now stops the command. The cancelled
+  turn only detached the coroutine while the call kept running in a
+  worker thread, so the shell kept working until its timeout expired.
+- Quitting no longer hangs. A tool call still parked in the event loop's
+  thread pool held up shutdown for as long as asyncio waits for that pool
+  (300s), and a Ctrl+C out of that wait dumped an asyncio teardown
+  traceback plus a deadlocked atexit handler. The persistent shell is now
+  killed before the loop joins its threads, `ShellSession.close()` no
+  longer waits for the call lock (killing the shell is what releases it),
+  and a `KeyboardInterrupt` reaching `main()` exits quietly with status
+  130.
+
 ## [0.13.0] - 2026-08-22
 
 ### Added
