@@ -1,3 +1,18 @@
+## [0.13.3] - 2026-08-22
+
+### Fixed
+- Network failures while calling the provider (connect/read timeouts,
+  resets, dropped connections) are now retried with the same back-off as
+  rate limits. The Mistral SDK raises raw `httpx` exceptions, so a single
+  `ReadTimeout` used to abort the turn.
+- When those retries are exhausted the agent raises the new
+  `BirdieProviderUnavailableError` (both it and `BirdieRateLimitError`
+  subclass `BirdieTransientError`) and the CLI reports "Provider
+  unreachable" rather than "Rate limit reached".
+- The CLI prints turn errors as a single line instead of a full traceback.
+  The traceback is logged at DEBUG and printed only with the new `--debug`
+  flag or `BIRDIE_DEBUG=1`.
+
 ## [0.13.2] - 2026-08-22
 
 ### Fixed
