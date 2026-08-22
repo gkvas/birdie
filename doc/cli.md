@@ -201,8 +201,17 @@ These fields are extracted from the same JSON config before it is forwarded to t
 | `Tab` (after `/cd `) | Cycle through directory completions |
 | `Ctrl+C` (non-empty input) | Clear the current input line |
 | `Ctrl+C` (empty input, first press) | Show hint: "Press Ctrl+C again to exit" |
-| `Ctrl+C` (empty input, second press) | Exit |
+| `Ctrl+C` (empty input, second press) | Exit (prints the command that resumes this session) |
 | `Ctrl+C` (while agent is running) | Cancel the current turn and return to the prompt |
+
+On exit - Ctrl+C, Ctrl+D or `/quit` - Birdie prints the command that picks the
+session up again, repeating any options the session was started with:
+
+```
+Goodbye.
+Resume this session with:
+  birdie --session-id 2026-04-29_1 --config ~/.birdie/provider.json
+```
 
 ---
 
