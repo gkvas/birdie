@@ -1,3 +1,13 @@
+## [0.14.1] - 2026-08-22
+
+### Fixed
+- `anthropic>=1.0` removed `temperature`/`top_p`/`top_k` from
+  `messages.create()`, so every Anthropic request failed client-side with
+  `TypeError: AsyncMessages.create() got an unexpected keyword argument
+  'temperature'`. The provider now probes the installed SDK at startup and
+  skips `temperature` when the parameter is gone, and the SDK `TypeError`
+  is treated like an API rejection so the drop-and-retry path covers it too.
+
 ## [0.14.0] - 2026-08-22
 
 ### Added
