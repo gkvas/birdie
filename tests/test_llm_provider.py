@@ -1892,6 +1892,62 @@ class TestRetryableErrors:
 
         assert _is_retryable_error(APIConnectionError("net down"))
 
+    def test_httpx_network_errors_are_retryable(self):
+        """The Mistral SDK raises raw httpx exceptions; they must be retried."""
+        import httpx
+        from birdie.agent.graph import _is_network_error, _is_retryable_error
+
+        for exc in (
+            httpx.ReadTimeout("read"), httpx.ConnectTimeout("connect"),
+            httpx.ConnectError("refused"), httpx.ReadError("reset"),
+            httpx.RemoteProtocolError("closed"),
+        ):
+            assert _is_network_error(exc), exc
+            assert _is_retryable_error(exc), exc
+
+    def test_rate_limit_is_not_a_network_error(self):
+        from birdie.agent.graph import _is_network_error
+
+        class RateLimitError(Exception):
+            status_code = 429
+
+        assert not _is_network_error(RateLimitError("slow down"))
+
+    @pytest.mark.asyncio
+    async def test_retry_exhaustion_raises_unavailable_for_network(self, monkeypatch):
+        import httpx
+        from birdie.agent import graph
+        from birdie.core.errors import (
+            BirdieProviderUnavailableError, BirdieRateLimitError, BirdieTransientError,
+        )
+
+        async def _no_sleep(_):
+            return None
+        monkeypatch.setattr(graph.asyncio, "sleep", _no_sleep)
+
+        provider = MagicMock()
+        provider.achat = AsyncMock(side_effect=httpx.ReadTimeout("slow"))
+        with pytest.raises(BirdieProviderUnavailableError) as exc:
+            await graph._achat_with_retry(provider, messages=[])
+        assert provider.achat.await_count == graph._MAX_RETRIES + 1
+        assert isinstance(exc.value, BirdieTransientError)
+        assert not isinstance(exc.value, BirdieRateLimitError)
+        assert "ReadTimeout" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_retry_recovers_after_transient_network_error(self, monkeypatch):
+        import httpx
+        from birdie.agent import graph
+
+        async def _no_sleep(_):
+            return None
+        monkeypatch.setattr(graph.asyncio, "sleep", _no_sleep)
+
+        provider = MagicMock()
+        provider.achat = AsyncMock(side_effect=[httpx.ReadTimeout("slow"), "ok"])
+        assert await graph._achat_with_retry(provider, messages=[]) == "ok"
+        assert provider.achat.await_count == 2
+
 
 class TestAnthropicPromptCaching:
     def test_cache_breakpoints_on_tools_system_and_last_stable_message(self):

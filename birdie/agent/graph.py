@@ -32,7 +32,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 
-from ..core.errors import BirdieRateLimitError
+from ..core.errors import BirdieProviderUnavailableError, BirdieRateLimitError
 from ..core.registry import SkillRegistry
 from ..core.adapter import skilltool_to_langchain_tool
 from ..core.policy import SkillPolicy
@@ -68,15 +68,42 @@ _MAX_RETRIES = 3          # maximum retry attempts on transient provider errors
 _RETRY_BASE_DELAY = 5.0   # base seconds for exponential backoff when no Retry-After header
 
 
+def _is_network_error(exc: Exception) -> bool:
+    """Return True for transport-level failures: the request never got an
+    answer (connect/read timeouts, resets, dropped connections).
+
+    Vendor SDKs differ here: OpenAI/Anthropic wrap these as
+    ``APIConnectionError``/``APITimeoutError``, while the Mistral SDK lets the
+    underlying ``httpx`` exception through unwrapped.
+    """
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a hard dependency
+        httpx = None
+    if httpx is not None and isinstance(exc, (
+        httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
+    )):
+        return True
+    name = type(exc).__name__
+    return any(k in name for k in (
+        "APIConnectionError", "APITimeoutError", "ConnectError",
+        "ConnectionError", "ReadError", "ReadTimeout", "ConnectTimeout",
+        "WriteTimeout", "PoolTimeout",
+    ))
+
+
 def _is_retryable_error(exc: Exception) -> bool:
-    """Return True for transient provider errors (rate limits, overload, 5xx)."""
+    """Return True for transient provider errors (rate limits, overload, 5xx,
+    and network failures)."""
+    if _is_network_error(exc):
+        return True
     status = getattr(exc, 'status_code', None)
     if status in (429, 500, 502, 503, 504, 529):
         return True
     name = type(exc).__name__
     if any(k in name for k in (
         "RateLimit", "Overloaded", "TooManyRequests",
-        "InternalServerError", "ServiceUnavailable", "APIConnectionError",
+        "InternalServerError", "ServiceUnavailable",
     )):
         return True
     msg = str(exc)
@@ -105,22 +132,31 @@ def _get_retry_after(exc: Exception) -> float | None:
 
 
 async def _achat_with_retry(provider: LLMProvider, **kwargs) -> BaseMessage:
-    """Call provider.achat with exponential back-off on transient rate-limit errors."""
+    """Call provider.achat with exponential back-off on transient provider
+    errors (rate limits, 5xx, network failures)."""
     for attempt in range(_MAX_RETRIES + 1):
         try:
             return await provider.achat(**kwargs)
         except Exception as exc:
             if not _is_retryable_error(exc):
                 raise
+            network = _is_network_error(exc)
             delay = _get_retry_after(exc) or (_RETRY_BASE_DELAY * (2 ** attempt))
             if attempt >= _MAX_RETRIES:
+                if network:
+                    raise BirdieProviderUnavailableError(
+                        f"Provider unreachable ({type(exc).__name__}: {exc}); "
+                        f"retries exhausted after {_MAX_RETRIES} attempts.",
+                        retry_after=delay,
+                    ) from exc
                 raise BirdieRateLimitError(
                     f"Provider rate limit hit; retries exhausted after {_MAX_RETRIES} attempts.",
                     retry_after=delay,
                 ) from exc
             log.warning(
-                "Provider rate-limited; retrying in %.1fs (attempt %d/%d)",
-                delay, attempt + 1, _MAX_RETRIES,
+                "Provider %s (%s); retrying in %.1fs (attempt %d/%d)",
+                "unreachable" if network else "rate-limited",
+                type(exc).__name__, delay, attempt + 1, _MAX_RETRIES,
             )
             await asyncio.sleep(delay)
     raise RuntimeError("unreachable")
