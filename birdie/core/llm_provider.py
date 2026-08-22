@@ -952,8 +952,29 @@ def _anthropic_accepts_temperature(model: str) -> bool:
     return not any(prefix in name for prefix in _ANTHROPIC_NO_SAMPLING_MODELS)
 
 
+def _sdk_accepts_temperature(client: Any) -> bool:
+    """
+    True when the installed anthropic SDK still exposes `temperature` on
+    `messages.create()`.  anthropic>=1.0 removed the sampling parameters
+    from the signature entirely, so passing them raises TypeError before
+    any request is sent.
+    """
+    try:
+        import inspect
+
+        return "temperature" in inspect.signature(client.messages.create).parameters
+    except (TypeError, ValueError, AttributeError):
+        return True
+
+
 def _is_temperature_rejection(exc: Exception) -> bool:
-    """True when an Anthropic API error complains about `temperature`."""
+    """
+    True when the SDK or API rejected the `temperature` parameter - either
+    an HTTP 400 ("`temperature` is deprecated for this model") or a client-side
+    TypeError from an SDK that no longer accepts the keyword.
+    """
+    if isinstance(exc, TypeError):
+        return "temperature" in str(exc).lower()
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -992,7 +1013,9 @@ class AnthropicProvider(LLMProvider):
         self._async_client = _anthropic.AsyncAnthropic(api_key=key)
         self._model = model
         self._temperature = temperature
-        self._send_temperature = _anthropic_accepts_temperature(model)
+        self._send_temperature = (
+            _anthropic_accepts_temperature(model) and _sdk_accepts_temperature(self._client)
+        )
         # Place cache_control breakpoints on tools, system, and the last
         # stable message block (disable with "prompt_cache": false in config).
         self._prompt_cache = prompt_cache
