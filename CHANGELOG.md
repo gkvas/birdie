@@ -1,3 +1,27 @@
+## [0.10.0] - 2026-08-22
+
+### Added
+- Per-tool-call timeout: every `bash:` and `http:` skill tool now advertises an
+  optional `timeout_s` parameter the LLM can set per call (clamped to 1-600 s),
+  auto-injected into the tool schema at SKILL.MD load time so all call paths
+  (ToolNode, ACP MCP server, direct resolver calls) honor it. Precedence:
+  per-call `timeout_s` > SKILL.MD `timeout:` > scheme default (120 s for bash,
+  30 s for HTTP). Timeout errors quote the partial output captured so far and
+  are never auto-retried.
+
+### Changed
+- Bash commands now default to a 120 s timeout instead of running unbounded;
+  slow commands (builds, test suites) should pass `timeout_s` explicitly.
+- On timeout the command's whole process tree is killed, not just the shell:
+  POSIX via `start_new_session` + `killpg` (TERM, then KILL), Windows via
+  `taskkill /F /T`. A descendant that escapes the kill and holds the output
+  pipe open no longer hangs the tool call.
+
+### Fixed
+- Non-UTF-8 command output (e.g. Windows-codepage tools under WSL) no longer
+  crashes the output reader and silently truncates the result; pipes decode
+  with `errors="replace"`.
+
 ## [0.9.0] - 2026-08-22
 
 ### Added
