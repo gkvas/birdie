@@ -58,6 +58,12 @@ SKILL_MAX_LOADED = 3     # maximum simultaneously loaded freetext skills (LRU ca
 # context sent to the LLM on every subsequent turn.
 MAX_TOOL_OUTPUT_CAP = 20_000
 
+# Hard ceiling on tool calls the model may issue within a single user turn.
+# Backstop for "creative" looping that the exact-match loop guard cannot
+# catch (e.g. the same command re-issued with a different `sleep N` suffix).
+# 0 disables the budget.
+MAX_TOOL_CALLS_PER_TURN = 40
+
 _MAX_RETRIES = 3          # maximum retry attempts on transient provider errors
 _RETRY_BASE_DELAY = 5.0   # base seconds for exponential backoff when no Retry-After header
 
@@ -311,6 +317,25 @@ def _guard_fired_this_turn(messages: list) -> bool:
         if isinstance(msg, ToolMessage) and str(msg.content).startswith(LOOP_GUARD_PREFIX):
             return True
     return False
+
+
+def _tool_calls_this_turn(messages: list) -> int:
+    """Number of tool calls issued by the model since the last HumanMessage."""
+    count = 0
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            break
+        if isinstance(msg, AIMessage):
+            count += len(getattr(msg, "tool_calls", None) or [])
+    return count
+
+
+def _stop_turn(last_ai: AIMessage, tool_note: str, stop_text: str) -> dict:
+    """Answer every pending tool call with ``tool_note`` and end the turn with ``stop_text``."""
+    return {"messages": [
+        ToolMessage(content=tool_note, tool_call_id=t["id"], name=t["name"])
+        for t in getattr(last_ai, "tool_calls", [])
+    ] + [AIMessage(content=stop_text)]}
 
 
 def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
@@ -949,29 +974,35 @@ def create_agent_graph(
         # Infinite loop guard: block any tool call that has appeared consecutively
         # more than max_tool_repetitions times with identical parameters.
         max_reps = config.get("configurable", {}).get("max_tool_repetitions", 3)
+        budget = config.get("configurable", {}).get(
+            "max_tool_calls_per_turn", MAX_TOOL_CALLS_PER_TURN)
         all_messages = list(state["messages"])
         last_ai = all_messages[-1] if all_messages else None
         if isinstance(last_ai, AIMessage):
+            # Per-turn tool-call budget (counts the calls pending right now).
+            if budget and _tool_calls_this_turn(all_messages) > budget:
+                return _stop_turn(
+                    last_ai,
+                    LOOP_GUARD_PREFIX + " tool-call budget exhausted. Turn ended.",
+                    f"Stopped: I have issued more than {budget} tool calls in "
+                    f"this turn without finishing. I am probably stuck - "
+                    f"please check the last tool results and tell me how to "
+                    f"proceed (or raise max_tool_calls_per_turn).",
+                )
             for tc in getattr(last_ai, "tool_calls", []):
                 if _consecutive_call_count(all_messages, tc["name"], tc["args"]) > max_reps:
                     # The guard already fired once this turn and the model
                     # is looping again: end the turn instead of handing the
                     # model yet another chance to repeat itself.
                     if _guard_fired_this_turn(all_messages):
-                        stop = (
+                        return _stop_turn(
+                            last_ai,
+                            LOOP_GUARD_PREFIX + " Turn ended.",
                             f"Stopped: '{tc['name']}' keeps being called with "
                             f"identical parameters after a loop warning. I am "
                             f"stuck and need guidance - please check the last "
-                            f"tool results and tell me how to proceed."
+                            f"tool results and tell me how to proceed.",
                         )
-                        return {"messages": [
-                            ToolMessage(
-                                content=LOOP_GUARD_PREFIX + " Turn ended.",
-                                tool_call_id=t["id"],
-                                name=t["name"],
-                            )
-                            for t in getattr(last_ai, "tool_calls", [])
-                        ] + [AIMessage(content=stop)]}
                     return {"messages": [
                         ToolMessage(
                             content=(

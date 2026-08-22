@@ -31,7 +31,7 @@ from ..core.ltm import LTMStore
 from .graph import (
     create_agent_graph, compact_history, AgentState,
     MIN_MESSAGES_AUTO, MIN_MESSAGES_FORCED, COMPRESSION_WINDOW_SIZE, MAX_TOOL_OUTPUT_CAP,
-    SKILL_DECAY_TURNS, SKILL_MAX_LOADED,
+    MAX_TOOL_CALLS_PER_TURN, SKILL_DECAY_TURNS, SKILL_MAX_LOADED,
 )
 
 
@@ -84,6 +84,7 @@ class DynamicAgent:
         min_messages_forced: int = MIN_MESSAGES_FORCED,
         compression_window_size: int = COMPRESSION_WINDOW_SIZE,
         tool_output_cap: int = MAX_TOOL_OUTPUT_CAP,
+        max_tool_calls_per_turn: int = MAX_TOOL_CALLS_PER_TURN,
         skill_decay_turns: int = SKILL_DECAY_TURNS,
         skill_max_loaded: int = SKILL_MAX_LOADED,
         compaction_token_threshold: Optional[int] = None,
@@ -101,6 +102,7 @@ class DynamicAgent:
         self._min_messages_forced = min_messages_forced
         self._compression_window_size = compression_window_size
         self._tool_output_cap = tool_output_cap
+        self._max_tool_calls_per_turn = max_tool_calls_per_turn
         self._skill_decay_turns = skill_decay_turns
         self._skill_max_loaded = skill_max_loaded
         self._compaction_token_threshold = compaction_token_threshold
@@ -200,7 +202,8 @@ class DynamicAgent:
         _AGENT_FIELDS = {
             "min_messages_auto", "min_messages_forced", "compression_window_size",
             "compaction_token_threshold",
-            "tool_output_cap", "skill_decay_turns", "skill_max_loaded",
+            "tool_output_cap", "max_tool_calls_per_turn",
+            "skill_decay_turns", "skill_max_loaded",
             "skills_enabled", "agents_enabled",
             "ltm_max_age_days", "ltm_max_entries", "ltm_min_score",
         }
@@ -208,6 +211,10 @@ class DynamicAgent:
         min_messages_forced = int(config_dict.get("min_messages_forced") or MIN_MESSAGES_FORCED)
         compression_window_size = int(config_dict.get("compression_window_size") or COMPRESSION_WINDOW_SIZE)
         tool_output_cap = int(config_dict.get("tool_output_cap") or MAX_TOOL_OUTPUT_CAP)
+        _raw_budget = config_dict.get("max_tool_calls_per_turn")
+        max_tool_calls_per_turn = (
+            int(_raw_budget) if _raw_budget is not None else MAX_TOOL_CALLS_PER_TURN
+        )
         skill_decay_turns = int(config_dict.get("skill_decay_turns") or SKILL_DECAY_TURNS)
         skill_max_loaded = int(config_dict.get("skill_max_loaded") or SKILL_MAX_LOADED)
         _raw_token_threshold = config_dict.get("compaction_token_threshold")
@@ -236,6 +243,7 @@ class DynamicAgent:
                    min_messages_auto=min_messages_auto, min_messages_forced=min_messages_forced,
                    compression_window_size=compression_window_size,
                    tool_output_cap=tool_output_cap,
+                   max_tool_calls_per_turn=max_tool_calls_per_turn,
                    skill_decay_turns=skill_decay_turns, skill_max_loaded=skill_max_loaded,
                    compaction_token_threshold=compaction_token_threshold,
                    skills_enabled=skills_enabled, agents_enabled=agents_enabled)
@@ -454,6 +462,7 @@ class DynamicAgent:
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
             "tool_output_cap": self._tool_output_cap,
+            "max_tool_calls_per_turn": self._max_tool_calls_per_turn,
             "skill_decay_turns": self._skill_decay_turns,
             "skill_max_loaded": self._skill_max_loaded,
         }}
@@ -498,6 +507,7 @@ class DynamicAgent:
             "thread_id": effective_thread,
             "long_term_memory": long_term_memory or [],
             "tool_output_cap": self._tool_output_cap,
+            "max_tool_calls_per_turn": self._max_tool_calls_per_turn,
             "skill_decay_turns": self._skill_decay_turns,
             "skill_max_loaded": self._skill_max_loaded,
         }}

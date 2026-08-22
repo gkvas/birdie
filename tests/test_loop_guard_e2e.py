@@ -92,3 +92,49 @@ def test_failing_call_does_not_clobber_sibling_results():
     assert by_id["good"].startswith("[x] Step 1 done")
     assert by_id["bad"].startswith("Error:")
     assert "No such file" in by_id["bad"]
+
+
+class CreativeLoopProvider:
+    """Never repeats exactly (varies a sleep suffix), so the exact-match guard
+    never fires; only the per-turn budget can stop it."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_tools(self):
+        return True
+
+    async def achat(self, **_):
+        self.calls += 1
+        return AIMessage(content="", tool_calls=[
+            {"name": "run_bash",
+             "args": {"command": f"true && sleep 0.0{self.calls}"},
+             "id": f"c{self.calls}"}])
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+
+
+def test_tool_call_budget_stops_creative_loop():
+    registry = SkillRegistry()
+    registry.register_skill(load_skill_from_markdown("birdie/skills/shell/SKILL.MD"))
+    policy = SkillPolicy()
+    policy.enable_skill("t", "Shell")
+    provider = CreativeLoopProvider()
+    graph = create_agent_graph(provider, registry, policy).compile()
+    cfg = {"configurable": {"thread_id": "t", "user_id": "u",
+                            "max_tool_calls_per_turn": 5}}
+    out = asyncio.run(graph.ainvoke(
+        {"messages": [HumanMessage(content="go")]}, cfg))
+    last = out["messages"][-1]
+    assert isinstance(last, AIMessage) and "more than 5 tool calls" in last.content
+    assert provider.calls == 6  # 5 allowed, the 6th is cut off
+
+
+def test_tool_calls_this_turn_resets_on_human_message():
+    from birdie.agent.graph import _tool_calls_this_turn
+    msgs = [HumanMessage(content="a"), AIMessage(content="", tool_calls=[
+        {"name": "x", "args": {}, "id": "1"}, {"name": "y", "args": {}, "id": "2"}]),
+        HumanMessage(content="b"), AIMessage(content="", tool_calls=[
+            {"name": "x", "args": {}, "id": "3"}])]
+    assert _tool_calls_this_turn(msgs) == 1

@@ -1,3 +1,13 @@
+## [0.13.0] - 2026-08-22
+
+### Added
+- Per-turn tool-call budget: `max_tool_calls_per_turn` (agent-level config
+  key, default 40, 0 disables). When the model issues more tool calls than
+  the budget within one user turn the graph ends the turn with a
+  "Stopped: ... probably stuck" message instead of re-invoking the model.
+  This backstops looping that the exact-match loop guard cannot catch, such
+  as the same command re-issued with a different `sleep N` suffix.
+
 ## [0.12.0] - 2026-08-22
 
 ### Added
