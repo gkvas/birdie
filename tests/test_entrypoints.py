@@ -386,3 +386,42 @@ class TestTimeoutSchemaInjection:
         tool = self._parse("### t\ndescription: d\nentrypoint: bash:date\n")
         assert tool.schema["type"] == "object"
         assert TIMEOUT_PARAM in tool.schema["properties"]
+
+
+class TestStderrSurfacing:
+    """stderr reaches the model even when the exit code is 0."""
+
+    def test_stderr_shown_on_zero_exit(self):
+        out = resolve_bash(
+            "bash:{command}",
+            command="cat /nonexistent/file.kts | head -5",
+        )
+        assert "[stderr]" in out
+        assert "No such file or directory" in out
+
+    def test_silent_command_is_labelled(self):
+        out = resolve_bash("bash:{command}", command="true")
+        assert "no output" in out
+
+    def test_plain_stdout_unchanged(self):
+        out = resolve_bash("bash:{command}", command="echo hi")
+        assert out == "hi\n"
+
+
+class TestCreatePlanRepeat:
+    def test_identical_replan_rejected(self):
+        from birdie.skills.todo import tools
+        tools._last_plan = None
+        first = tools.create_plan(["a", "b"])
+        assert "[ ] 1. a" in first
+        again = tools.create_plan(["a", "b"])
+        assert "unchanged" in again
+        changed = tools.create_plan(["a", "c"])
+        assert "[ ] 2. c" in changed
+
+
+def test_tilde_expanded_in_template_args(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "marker.txt").write_text("found\n")
+    out = resolve_bash("bash:cat {path}", path="~/marker.txt")
+    assert out == "found\n"

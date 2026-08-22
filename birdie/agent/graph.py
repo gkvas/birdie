@@ -295,6 +295,24 @@ def _last_input_tokens(messages: list) -> int:
     return 0
 
 
+LOOP_GUARD_PREFIX = "Error: loop guard:"
+
+
+def _tool_error_content(exc: Exception) -> str:
+    """ToolNode error handler: render one tool's failure as its result."""
+    return f"Error: {exc}"
+
+
+def _guard_fired_this_turn(messages: list) -> bool:
+    """True if a loop-guard ToolMessage was already emitted since the last HumanMessage."""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return False
+        if isinstance(msg, ToolMessage) and str(msg.content).startswith(LOOP_GUARD_PREFIX):
+            return True
+    return False
+
+
 def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
     """Count how many consecutive recent agent cycles included (name, args) in their tool calls.
 
@@ -936,12 +954,36 @@ def create_agent_graph(
         if isinstance(last_ai, AIMessage):
             for tc in getattr(last_ai, "tool_calls", []):
                 if _consecutive_call_count(all_messages, tc["name"], tc["args"]) > max_reps:
+                    # The guard already fired once this turn and the model
+                    # is looping again: end the turn instead of handing the
+                    # model yet another chance to repeat itself.
+                    if _guard_fired_this_turn(all_messages):
+                        stop = (
+                            f"Stopped: '{tc['name']}' keeps being called with "
+                            f"identical parameters after a loop warning. I am "
+                            f"stuck and need guidance - please check the last "
+                            f"tool results and tell me how to proceed."
+                        )
+                        return {"messages": [
+                            ToolMessage(
+                                content=LOOP_GUARD_PREFIX + " Turn ended.",
+                                tool_call_id=t["id"],
+                                name=t["name"],
+                            )
+                            for t in getattr(last_ai, "tool_calls", [])
+                        ] + [AIMessage(content=stop)]}
                     return {"messages": [
                         ToolMessage(
                             content=(
-                                f"Error: '{tc['name']}' has been called more than {max_reps} "
-                                f"times consecutively with identical parameters. "
-                                f"Breaking the loop to prevent infinite repetition."
+                                f"{LOOP_GUARD_PREFIX} '{tc['name']}' has been called more than "
+                                f"{max_reps} times consecutively with identical parameters. "
+                                f"Breaking the loop to prevent infinite repetition. "
+                                f"Repeating this call will not change its result. "
+                                f"Do NOT re-create the plan or retry the same call. "
+                                f"Instead: re-read the previous result or error, run a "
+                                f"different diagnostic (e.g. list the parent directory, "
+                                f"check the file exists, print the variable), or tell "
+                                f"the user what is blocking you."
                             ),
                             tool_call_id=t["id"],
                             name=t["name"],
@@ -1008,10 +1050,14 @@ def create_agent_graph(
         )
         cap = config.get("configurable", {}).get("tool_output_cap", MAX_TOOL_OUTPUT_CAP)
 
-        tool_node = ToolNode(langchain_tools)
+        # Per-call error handling: a failing tool yields an error ToolMessage
+        # for *its* call only, so sibling calls in the same batch keep their
+        # real results (and the error is not duplicated once per call).
+        tool_node = ToolNode(langchain_tools, handle_tool_errors=_tool_error_content)
         try:
             result = await tool_node.ainvoke(state, config)
         except Exception as exc:
+            # Safety net for failures outside tool execution itself.
             last = state["messages"][-1]
             return {"messages": [
                 ToolMessage(
@@ -1040,6 +1086,14 @@ def create_agent_graph(
             return "tools"
         return END
 
+    def after_tools(state: AgentState) -> str:
+        # The tools node ends the turn itself (loop guard) by appending a
+        # final AIMessage; otherwise hand the tool results back to the model.
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage):
+            return END
+        return "agent"
+
     workflow = StateGraph(AgentState)
     workflow.add_node("agent", call_model)
     workflow.add_node("tools", execute_tools)
@@ -1050,6 +1104,10 @@ def create_agent_graph(
         should_continue,
         {"tools": "tools", END: END},
     )
-    workflow.add_edge("tools", "agent")
+    workflow.add_conditional_edges(
+        "tools",
+        after_tools,
+        {"agent": "agent", END: END},
+    )
 
     return workflow

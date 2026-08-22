@@ -1230,6 +1230,15 @@ class BirdieCLI:
                                     pass  # transcript already printed by the tool
                                 else:
                                     self._render_tool_output(name, str(msg.content))
+                            elif isinstance(msg, AIMessage) and msg.content:
+                                # The tools node ended the turn itself
+                                # (loop guard): show its final message.
+                                status.stop()
+                                for i, line in enumerate(str(msg.content).splitlines()):
+                                    prefix = "🐦 " if i == 0 else "   "
+                                    self.console.print(f"{prefix}{line}", highlight=False)
+                                self.console.print()
+                                printed_any = True
                         status.update("[dim]thinking…[/dim]")
 
                     elif node_name == "agent":
@@ -1321,6 +1330,9 @@ class BirdieCLI:
                                     content = str(msg.content) if msg.content else ""
                                     if content:
                                         output_parts.append(f"🐦 {name}: {content}")
+                            elif isinstance(msg, AIMessage) and msg.content:
+                                # Turn ended by the tools node (loop guard).
+                                output_parts.append(str(msg.content))
                     
                     elif node_name == "agent":
                         for msg in msgs:
