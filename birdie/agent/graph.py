@@ -531,6 +531,37 @@ def create_agent_graph(
             return text if text else None
         return None
 
+    def _load_project_instructions() -> str | None:
+        """Load project instructions from CLAUDE.md or AGENTS.md in the cwd.
+
+        Returns the content wrapped in a ``<system-reminder>`` block ready to
+        be prepended to the first user message, or ``None`` when neither file
+        exists (or both are empty).  ``CLAUDE.md`` wins when both are present.
+
+        These deliberately do NOT go into the system prompt: riding inside the
+        first user message keeps the system prompt free of per-project content
+        while the wrapper text recovers the instruction authority.  Because the
+        block sits at the very start of the conversation and the file rarely
+        changes mid-session, the provider prompt-cache prefix stays intact.
+        The file is re-read every turn, so edits take effect immediately.
+        """
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            path = Path(name)
+            if path.is_file():
+                text = path.read_text(encoding="utf-8").strip()
+                if text:
+                    return (
+                        "<system-reminder>\n"
+                        f"Project instructions from {path.resolve()} are shown "
+                        "below. Be sure to adhere to these instructions. "
+                        "IMPORTANT: These instructions OVERRIDE any default "
+                        "behavior and you MUST follow them exactly as "
+                        "written.\n\n"
+                        f"{text}\n"
+                        "</system-reminder>"
+                    )
+        return None
+
     def _build_system_prompt(config: RunnableConfig) -> str | None:
         """Assemble the *stable* system prompt from in-memory skill objects.
 
@@ -792,6 +823,26 @@ def create_agent_graph(
 
         # Repair any dangling tool calls within the context window.
         clean_messages = _repair_dangling_tool_calls(context_msgs)
+
+        # Project instructions (CLAUDE.md / AGENTS.md) are merged into the
+        # first user message of the outgoing request only - never written to
+        # the checkpoint.  ACP agents (Claude Code, Gemini CLI, ...) run in
+        # the same cwd and read these files themselves, so injecting here
+        # would duplicate them.
+        project_instructions = _load_project_instructions()
+        if project_instructions and not isinstance(provider, ACPProvider):
+            for i, msg in enumerate(clean_messages):
+                if isinstance(msg, HumanMessage):
+                    if isinstance(msg.content, str):
+                        content = f"{project_instructions}\n\n{msg.content}"
+                    else:
+                        content = (
+                            [{"type": "text", "text": project_instructions}]
+                            + list(msg.content)
+                        )
+                    clean_messages = list(clean_messages)
+                    clean_messages[i] = msg.model_copy(update={"content": content})
+                    break
 
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
