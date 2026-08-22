@@ -358,7 +358,12 @@ def resolve_bash(entrypoint: str, _timeout: float | None = None, **kwargs: Any) 
     if re.fullmatch(r'\{\w+\}', template):
         command = template.format(**kwargs)
     else:
-        quoted = {k: shlex.quote(str(v)) for k, v in kwargs.items()}
+        # Quoting defeats the shell's tilde expansion, so expand ``~`` here:
+        # models routinely pass ``~/foo`` to path-taking tools.
+        quoted = {
+            k: shlex.quote(os.path.expanduser(str(v)))
+            for k, v in kwargs.items()
+        }
         command = template.format(**quoted)
     timeout = _effective_timeout(call_timeout, _timeout, BASH_TIMEOUT)
     if _use_persistent_shell():
@@ -383,13 +388,29 @@ def resolve_bash(entrypoint: str, _timeout: float | None = None, **kwargs: Any) 
             )
         if returncode != 0:
             raise RuntimeError(f"Command failed: {stderr}{session_note}")
-        return stdout + session_note if session_note else stdout
+        return _format_output(stdout, stderr) + session_note
     timed_out, stdout, stderr, returncode = _run_shell(command, timeout)
     if timed_out:
         raise ToolTimeoutError(_timeout_message(timeout, stdout, stderr))
     if returncode != 0:
         raise RuntimeError(f"Command failed: {stderr}")
-    return stdout
+    return _format_output(stdout, stderr)
+
+
+def _format_output(stdout: str, stderr: str) -> str:
+    """Build the tool result for a command that exited 0.
+
+    stderr is always surfaced: pipelines such as ``cat missing | grep x | head``
+    exit 0 even though ``cat`` failed, and hiding that error leaves the model
+    with a blank result it tends to retry verbatim.  A fully silent command is
+    labelled explicitly for the same reason.
+    """
+    if not stdout and not stderr:
+        return "(command produced no output, exit code 0)"
+    if not stderr:
+        return stdout
+    sep = "" if not stdout or stdout.endswith("\n") else "\n"
+    return f"{stdout}{sep}[stderr]\n{stderr}"
 
 
 def resolve_python(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:

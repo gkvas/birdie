@@ -6,6 +6,12 @@ entrypoints and their return values appear as ToolMessage content in the CLI.
 """
 
 
+# Last plan handed out by create_plan. Used to reject verbatim re-plans, a
+# common failure mode where a model "recovers" from an error by re-issuing
+# the same plan and restarting from step 1 instead of acting on the error.
+_last_plan: list | None = None
+
+
 def create_plan(steps: list, **_) -> str:
     """Format and return a numbered plan from a list of step descriptions.
 
@@ -14,10 +20,20 @@ def create_plan(steps: list, **_) -> str:
         **_: Ignored extra kwargs from the StructuredTool wrapper.
 
     Returns:
-        A multiline string with a header and one checkbox line per step.
+        A multiline string with a header and one checkbox line per step, or a
+        short refusal if ``steps`` is identical to the previous plan.
     """
+    global _last_plan
     if not steps:
         return "No steps provided."
+    steps = [str(s) for s in steps]
+    if steps == _last_plan:
+        return (
+            f"Plan unchanged ({len(steps)} steps) - not re-created. Do not "
+            "re-plan; continue with the next open step, or act on the last "
+            "error (run a different diagnostic command or ask the user)."
+        )
+    _last_plan = steps
     n = len(steps)
     lines = [f"Plan ({n} step{'s' if n != 1 else ''}):"]
     for i, step in enumerate(steps, 1):

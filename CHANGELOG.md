@@ -1,3 +1,32 @@
+## [0.12.0] - 2026-08-22
+
+### Added
+- Loop guard now ends the turn: the first time a tool is called more than
+  `max_tool_repetitions` times with identical parameters the model gets a
+  prescriptive warning (inspect the error, run a different diagnostic, or
+  ask the user); if the guard fires again in the same turn the graph stops
+  and returns a "Stopped: ... I am stuck" message to the user instead of
+  re-invoking the model. Previously the guard only returned an error and
+  the model could loop indefinitely.
+- `todo_create_plan` refuses a verbatim re-plan ("Plan unchanged") instead
+  of printing a fresh all-unchecked plan, a common way weak models reset
+  progress after an error.
+
+### Changed
+- `run_bash` always surfaces stderr, even on exit code 0, and labels a
+  fully silent command explicitly (`(command produced no output, exit
+  code 0)`). Pipelines such as `cat missing | grep x | head` no longer
+  return a blank result that hides the underlying error.
+- `bash:` template arguments expand `~` before quoting, so path-taking
+  tools such as `list_dir(path='~/git')` work.
+- Tool errors are handled per call (`ToolNode(handle_tool_errors=...)`):
+  one failing tool in a multi-call batch no longer overwrites the results
+  of its siblings or duplicates its error once per call.
+
+### Fixed
+- The CLI now prints messages emitted by the tools node (the loop-guard
+  stop message was shown as "(no response)").
+
 ## [0.11.0] - 2026-08-22
 
 ### Added
