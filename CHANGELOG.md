@@ -1,6 +1,12 @@
 ## [Unreleased]
 
 ### Added
+- Project instructions: `CLAUDE.md` (or `AGENTS.md` as fallback) in the current
+  working directory is now picked up automatically. The content is wrapped in a
+  `<system-reminder>` block and merged into the first user message of each
+  request - the Claude Code approach - so the system prompt and the provider
+  prompt-cache prefix stay stable. Never written to the checkpoint; skipped for
+  ACP agents, which read these files themselves.
 - Non-interactive mode via `-p`/`--prompt` CLI argument: allows passing a prompt directly to birdie, which then runs once and outputs the AI response to stdout (similar to Claude Code's `-p` flag). Works with all existing CLI options like `--config`, `--user`, and `--session-id`.
 
 ## [0.8.1] - 2026-08-22

@@ -478,7 +478,9 @@ context into two carriers with different stability guarantees:
   turn;
 - the **session-context message** (`_build_volatile_context()`) - everything that changes
   per turn, wrapped in `<session_context>` tags and appended as an ephemeral `HumanMessage`
-  after the real conversation. It is sent to the provider but never written to the checkpoint.
+  after the real conversation. It is sent to the provider but never written to the checkpoint;
+- **project instructions** (`_load_project_instructions()`) - `CLAUDE.md` / `AGENTS.md`
+  content, merged into the *first* user message of the outgoing request (see below).
 
 ### Stable system prompt
 
@@ -493,9 +495,11 @@ Always prefer readability over cleverness.
 EOF
 ```
 
-This is the recommended way to give the agent project-specific instructions. The file is
+This is the recommended way to give the agent a project-specific *persona*. The file is
 intentionally project-local (`.birdie/`, which should be in `.gitignore`) so different projects
-can have different personas without touching global config.
+can have different personas without touching global config. For codebase conventions that are
+checked in and shared with other AI tools, use `CLAUDE.md` / `AGENTS.md` instead (see
+*Project instructions* below).
 
 **Tier 1 - skill catalog (always present).** A compact bullet list of every skill currently
 allowed for the session. Knowledge skills carry a `[load: <name>]` hint:
@@ -516,6 +520,20 @@ are not listed here, so the model does not attempt to call tools it cannot use.
 **Tier 2 - always_inject skill bodies.** Skills with `always_inject: true` in their SKILL.MD
 frontmatter have their full prose body appended on every turn, regardless of what the user said.
 This is useful for planning or meta skills whose instructions must always be present.
+
+### Project instructions (CLAUDE.md / AGENTS.md)
+
+If `CLAUDE.md` exists in the current working directory - or, failing that, `AGENTS.md` - its
+contents are wrapped in a `<system-reminder>` block and prepended to the **first user message**
+of every outgoing request. This is the same trick Claude Code uses: the instructions carry
+explicit "these override default behavior" framing so they keep system-prompt authority, but
+the system prompt itself stays free of per-project content. Because the block sits at the very
+start of the conversation and is byte-identical from turn to turn, the provider prompt-cache
+prefix survives; because it is applied at request-build time, it is never written to the
+checkpoint, and edits to the file take effect on the next turn without restarting the agent.
+
+The injection is skipped for `ACPProvider`: ACP agents (Claude Code, Gemini CLI, ...) run in
+the same working directory and read these files themselves, so injecting would duplicate them.
 
 ### Ephemeral session context
 
