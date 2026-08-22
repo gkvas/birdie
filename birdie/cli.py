@@ -43,6 +43,7 @@ from .agent.run import DynamicAgent
 from .core.errors import BirdieRateLimitError
 from .core.models import Skill
 from .core.session import Session, SessionManager, UserMemory
+from .core.shell_session import peek_default_session
 
 
 PROMPT_STYLE = Style.from_dict({
@@ -1425,6 +1426,10 @@ class BirdieCLI:
             try:
                 await task
             except asyncio.CancelledError:
+                # Cancelling the task only detaches the coroutine; a bash
+                # tool call keeps running in a worker thread.  Kill what the
+                # shell is running so Ctrl+C really stops it.
+                _interrupt_shell()
                 self.console.print("\n[dim]Interrupted.[/dim]")
             except BirdieRateLimitError:
                 self.console.print(
@@ -1491,7 +1496,17 @@ def main() -> None:
     agents_dir = args.agents_dir or os.path.join(os.path.dirname(__file__), "agents")
     provider_config = Path(args.config) if args.config else None
 
-    asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config, args.prompt))
+    try:
+        asyncio.run(
+            _async_main(args.session_id, user_id, skills_dir, agents_dir,
+                        provider_config, args.prompt)
+        )
+    except KeyboardInterrupt:
+        # Ctrl+C outside the REPL's own handling (during startup or teardown):
+        # exit quietly with the conventional 128+SIGINT status rather than
+        # dumping an asyncio shutdown traceback at the user.
+        _close_shell()
+        sys.exit(130)
 
 
 _PROVIDER_HELP = """
@@ -1526,6 +1541,26 @@ variables or a JSON config file.
 
 [bold]Supported vendors:[/bold] openai, anthropic, mistral, gemini, azure, ollama
 """
+
+
+def _interrupt_shell() -> None:
+    """Stop the command the persistent shell is running, if any."""
+    session = peek_default_session()
+    if session is not None:
+        session.interrupt()
+
+
+def _close_shell() -> None:
+    """Kill the persistent shell on the way out.
+
+    Tool calls run in the event loop's thread pool, and asyncio waits up to
+    five minutes for those threads at shutdown.  A bash call still parked in
+    one -- an interrupted turn, a long timeout -- would hold the process open
+    that whole time; killing the shell lets the thread return at once.
+    """
+    session = peek_default_session()
+    if session is not None:
+        session.close()
 
 
 def _abort(console: Console, message: str) -> None:
@@ -1590,13 +1625,16 @@ async def _async_main(
             user_memory=user_memory,
             console=console,
         )
-        
-        if prompt is not None:
-            # Non-interactive mode: run single prompt and output to stdout
-            await cli.run_non_interactive(prompt)
-        else:
-            # Interactive mode: start the REPL
-            await cli.run()
+
+        try:
+            if prompt is not None:
+                # Non-interactive mode: run single prompt and output to stdout
+                await cli.run_non_interactive(prompt)
+            else:
+                # Interactive mode: start the REPL
+                await cli.run()
+        finally:
+            _close_shell()
 
 
 if __name__ == "__main__":

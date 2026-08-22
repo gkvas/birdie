@@ -119,10 +119,62 @@ class TestShellSession:
             t.join(timeout=30)
         assert results == {"aa": "aa", "bb": "bb"}
 
+    def test_interrupt_stops_running_command(self, session):
+        session.run("export BIRDIE_INT_STATE=kept", 10)
+        result = {}
+
+        def call():
+            start = time.monotonic()
+            result["call"] = session.run("sleep 60", 120)
+            result["elapsed"] = time.monotonic() - start
+
+        t = threading.Thread(target=call)
+        t.start()
+        time.sleep(1.5)  # let the sleep actually start under the shell
+        session.interrupt()
+        t.join(timeout=30)
+        assert not t.is_alive()
+        assert result["elapsed"] < 15
+        timed_out, _, _, _, alive = result["call"]
+        assert not timed_out and alive
+        _, out, _, _, _ = session.run("echo $BIRDIE_INT_STATE", 10)
+        assert out.strip() == "kept"
+
+    def test_close_does_not_wait_for_in_flight_call(self, session):
+        """close() must not block on the lock, or shutdown hangs."""
+        done = threading.Event()
+
+        def call():
+            session.run("sleep 60", 120)
+            done.set()
+
+        t = threading.Thread(target=call, daemon=True)
+        t.start()
+        time.sleep(1.5)
+        start = time.monotonic()
+        session.close()
+        assert time.monotonic() - start < 5
+        assert done.wait(timeout=15), "worker thread still parked in the call"
+
     def test_non_utf8_output(self, session):
         _, out, _, rc, _ = session.run(r"printf 'caf\x81 before\nafter\n'", 10)
         assert rc == 0
         assert "before" in out and "after" in out
+
+
+class TestDefaultSession:
+    @pytest.fixture(autouse=True)
+    def fresh_default_session(self):
+        shell_session.reset_default_session()
+        yield
+        shell_session.reset_default_session()
+
+    def test_peek_does_not_spawn_a_session(self):
+        assert shell_session.peek_default_session() is None
+
+    def test_peek_returns_the_started_session(self):
+        session = shell_session.get_default_session()
+        assert shell_session.peek_default_session() is session
 
 
 class TestResolveBashIntegration:
