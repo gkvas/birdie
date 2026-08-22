@@ -1,3 +1,26 @@
+## [0.11.0] - 2026-08-22
+
+### Added
+- Persistent shell session for `bash:` entrypoints: `run_bash` now executes
+  in one long-lived shell per birdie process (Claude Code style), so working
+  directory, exported variables, functions and aliases persist from one tool
+  call to the next. Commands are framed with per-call sentinels on both
+  streams, so background jobs holding the pipes open can never block a call.
+  Windows falls back to the previous one-shot execution;
+  `BIRDIE_PERSISTENT_SHELL=0` opts out everywhere.
+
+### Changed
+- A `timeout_s` expiry now kills the shell's descendant processes
+  (background jobs included) but spares the session — exports and cwd
+  survive, and the error message says so. Only a genuinely wedged shell is
+  killed and respawned, with the error noting that state was lost. Daemons
+  that must survive a timeout should be started with
+  `setsid <cmd> >/dev/null 2>&1 &` (the Shell skill description teaches
+  this).
+- A shell that dies mid-command (`exit`, `exec`, persisted `set -e`)
+  reports its exit code plus a session-reset note and respawns
+  transparently on the next call.
+
 ## [0.10.0] - 2026-08-22
 
 ### Added
