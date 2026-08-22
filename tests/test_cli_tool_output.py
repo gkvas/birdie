@@ -48,3 +48,27 @@ def test_render_tool_output_short_mode_truncates():
     cli._render_tool_output("run_bash", "x" * 1500)
     text = console.export_text()
     assert "500 more characters" in text
+
+
+def test_turn_error_report_is_one_line_by_default(monkeypatch):
+    monkeypatch.delenv("BIRDIE_DEBUG", raising=False)
+    cli, console = _make_cli()
+    try:
+        raise ValueError("boom")
+    except ValueError as exc:
+        cli._report_turn_error(exc)
+    text = console.export_text()
+    assert "--debug" in text
+    assert "Traceback" not in text
+
+
+def test_turn_error_report_prints_traceback_in_debug(monkeypatch):
+    monkeypatch.setenv("BIRDIE_DEBUG", "1")
+    cli, console = _make_cli()
+    try:
+        raise ValueError("boom")
+    except ValueError as exc:
+        cli._report_turn_error(exc)
+    text = console.export_text()
+    assert "Traceback" in text
+    assert "ValueError" in text

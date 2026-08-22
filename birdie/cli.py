@@ -40,7 +40,7 @@ from rich.console import Console
 
 from .agent.graph import MAX_TOOL_OUTPUT_CAP
 from .agent.run import DynamicAgent
-from .core.errors import BirdieRateLimitError
+from .core.errors import BirdieProviderUnavailableError, BirdieRateLimitError
 from .core.models import Skill
 from .core.session import Session, SessionManager, UserMemory
 from .core.shell_session import peek_default_session
@@ -177,6 +177,7 @@ class BirdieCLI:
         user_id: str,
         user_memory: UserMemory,
         console: Optional[Console] = None,
+        debug: bool = False,
     ) -> None:
         self.agent = agent
         self.session_manager = session_manager
@@ -184,6 +185,10 @@ class BirdieCLI:
         self.user_id = user_id
         self.user_memory = user_memory
         self.console = console or Console()
+        # Full tracebacks for turn errors: --debug flag or BIRDIE_DEBUG=1.
+        self._debug = (
+            debug or os.environ.get("BIRDIE_DEBUG", "") not in ("", "0")
+        )
 
         self._total_in: int = 0
         self._total_out: int = 0
@@ -613,6 +618,21 @@ class BirdieCLI:
             f"  [dim]memory:[/dim]   {has_ltm}\n"
             f"  [dim]provider:[/dim] {vendor}"
         )
+
+    def _report_turn_error(self, exc: BaseException) -> None:
+        """Log the traceback; print it only in debug mode.
+
+        A 200-line traceback for a dropped connection buries the one line
+        the user needs.  The full trace always goes to the ``birdie`` logger
+        so it is recoverable when logging is on.
+        """
+        logging.getLogger("birdie").debug("turn failed", exc_info=exc)
+        if self._debug:
+            self.console.print_exception(show_locals=False)
+        else:
+            self.console.print(
+                "[dim](run with --debug or BIRDIE_DEBUG=1 for the traceback)[/dim]"
+            )
 
     def _render_tool_output(self, name: str, content: str) -> None:
         """Render tool output according to the current _tool_output_mode."""
@@ -1441,11 +1461,18 @@ class BirdieCLI:
                 self.console.print(
                     "[yellow]Rate limit reached - please wait a moment and try again.[/yellow]"
                 )
+            except BirdieProviderUnavailableError as exc:
+                self.console.print(
+                    "[yellow]Provider unreachable - the request timed out or the "
+                    "connection dropped, even after retries. Check your network "
+                    "and try again.[/yellow]"
+                )
+                self._report_turn_error(exc)
             except Exception as exc:
                 self.console.print(
                     f"[red bold]Error:[/red bold] {type(exc).__name__}: {exc}"
                 )
-                self.console.print_exception(show_locals=False)
+                self._report_turn_error(exc)
             finally:
                 loop.remove_signal_handler(signal.SIGINT)
 
@@ -1490,6 +1517,11 @@ def main() -> None:
         default=None,
         help="Run non-interactively with the given prompt and print the AI response to stdout",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print full tracebacks for errors during a turn (also: BIRDIE_DEBUG=1)",
+    )
     args = parser.parse_args()
 
     user_id = (
@@ -1505,7 +1537,7 @@ def main() -> None:
     try:
         asyncio.run(
             _async_main(args.session_id, user_id, skills_dir, agents_dir,
-                        provider_config, args.prompt)
+                        provider_config, args.prompt, debug=args.debug)
         )
     except KeyboardInterrupt:
         # Ctrl+C outside the REPL's own handling (during startup or teardown):
@@ -1581,6 +1613,7 @@ async def _async_main(
     agents_dir: Optional[str],
     provider_config,
     prompt: Optional[str] = None,
+    debug: bool = False,
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -1630,6 +1663,7 @@ async def _async_main(
             user_id=user_id,
             user_memory=user_memory,
             console=console,
+            debug=debug,
         )
 
         try:
