@@ -1,4 +1,4 @@
-## [Unreleased]
+## [0.9.0] - 2026-08-22
 
 ### Added
 - Project instructions: `CLAUDE.md` (or `AGENTS.md` as fallback) in the current
