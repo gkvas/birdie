@@ -26,6 +26,7 @@ from birdie.core.llm_provider import (
     _tools_to_anthropic,
     _anthropic_accepts_temperature,
     _is_temperature_rejection,
+    _sdk_accepts_temperature,
     AnthropicProvider,
     skilltool_to_normalized_def,
     get_llm_provider,
@@ -306,6 +307,43 @@ class TestAnthropicTemperature:
         exc = Exception("temperature something")
         exc.status_code = 500
         assert _is_temperature_rejection(exc) is False
+
+    def test_rejection_detector_accepts_sdk_typeerror(self):
+        # anthropic>=1.0 removed `temperature` from messages.create() and
+        # raises client-side before any request is made.
+        exc = TypeError("AsyncMessages.create() got an unexpected keyword argument 'temperature'")
+        assert _is_temperature_rejection(exc) is True
+        assert _is_temperature_rejection(TypeError("missing 1 required argument")) is False
+
+    def test_sdk_without_temperature_param_is_never_sent(self):
+        def create(*, model, messages, max_tokens, system=None, tools=None):
+            return MagicMock(content=[MagicMock(type="text", text="Hello")])
+
+        client = MagicMock()
+        client.messages.create = create
+        assert _sdk_accepts_temperature(client) is False
+
+        p = _make_anthropic_provider("claude-sonnet-4-6")
+        p._send_temperature = _sdk_accepts_temperature(client)
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, None, None)
+        assert "temperature" not in kw
+
+    @pytest.mark.asyncio
+    async def test_achat_retries_without_temperature_on_typeerror(self):
+        p = _make_anthropic_provider("claude-sonnet-4-6")
+        ok = MagicMock()
+        ok.content = [MagicMock(type="text", text="Hello")]
+        p._async_client.messages.create = AsyncMock(side_effect=[
+            TypeError("AsyncMessages.create() got an unexpected keyword argument 'temperature'"),
+            ok,
+        ])
+
+        msg = await p.achat([HumanMessage(content="hi")])
+
+        assert "Hello" in msg.content
+        assert p._async_client.messages.create.call_count == 2
+        assert "temperature" not in p._async_client.messages.create.call_args_list[1].kwargs
+        assert p._send_temperature is False
 
 
 # ---------------------------------------------------------------------------
