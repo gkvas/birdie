@@ -1,3 +1,14 @@
+## [0.13.2] - 2026-08-22
+
+### Fixed
+- `bash:` tools that exit non-zero now report the exit code and both
+  stdout and stderr (tail-capped). Only stderr was quoted before, so a
+  script that printed its diagnostics to stdout and then exited 1 left
+  the model with a bare `Command failed:`.
+- The CLI escapes tool output before rendering it. Rich treated bracketed
+  text such as the `[stderr]` label as markup and dropped the line, so the
+  terminal hid the stderr marker the model was seeing.
+
 ## [0.13.1] - 2026-08-22
 
 ### Fixed
