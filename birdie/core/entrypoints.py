@@ -301,11 +301,34 @@ def _tail(text: str) -> str:
     return f"[... truncated ...]\n{text[-_PARTIAL_OUTPUT_CAP:]}"
 
 
-def resolve_bash(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:
-    """Execute a ``bash:`` entrypoint via a subprocess shell.
+def _timeout_message(
+    timeout: float, stdout: str, stderr: str,
+    killed_desc: str = "its process tree was killed",
+) -> str:
+    return (
+        f"Command timed out after {timeout:g}s and {killed_desc}. If it "
+        f"simply needs longer, retry with a larger {TIMEOUT_PARAM} (max "
+        f"{MAX_CALL_TIMEOUT:g}); if it was hung waiting on something, fix "
+        f"that instead of retrying.\n"
+        f"Partial stdout:\n{_tail(stdout)}\n"
+        f"Partial stderr:\n{_tail(stderr)}"
+    )
 
-    The command template (everything after ``bash:``) is formatted with kwargs,
-    then run through the platform shell with a hard deadline.
+
+def _use_persistent_shell() -> bool:
+    """Persistent shell session on POSIX; one-shot on Windows (no bash
+    guaranteed) or when BIRDIE_PERSISTENT_SHELL=0 opts out."""
+    return not _IS_WINDOWS and os.environ.get("BIRDIE_PERSISTENT_SHELL", "1") != "0"
+
+
+def resolve_bash(entrypoint: str, _timeout: float | None = None, **kwargs: Any) -> Any:
+    """Execute a ``bash:`` entrypoint in the persistent shell session.
+
+    The command template (everything after ``bash:``) is formatted with
+    kwargs, then run with a hard deadline in the process-wide persistent
+    shell (Claude Code style: cwd, exports and functions carry over to the
+    next call).  On Windows, or with BIRDIE_PERSISTENT_SHELL=0, each command
+    runs in a fresh one-shot shell instead.
 
     Substituted values are shell-quoted (``shlex.quote``) so LLM-supplied
     arguments cannot inject extra shell commands into templates like
@@ -338,16 +361,32 @@ def resolve_bash(entrypoint: str, _timeout: float | None = None, **kwargs: Any) 
         quoted = {k: shlex.quote(str(v)) for k, v in kwargs.items()}
         command = template.format(**quoted)
     timeout = _effective_timeout(call_timeout, _timeout, BASH_TIMEOUT)
+    if _use_persistent_shell():
+        from . import shell_session
+        timed_out, stdout, stderr, returncode, alive = (
+            shell_session.get_default_session().run(command, timeout)
+        )
+        session_note = "" if alive else (
+            "\nNote: the persistent shell session was reset -- exports, cwd "
+            "and functions from earlier commands are gone; the next command "
+            "starts a fresh shell."
+        )
+        if timed_out:
+            killed_desc = (
+                "the shell's child processes (background jobs included) were "
+                "killed; the session itself survived, exports and cwd are "
+                "intact" if alive else "the shell session was killed"
+            )
+            raise ToolTimeoutError(
+                _timeout_message(timeout, stdout, stderr, killed_desc)
+                + session_note
+            )
+        if returncode != 0:
+            raise RuntimeError(f"Command failed: {stderr}{session_note}")
+        return stdout + session_note if session_note else stdout
     timed_out, stdout, stderr, returncode = _run_shell(command, timeout)
     if timed_out:
-        raise ToolTimeoutError(
-            f"Command timed out after {timeout:g}s and its process tree was "
-            f"killed. If it simply needs longer, retry with a larger "
-            f"{TIMEOUT_PARAM} (max {MAX_CALL_TIMEOUT:g}); if it was hung "
-            f"waiting on something, fix that instead of retrying.\n"
-            f"Partial stdout:\n{_tail(stdout)}\n"
-            f"Partial stderr:\n{_tail(stderr)}"
-        )
+        raise ToolTimeoutError(_timeout_message(timeout, stdout, stderr))
     if returncode != 0:
         raise RuntimeError(f"Command failed: {stderr}")
     return stdout
