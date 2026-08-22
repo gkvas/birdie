@@ -18,12 +18,13 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 
@@ -178,6 +179,7 @@ class BirdieCLI:
         user_memory: UserMemory,
         console: Optional[Console] = None,
         debug: bool = False,
+        resume_flags: Optional[List[str]] = None,
     ) -> None:
         self.agent = agent
         self.session_manager = session_manager
@@ -189,6 +191,9 @@ class BirdieCLI:
         self._debug = (
             debug or os.environ.get("BIRDIE_DEBUG", "") not in ("", "0")
         )
+        # Extra flags (already shell-quoted) needed to reproduce this
+        # invocation when resuming, e.g. ["--config", "~/prov.json"].
+        self._resume_flags: List[str] = list(resume_flags or [])
 
         self._total_in: int = 0
         self._total_out: int = 0
@@ -534,6 +539,24 @@ class BirdieCLI:
             f"agents: [yellow]{agent_count}[/yellow]"
         )
         self.console.print("[dim]Type /help for commands, /quit to exit.[/dim]")
+
+    def _resume_command(self) -> str:
+        """Return the shell command that resumes the active session."""
+        parts = ["birdie", "--session-id", shlex.quote(self.session.id)]
+        parts.extend(self._resume_flags)
+        return " ".join(parts)
+
+    def _print_goodbye(self) -> None:
+        """Say goodbye, and show how to pick this session up again."""
+        self.console.print("[dim]Goodbye.[/dim]")
+        self.console.print("[dim]Resume this session with:[/dim]")
+        # soft_wrap keeps the command on one line so it survives a
+        # copy-paste out of the terminal.
+        self.console.print(
+            f"  [cyan]{self._resume_command()}[/cyan]",
+            highlight=False,
+            soft_wrap=True,
+        )
 
     def _show_help(self) -> None:
         """Print the slash-command reference."""
@@ -1123,7 +1146,7 @@ class BirdieCLI:
         arg = parts[1] if len(parts) > 1 else ""
 
         if cmd in ("/quit", "/exit"):
-            self.console.print("[dim]Goodbye.[/dim]")
+            self._print_goodbye()
             sys.exit(0)
 
         elif cmd == "/help":
@@ -1427,10 +1450,11 @@ class BirdieCLI:
                 )
                 self._ctrl_c_warned = False
             except SystemExit:
-                self.console.print("[dim]Goodbye.[/dim]")
+                # Ctrl+C twice at an empty prompt.
+                self._print_goodbye()
                 return
             except EOFError:
-                self.console.print("[dim]Goodbye.[/dim]")
+                self._print_goodbye()
                 return
             except KeyboardInterrupt:
                 continue
@@ -1533,11 +1557,13 @@ def main() -> None:
     skills_dir = args.skills_dir or os.path.join(os.path.dirname(__file__), "skills")
     agents_dir = args.agents_dir or os.path.join(os.path.dirname(__file__), "agents")
     provider_config = Path(args.config) if args.config else None
+    resume_flags = _resume_flags(args)
 
     try:
         asyncio.run(
             _async_main(args.session_id, user_id, skills_dir, agents_dir,
-                        provider_config, args.prompt, debug=args.debug)
+                        provider_config, args.prompt, debug=args.debug,
+                        resume_flags=resume_flags)
         )
     except KeyboardInterrupt:
         # Ctrl+C outside the REPL's own handling (during startup or teardown):
@@ -1581,6 +1607,25 @@ variables or a JSON config file.
 """
 
 
+def _resume_flags(args) -> List[str]:
+    """Flags to repeat when resuming, so the resumed session is configured
+    the same way.  Only options the user actually passed are echoed back -
+    the defaults resolve identically on the next start.
+    """
+    flags: List[str] = []
+    for name, value in (
+        ("--user", args.user),
+        ("--skills-dir", args.skills_dir),
+        ("--agents-dir", args.agents_dir),
+        ("--config", args.config),
+    ):
+        if value:
+            flags += [name, shlex.quote(str(value))]
+    if args.debug:
+        flags.append("--debug")
+    return flags
+
+
 def _interrupt_shell() -> None:
     """Stop the command the persistent shell is running, if any."""
     session = peek_default_session()
@@ -1614,6 +1659,7 @@ async def _async_main(
     provider_config,
     prompt: Optional[str] = None,
     debug: bool = False,
+    resume_flags: Optional[List[str]] = None,
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -1664,6 +1710,7 @@ async def _async_main(
             user_memory=user_memory,
             console=console,
             debug=debug,
+            resume_flags=resume_flags,
         )
 
         try:

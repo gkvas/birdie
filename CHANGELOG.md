@@ -1,3 +1,18 @@
+## [0.14.0] - 2026-08-22
+
+### Added
+- Leaving the CLI now prints the command that resumes the session, so the
+  session ID does not have to be looked up by hand:
+
+      Goodbye.
+      Resume this session with:
+        birdie --session-id 2026-08-22_13 --config ~/.birdie/mistral.json
+
+  Shown on all three exits (Ctrl+C twice, Ctrl+D, `/quit`). Options the
+  session was started with (`--user`, `--skills-dir`, `--agents-dir`,
+  `--config`, `--debug`) are echoed back shell-quoted; defaults are left
+  off because they resolve the same way on the next start.
+
 ## [0.13.3] - 2026-08-22
 
 ### Fixed
