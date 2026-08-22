@@ -21,6 +21,7 @@ import yaml
 from pathlib import Path
 from typing import List
 from .models import Skill, SkillTool, MCPServerConfig
+from .entrypoints import TIMEOUT_PARAM, supports_timeout, timeout_param_schema
 
 
 def parse_skill_markdown(content: str) -> Skill:
@@ -67,7 +68,17 @@ def parse_skill_markdown(content: str) -> Skill:
             entrypoint = ep_match.group(1).strip() if ep_match else ""
 
             schema_match = re.search(r'schema:(.*?)(?=\n### |\n## |\Z)', tool_content, re.DOTALL)
-            schema = yaml.safe_load(schema_match.group(1)) if schema_match else {}
+            schema = (yaml.safe_load(schema_match.group(1)) if schema_match else {}) or {}
+
+            # Advertise the per-call timeout override on every tool whose
+            # resolver enforces it.  The raw schema is what the LLM sees, so
+            # this is also where the timeout contract gets documented.  A
+            # skill-defined property of the same name wins.
+            if supports_timeout(entrypoint):
+                props = schema.setdefault("properties", {})
+                if TIMEOUT_PARAM not in props:
+                    schema.setdefault("type", "object")
+                    props[TIMEOUT_PARAM] = timeout_param_schema(entrypoint)
 
             # timeout/retries only match before the schema block, so schema
             # properties with those names are never misread as tool settings.
