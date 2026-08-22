@@ -616,6 +616,8 @@ class BirdieCLI:
 
     def _render_tool_output(self, name: str, content: str) -> None:
         """Render tool output according to the current _tool_output_mode."""
+        from rich.markup import escape
+
         lines = content.splitlines() or [""]
         n = len(lines)
 
@@ -634,7 +636,11 @@ class BirdieCLI:
             remaining = 0
 
         for line in display_lines:
-            self.console.print(f"[dim]   {line}[/dim]", highlight=False)
+            # escape: tool output is data, and Rich otherwise eats anything
+            # that looks like a markup tag (the "[stderr]" label, "[ok]"...).
+            self.console.print(
+                f"[dim]   {escape(line)}[/dim]", highlight=False
+            )
         if remaining > 0:
             self.console.print(
                 f"[dim]   ... {remaining} more character{'s' if remaining != 1 else ''}[/dim]"

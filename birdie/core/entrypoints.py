@@ -387,14 +387,33 @@ def resolve_bash(entrypoint: str, _timeout: float | None = None, **kwargs: Any) 
                 + session_note
             )
         if returncode != 0:
-            raise RuntimeError(f"Command failed: {stderr}{session_note}")
+            raise RuntimeError(
+                _failure_message(returncode, stdout, stderr) + session_note
+            )
         return _format_output(stdout, stderr) + session_note
     timed_out, stdout, stderr, returncode = _run_shell(command, timeout)
     if timed_out:
         raise ToolTimeoutError(_timeout_message(timeout, stdout, stderr))
     if returncode != 0:
-        raise RuntimeError(f"Command failed: {stderr}")
+        raise RuntimeError(_failure_message(returncode, stdout, stderr))
     return _format_output(stdout, stderr)
+
+
+def _failure_message(returncode: int, stdout: str, stderr: str) -> str:
+    """Build the error text for a command that exited non-zero.
+
+    Both streams are quoted (tail-capped like the timeout message): scripts
+    routinely print their diagnostics to stdout before exiting 1, and
+    showing only stderr left the model with a bare ``Command failed:``.
+    """
+    msg = f"Command failed (exit code {returncode})."
+    if stdout:
+        msg += f"\nstdout:\n{_tail(stdout)}"
+    if stderr:
+        msg += f"\nstderr:\n{_tail(stderr)}"
+    if not stdout and not stderr:
+        msg += " No output."
+    return msg
 
 
 def _format_output(stdout: str, stderr: str) -> str:

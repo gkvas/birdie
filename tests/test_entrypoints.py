@@ -30,6 +30,27 @@ class TestResolveBashQuoting:
         with pytest.raises(RuntimeError):
             resolve_bash("bash:{command}", command="false")
 
+    @pytest.mark.parametrize("persistent", ["0", "1"])
+    def test_nonzero_exit_quotes_both_streams_and_code(
+        self, persistent, monkeypatch
+    ):
+        """A failing script's stdout must not be dropped: scripts print their
+        diagnostics there before exiting non-zero."""
+        monkeypatch.setenv("BIRDIE_PERSISTENT_SHELL", persistent)
+        with pytest.raises(RuntimeError) as exc:
+            resolve_bash(
+                "bash:{command}",
+                command="echo diag-out; echo diag-err >&2; exit 3",
+            )
+        msg = str(exc.value)
+        assert "exit code 3" in msg
+        assert "diag-out" in msg
+        assert "diag-err" in msg
+
+    def test_nonzero_exit_silent_is_labelled(self):
+        with pytest.raises(RuntimeError, match=r"exit code 1\)\. No output\."):
+            resolve_bash("bash:{command}", command="exit 1")
+
 
 class TestResolveEntrypointDispatch:
     def test_bash_scheme(self):
