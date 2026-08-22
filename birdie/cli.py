@@ -53,6 +53,8 @@ PROMPT_STYLE = Style.from_dict({
 HELP_TEXT = """
 [bold cyan]Birdie CLI - available slash commands[/bold cyan]
 
+  Supported vendors: openai, anthropic, mistral, gemini, ollama, acp, langchain
+
   [yellow]/help[/yellow]                         Show this help
   [yellow]/quit[/yellow]  [yellow]/exit[/yellow]                 Exit the session
   [yellow]/new[/yellow]                          Start a fresh conversation (new thread)
@@ -60,7 +62,7 @@ HELP_TEXT = """
   [yellow]/remember <text>[/yellow]              Save a note to long-term memory
   [yellow]/compact[/yellow]                      Force-compact conversation history into LTM now
   [yellow]/cost[/yellow]                         Show token usage and estimated cost for this session
-  [yellow]/history \[N][/yellow]                  Show the last N messages of this session (default 10)
+  [yellow]/history [N][/yellow]                  Show the last N messages of this session (default 10)
   [yellow]/info[/yellow]                         Show session info (user, session, provider)
 
   [bold]Tool commands[/bold]
