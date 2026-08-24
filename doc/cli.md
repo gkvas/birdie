@@ -156,6 +156,7 @@ These fields are extracted from the same JSON config before it is forwarded to t
 | `ltm_max_age_days` | `90` | Drop LTM entries older than this |
 | `ltm_max_entries` | `100` | Keep at most this many LTM entries |
 | `ltm_min_score` | `0.05` | Minimum similarity for LTM retrieval |
+| `pricing` | - | Per-model `/cost` overrides, e.g. `{"my-model": [1.50, 6.00]}` (USD per million input/output tokens). See [Configuring `/cost` pricing](#configuring-cost-pricing) |
 
 ---
 
@@ -367,3 +368,39 @@ Example - a config that compacts more aggressively:
 ```
 
 These fields are stripped from the config before it is forwarded to the vendor SDK, so they are safe to include alongside vendor-specific fields like `api_key` and `temperature`.
+
+
+---
+
+## Configuring `/cost` pricing
+
+`/cost` and the status bar's `spent:` field estimate USD cost from a built-in per-model pricing table (`birdie/core/pricing.py`) when the provider does not report actual cost itself. Vendor prices change and new models ship more often than birdie makes releases, so the table is intentionally overridable without a code change, in priority order (highest first):
+
+1. **`pricing` field in the provider JSON config** - highest priority, scoped to that config only:
+
+   ```json
+   {
+     "vendor": "bedrock",
+     "model": "my-fine-tuned-model",
+     "pricing": {
+       "my-fine-tuned-model": [1.50, 6.00]
+     }
+   }
+   ```
+
+2. **`~/.birdie/pricing.json`** - a user-editable file merged over the built-in table for every session on the machine, regardless of which config is active:
+
+   ```json
+   {
+     "claude-sonnet-4-6": [2.50, 12.00],
+     "my-custom-model": [1.50, 6.00]
+   }
+   ```
+
+   The file path can be overridden with the `BIRDIE_PRICING_FILE` environment variable. A missing or malformed file is treated as "no overrides" rather than raising - `/cost` falls back to the built-in table.
+
+3. **The built-in table** - a snapshot of published vendor list prices, used when nothing above matches.
+
+Each entry is `[input USD per million tokens, output USD per million tokens]`. Model IDs are matched exactly first, then by longest matching prefix (so a dated ID like `claude-haiku-4-5-20251001` resolves to a `claude-haiku-4-5` entry). A model with no match anywhere reports "unknown (no pricing data)" instead of assuming zero cost.
+
+Providers that report actual billed cost themselves (currently ACP agents, via `usage_update` notifications) always take priority over any estimate - `/cost` shows `(reported by agent)` in that case and none of the three layers above are consulted.

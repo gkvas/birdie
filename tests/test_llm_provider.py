@@ -1648,6 +1648,28 @@ class TestProviderConfig:
         with pytest.raises(ValidationError):
             ProviderConfig(max_tokens=0)
 
+    def test_pricing_field_default_none(self):
+        cfg = ProviderConfig()
+        assert cfg.pricing is None
+
+    def test_pricing_field_roundtrip(self):
+        cfg = ProviderConfig(
+            vendor="openai", model="gpt-4o",
+            pricing={"my-custom-model": [1.5, 6.0]},
+        )
+        assert cfg.pricing == {"my-custom-model": [1.5, 6.0]}
+        restored = ProviderConfig.from_json(cfg.to_json())
+        assert restored.pricing == {"my-custom-model": [1.5, 6.0]}
+
+    def test_pricing_is_agent_level_not_forwarded_to_vendor(self, tmp_path):
+        from birdie.agent.run import DynamicAgent
+        with patch("birdie.core.llm_provider.OpenAIProvider.__init__", return_value=None) as mock_init:
+            DynamicAgent.from_config(
+                {"vendor": "openai", "model": "gpt-4o", "pricing": {"gpt-4o": [1.0, 2.0]}},
+                skills_dir=str(tmp_path),
+            )
+        mock_init.assert_called_once_with(model="gpt-4o", temperature=0.0)
+
 
 class TestGetLLMProvider:
     def test_langchain_vendor(self):

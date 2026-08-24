@@ -19,7 +19,7 @@ import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Optional, Union, TYPE_CHECKING
+from typing import Any, AsyncIterator, Dict, Iterator, Optional, Union, TYPE_CHECKING
 
 from langchain_core.messages import (
     AIMessage,
@@ -192,6 +192,15 @@ class ProviderConfig(BaseModel):
         description=(
             "Agents enabled by default for every session.  "
             "Corresponds to agent names declared in AGENT.MD frontmatter."
+        ),
+    )
+    pricing: Optional[Dict[str, list]] = Field(
+        default=None,
+        description=(
+            "Per-model cost overrides used by `/cost`, e.g. "
+            '{"my-custom-model": [1.50, 6.00]} (USD per million input/output '
+            "tokens). Takes priority over both ~/.birdie/pricing.json and "
+            "the built-in pricing table; see birdie.core.pricing."
         ),
     )
 

@@ -1,3 +1,18 @@
+## [0.16.0] - 2026-08-24
+
+### Added
+- Configurable `/cost` pricing: the per-model USD pricing table used by
+  `/cost` and the status bar's `spent:` field was previously hardcoded in
+  `birdie/core/pricing.py`, requiring a code change and release for every
+  new model or price update. Pricing is now resolved in priority order:
+  a `pricing` field in the provider JSON config (scoped to that config),
+  then a user-editable `~/.birdie/pricing.json` file (override the path
+  with `BIRDIE_PRICING_FILE`), then the built-in table as a last resort.
+  Each entry is `[input USD/MTok, output USD/MTok]`; a missing or
+  malformed override file is treated as "no overrides" rather than
+  raising. Documented in `doc/cli.md` under "Configuring `/cost`
+  pricing".
+
 ## [0.15.1] - 2026-08-24
 
 ### Fixed

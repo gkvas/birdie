@@ -206,6 +206,7 @@ class DynamicAgent:
             "skill_decay_turns", "skill_max_loaded",
             "skills_enabled", "agents_enabled",
             "ltm_max_age_days", "ltm_max_entries", "ltm_min_score",
+            "pricing",
         }
         min_messages_auto = int(config_dict.get("min_messages_auto") or MIN_MESSAGES_AUTO)
         min_messages_forced = int(config_dict.get("min_messages_forced") or MIN_MESSAGES_FORCED)

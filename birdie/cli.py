@@ -616,7 +616,9 @@ class BirdieCLI:
                 f"  [dim]cost:[/dim]     ${self.session.total_cost_usd:.4f} (reported by agent)"
             )
             return
-        cost = estimate_cost(model, s_in, s_out)
+        provider_config = getattr(self.agent, "_provider_config", None) or {}
+        pricing_overrides = provider_config.get("pricing")
+        cost = estimate_cost(model, s_in, s_out, extra_overrides=pricing_overrides)
         cost_str = f"${cost:.4f}" if cost is not None else "unknown (no pricing data)"
         self.console.print(
             f"  [dim]model:[/dim]    {model}\n"
