@@ -32,6 +32,7 @@ Birdie resolves the LLM provider in this priority order:
 | Anthropic | `LLM_VENDOR=anthropic`, `LLM_MODEL=claude-sonnet-4-6`, `ANTHROPIC_API_KEY` |
 | OpenAI | `LLM_VENDOR=openai`, `LLM_MODEL=gpt-4o`, `OPENAI_API_KEY` |
 | Azure OpenAI | `LLM_VENDOR=azure`, `LLM_MODEL=<deployment-name>`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_ENDPOINT` |
+| AWS Bedrock | `LLM_VENDOR=bedrock`, `LLM_MODEL=anthropic.claude-sonnet-4-20250514-v1:0` (no key; standard AWS credential chain - env vars, shared config, IAM role, SSO, ...) |
 | Mistral | `LLM_VENDOR=mistral`, `LLM_MODEL=mistral-large-latest`, `MISTRAL_API_KEY` |
 | Google Gemini | `LLM_VENDOR=gemini`, `LLM_MODEL=gemini-2.5-pro`, `GEMINI_API_KEY` |
 | Ollama | `LLM_VENDOR=ollama`, `LLM_MODEL=llama3` (no key; local server must be running) |
@@ -70,6 +71,17 @@ Pass via `--config FILE` or by setting `LLM_PROVIDER_CONFIG="$(cat file.json)"`:
   "api_version": "2024-02-01"
 }
 ```
+
+**AWS Bedrock** (standard AWS credential chain - no `api_key` needed unless overriding)
+```json
+{
+  "vendor": "bedrock",
+  "model": "anthropic.claude-sonnet-4-20250514-v1:0",
+  "region_name": "us-east-1"
+}
+```
+
+`model` is the Bedrock model ID or inference-profile ID/ARN (e.g. `us.anthropic.claude-sonnet-4-20250514-v1:0`). Requests are sent through Bedrock's vendor-agnostic Converse API, so Anthropic, Amazon Nova, Meta Llama, and Mistral models hosted on Bedrock all work through the same code path. Credentials resolve via the standard boto3 chain (environment variables, shared config/credentials files, IAM role, SSO, ...); `api_key` maps to `aws_access_key_id` if you want to pass it explicitly, and `aws_secret_access_key` / `aws_session_token` may be set via their own environment variables. Requires `pip install boto3` (or the `birdie[bedrock]` extra).
 
 **Google Gemini**
 ```json
@@ -116,7 +128,7 @@ The `model` field is the binary name to spawn. Birdie starts it as a child proce
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `vendor` | string | `openai` | `openai` \| `azure` \| `anthropic` \| `mistral` \| `gemini` \| `ollama` \| `langchain` \| `acp` |
+| `vendor` | string | `openai` | `openai` \| `azure` \| `anthropic` \| `bedrock` \| `mistral` \| `gemini` \| `ollama` \| `langchain` \| `acp` |
 | `model` | string | provider default | Model identifier |
 | `api_key` | string | from env var | API key (omit to use env var) |
 | `base_url` | string | - | Override API endpoint (proxy, local server) |
@@ -201,8 +213,17 @@ These fields are extracted from the same JSON config before it is forwarded to t
 | `Tab` (after `/cd `) | Cycle through directory completions |
 | `Ctrl+C` (non-empty input) | Clear the current input line |
 | `Ctrl+C` (empty input, first press) | Show hint: "Press Ctrl+C again to exit" |
-| `Ctrl+C` (empty input, second press) | Exit |
+| `Ctrl+C` (empty input, second press) | Exit (prints the command that resumes this session) |
 | `Ctrl+C` (while agent is running) | Cancel the current turn and return to the prompt |
+
+On exit - Ctrl+C, Ctrl+D or `/quit` - Birdie prints the command that picks the
+session up again, repeating any options the session was started with:
+
+```
+Goodbye.
+Resume this session with:
+  birdie --session-id 2026-04-29_1 --config ~/.birdie/provider.json
+```
 
 ---
 

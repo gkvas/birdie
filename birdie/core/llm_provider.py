@@ -10,6 +10,7 @@ never touches a vendor SDK directly.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -107,7 +108,7 @@ class ProviderConfig(BaseModel):
         default="openai",
         description=(
             "LLM vendor identifier.  "
-            "Supported: openai | azure | anthropic | mistral | gemini | ollama | langchain | acp"
+            "Supported: openai | azure | anthropic | bedrock | mistral | gemini | ollama | langchain | acp"
         ),
     )
     model: Optional[str] = Field(
@@ -118,7 +119,9 @@ class ProviderConfig(BaseModel):
         default=None,
         description=(
             "API key.  Falls back to the vendor environment variable "
-            "(OPENAI_API_KEY, AZURE_OPENAI_API_KEY, ANTHROPIC_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY)."
+            "(OPENAI_API_KEY, AZURE_OPENAI_API_KEY, ANTHROPIC_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY). "
+            "For ``bedrock``, this maps to ``aws_access_key_id``; AWS credentials are otherwise "
+            "resolved via the standard boto3 credential chain."
         ),
     )
     base_url: Optional[str] = Field(
@@ -884,10 +887,32 @@ def _anthropic_response_to_lc(response: Any) -> AIMessage:
         out = getattr(response.usage, "output_tokens", 0) or 0
         usage_metadata = {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
 
+    stop_reason = getattr(response, "stop_reason", None)
+    response_metadata: dict = {}
+    if isinstance(stop_reason, str):
+        response_metadata["stop_reason"] = stop_reason
+
+    content = " ".join(text_parts)
+    # Surface max_tokens truncation instead of silently returning an empty
+    # message.  On thinking models the whole output budget can be consumed
+    # by internal reasoning, leaving no text and no tool_use blocks; the
+    # turn would otherwise end with no visible output at all.
+    if stop_reason == "max_tokens" and not tool_calls:
+        if not content.strip():
+            content = (
+                "[Truncated: the response hit the max_tokens output limit "
+                "before producing any visible output (the budget was likely "
+                "spent on internal reasoning). Raise max_tokens in the "
+                "provider config.]"
+            )
+        else:
+            content += "\n[Truncated: the response hit the max_tokens output limit.]"
+
     return AIMessage(
-        content=" ".join(text_parts),
+        content=content,
         tool_calls=tool_calls,
         usage_metadata=usage_metadata,
+        response_metadata=response_metadata,
     )
 
 
@@ -951,8 +976,29 @@ def _anthropic_accepts_temperature(model: str) -> bool:
     return not any(prefix in name for prefix in _ANTHROPIC_NO_SAMPLING_MODELS)
 
 
+def _sdk_accepts_temperature(client: Any) -> bool:
+    """
+    True when the installed anthropic SDK still exposes `temperature` on
+    `messages.create()`.  anthropic>=1.0 removed the sampling parameters
+    from the signature entirely, so passing them raises TypeError before
+    any request is sent.
+    """
+    try:
+        import inspect
+
+        return "temperature" in inspect.signature(client.messages.create).parameters
+    except (TypeError, ValueError, AttributeError):
+        return True
+
+
 def _is_temperature_rejection(exc: Exception) -> bool:
-    """True when an Anthropic API error complains about `temperature`."""
+    """
+    True when the SDK or API rejected the `temperature` parameter - either
+    an HTTP 400 ("`temperature` is deprecated for this model") or a client-side
+    TypeError from an SDK that no longer accepts the keyword.
+    """
+    if isinstance(exc, TypeError):
+        return "temperature" in str(exc).lower()
     status = getattr(exc, "status_code", None)
     if status is None:
         status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -991,12 +1037,17 @@ class AnthropicProvider(LLMProvider):
         self._async_client = _anthropic.AsyncAnthropic(api_key=key)
         self._model = model
         self._temperature = temperature
-        self._send_temperature = _anthropic_accepts_temperature(model)
+        self._send_temperature = (
+            _anthropic_accepts_temperature(model) and _sdk_accepts_temperature(self._client)
+        )
         # Place cache_control breakpoints on tools, system, and the last
         # stable message block (disable with "prompt_cache": false in config).
         self._prompt_cache = prompt_cache
-        # Anthropic requires max_tokens; use 4096 as a safe default
-        self._max_tokens = max_tokens or 4096
+        # Anthropic requires max_tokens.  16000 leaves room for models with
+        # always-on/adaptive thinking (Sonnet 5, Opus 5, Fable 5, ...), whose
+        # reasoning tokens count against max_tokens - a 4096 cap can be fully
+        # consumed by thinking, ending the turn with no visible output.
+        self._max_tokens = max_tokens or 16000
 
     def supports_tools(self) -> bool:
         return True
@@ -1174,6 +1225,338 @@ class AnthropicProvider(LLMProvider):
 
 
 # ---------------------------------------------------------------------------
+# AWS Bedrock provider (native boto3 SDK, Converse API)
+# ---------------------------------------------------------------------------
+
+def _lc_to_bedrock_messages(messages: list[BaseMessage]) -> list[dict]:
+    """
+    Convert LangChain messages to Bedrock's Converse API message format.
+
+    Key differences from OpenAI/Anthropic:
+    - SystemMessage is handled as a top-level field (extracted by caller).
+    - ToolMessages must be batched into a single "user" message as
+      ``toolResult`` content blocks.
+    - AIMessages with tool_calls emit ``toolUse`` content blocks.
+    - Every content block is ``{"text": ...}`` / ``{"toolUse": {...}}`` /
+      ``{"toolResult": {...}}`` rather than bare strings.
+    """
+    result: list[dict] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if isinstance(msg, SystemMessage):
+            i += 1  # caller extracts this separately
+        elif isinstance(msg, HumanMessage):
+            result.append({"role": "user", "content": [{"text": str(msg.content)}]})
+            i += 1
+        elif isinstance(msg, AIMessage):
+            content: list[dict] = []
+            if msg.content:
+                content.append({"text": str(msg.content)})
+            for tc in msg.tool_calls or []:
+                content.append({
+                    "toolUse": {
+                        "toolUseId": tc["id"],
+                        "name": tc["name"],
+                        "input": tc["args"],
+                    },
+                })
+            if not content:
+                content = [{"text": ""}]
+            result.append({"role": "assistant", "content": content})
+            i += 1
+        elif isinstance(msg, ToolMessage):
+            # Batch consecutive ToolMessages into one user message
+            blocks: list[dict] = []
+            while i < len(messages) and isinstance(messages[i], ToolMessage):
+                tm = messages[i]
+                content = str(tm.content)
+                if len(content) > _MAX_TOOL_CONTENT_CHARS:
+                    dropped = len(content) - _MAX_TOOL_CONTENT_CHARS
+                    content = (
+                        content[:_MAX_TOOL_CONTENT_CHARS]
+                        + f"\n[...{dropped} characters truncated]"
+                    )
+                blocks.append({
+                    "toolResult": {
+                        "toolUseId": tm.tool_call_id,
+                        "content": [{"text": content}],
+                    },
+                })
+                i += 1
+            result.append({"role": "user", "content": blocks})
+        else:
+            i += 1
+    return result
+
+
+def _bedrock_response_to_lc(response: dict) -> AIMessage:
+    """Convert a Bedrock Converse API response dict to a LangChain AIMessage."""
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+
+    message = (response.get("output") or {}).get("message") or {}
+    for block in message.get("content") or []:
+        if "text" in block:
+            text_parts.append(block["text"])
+        elif "toolUse" in block:
+            tu = block["toolUse"]
+            tool_calls.append({
+                "id": tu.get("toolUseId", ""),
+                "name": tu.get("name", ""),
+                "args": tu.get("input") or {},
+                "type": "tool_call",
+            })
+
+    usage_metadata = None
+    usage = response.get("usage")
+    if usage:
+        inp = usage.get("inputTokens", 0) or 0
+        out = usage.get("outputTokens", 0) or 0
+        usage_metadata = {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+
+    stop_reason = response.get("stopReason")
+    response_metadata: dict = {}
+    if isinstance(stop_reason, str):
+        response_metadata["stop_reason"] = stop_reason
+
+    content = " ".join(text_parts)
+    # Surface max_tokens truncation instead of silently returning an empty
+    # message (mirrors _anthropic_response_to_lc): on thinking models the
+    # whole output budget can be consumed by internal reasoning, leaving
+    # no text and no toolUse blocks.
+    if stop_reason == "max_tokens" and not tool_calls:
+        if not content.strip():
+            content = (
+                "[Truncated: the response hit the max_tokens output limit "
+                "before producing any visible output (the budget was likely "
+                "spent on internal reasoning). Raise max_tokens in the "
+                "provider config.]"
+            )
+        else:
+            content += "\n[Truncated: the response hit the max_tokens output limit.]"
+
+    return AIMessage(
+        content=content,
+        tool_calls=tool_calls,
+        usage_metadata=usage_metadata,
+        response_metadata=response_metadata,
+    )
+
+
+def _tools_to_bedrock(tools: list[NormalizedToolDef]) -> dict:
+    return {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "inputSchema": {"json": t["parameters"]},
+                },
+            }
+            for t in tools
+        ]
+    }
+
+
+class BedrockProvider(LLMProvider):
+    """
+    AWS Bedrock via the official boto3 SDK, using the vendor-agnostic
+    Converse API (supports Anthropic, Meta Llama, Amazon Nova, Mistral, and
+    other Bedrock-hosted model families through a single wire format).
+
+    Install: pip install boto3
+
+    Authentication follows the standard AWS credential chain (environment
+    variables, shared config/credentials files, IAM role, SSO, ...).
+    ``api_key``/``aws_access_key_id``/``aws_secret_access_key``/
+    ``aws_session_token`` may be supplied explicitly; otherwise boto3
+    resolves credentials automatically.
+
+    ``model`` is the Bedrock model ID or inference-profile ID/ARN, e.g.
+    ``anthropic.claude-sonnet-4-20250514-v1:0`` or
+    ``us.anthropic.claude-sonnet-4-20250514-v1:0``.
+
+    ``region_name`` defaults to ``AWS_REGION`` / ``AWS_DEFAULT_REGION`` (or
+    boto3's own resolution) when omitted.
+    """
+
+    def __init__(
+        self,
+        model: str = "anthropic.claude-sonnet-4-20250514-v1:0",
+        api_key: str | None = None,
+        region_name: str | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        try:
+            import boto3
+        except ImportError as e:
+            raise ImportError("pip install boto3") from e
+
+        session_kw: dict[str, Any] = {}
+        resolved_key = aws_access_key_id or api_key or os.environ.get("AWS_ACCESS_KEY_ID")
+        resolved_secret = aws_secret_access_key or os.environ.get("AWS_SECRET_ACCESS_KEY")
+        resolved_token = aws_session_token or os.environ.get("AWS_SESSION_TOKEN")
+        if resolved_key:
+            session_kw["aws_access_key_id"] = resolved_key
+        if resolved_secret:
+            session_kw["aws_secret_access_key"] = resolved_secret
+        if resolved_token:
+            session_kw["aws_session_token"] = resolved_token
+        resolved_region = (
+            region_name
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+        )
+        if resolved_region:
+            session_kw["region_name"] = resolved_region
+
+        self._client = boto3.client("bedrock-runtime", **session_kw)
+        self._model = model
+        self._temperature = temperature
+        # 16000 leaves room for models with always-on/adaptive thinking,
+        # whose reasoning tokens count against max_tokens - a 4096 cap can
+        # be fully consumed by thinking, ending the turn with no visible
+        # output (same rationale as AnthropicProvider).
+        self._max_tokens = max_tokens or 16000
+
+    def supports_tools(self) -> bool:
+        return True
+
+    def supports_streaming(self) -> bool:
+        return True
+
+    def supports_json_mode(self) -> bool:
+        # Bedrock's Converse API has no dedicated JSON mode; callers
+        # instruct via system prompt.
+        return False
+
+    def _build_kwargs(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None,
+        system_prompt: str | None,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> dict:
+        resolved_system = system_prompt
+        if not resolved_system:
+            system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+            if system_msgs:
+                resolved_system = str(system_msgs[-1].content)
+
+        non_system = [m for m in messages if not isinstance(m, SystemMessage)]
+        kw: dict[str, Any] = {
+            "modelId": self._model,
+            "messages": _lc_to_bedrock_messages(non_system),
+            "inferenceConfig": {
+                "maxTokens": max_tokens if max_tokens is not None else self._max_tokens,
+                "temperature": temperature if temperature is not None else self._temperature,
+            },
+        }
+        if resolved_system:
+            kw["system"] = [{"text": resolved_system}]
+        if tools:
+            kw["toolConfig"] = _tools_to_bedrock(tools)
+        return kw
+
+    def chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        json_mode: bool = False,
+        **kwargs: Any,
+    ) -> BaseMessage:
+        kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens)
+        self._log_request(messages, tools, system_prompt)
+        response = self._client.converse(**kw)
+        result = _bedrock_response_to_lc(response)
+        self._log_response(result)
+        return result
+
+    async def achat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        json_mode: bool = False,
+        **kwargs: Any,
+    ) -> BaseMessage:
+        # boto3 has no native async client; offload the blocking call so
+        # the event loop keeps making progress.
+        kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens)
+        self._log_request(messages, tools, system_prompt)
+        response = await asyncio.to_thread(self._client.converse, **kw)
+        result = _bedrock_response_to_lc(response)
+        self._log_response(result)
+        return result
+
+    def stream_chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> Iterator[BaseMessage]:
+        kw = self._build_kwargs(messages, tools, system_prompt, kwargs.pop("temperature", 0.0), None)
+        response = self._client.converse_stream(**kw)
+        for event in response["stream"]:
+            delta = event.get("contentBlockDelta", {}).get("delta") if isinstance(event, dict) else None
+            if delta and "text" in delta:
+                yield AIMessageChunk(content=delta["text"])
+
+    async def astream_chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[BaseMessage]:
+        kw = self._build_kwargs(messages, tools, system_prompt, kwargs.pop("temperature", 0.0), None)
+        response = await asyncio.to_thread(self._client.converse_stream, **kw)
+        for event in response["stream"]:
+            delta = event.get("contentBlockDelta", {}).get("delta") if isinstance(event, dict) else None
+            if delta and "text" in delta:
+                yield AIMessageChunk(content=delta["text"])
+
+    def list_models(self) -> list[ModelInfo]:
+        # Cached catalog of common Bedrock foundation models (2026-07).
+        # Bedrock model availability is region- and account-dependent, so
+        # this is a representative subset rather than a live query.
+        _KNOWN = {
+            "anthropic.claude-sonnet-4-20250514-v1:0":  {"context_window": 1_000_000},
+            "anthropic.claude-opus-4-20250514-v1:0":    {"context_window": 200_000},
+            "anthropic.claude-3-5-sonnet-20241022-v2:0":{"context_window": 200_000},
+            "anthropic.claude-3-5-haiku-20241022-v1:0": {"context_window": 200_000},
+            "amazon.nova-pro-v1:0":                     {"context_window": 300_000},
+            "amazon.nova-lite-v1:0":                    {"context_window": 300_000},
+            "amazon.nova-micro-v1:0":                   {"context_window": 128_000},
+            "meta.llama3-1-70b-instruct-v1:0":          {"context_window": 128_000},
+            "mistral.mistral-large-2407-v1:0":          {"context_window": 128_000},
+        }
+        return [
+            ModelInfo(
+                id=k,
+                supports_tools=True,
+                supports_streaming=True,
+                supports_json_mode=False,
+                **v,
+            )
+            for k, v in _KNOWN.items()
+        ]
+
+
+# ---------------------------------------------------------------------------
 # LangChain adapter (wraps any BaseChatModel)
 # ---------------------------------------------------------------------------
 
@@ -1333,7 +1716,8 @@ class ACPProvider(LLMProvider):
       3. session/prompt - send user message, receive streaming updates + final response
 
     The provider also handles incoming requests from the agent:
-      - session/request_permission -> auto-allow
+      - session/request_permission -> routed through ``permission_callback``
+        when set (see :meth:`_permission_outcome`), otherwise auto-allowed
       - fs/read_text_file / fs/write_text_file -> perform local I/O
       - terminal/create -> run the command and return output
 
@@ -1358,6 +1742,13 @@ class ACPProvider(LLMProvider):
     ) -> None:
         self._command = [command] if isinstance(command, str) else list(command)
         self._cwd = cwd or os.getcwd()
+        # Optional observer for tool_call / tool_call_update session updates.
+        # Set by the CLI so the agent's tool activity can be rendered live.
+        self.tool_event_callback: Any | None = None
+        # Optional gate for session/request_permission.  Receives a normalized
+        # request dict and returns "allow", "allow_always" or "deny" (may be a
+        # coroutine on the async paths).  When None, requests are auto-allowed.
+        self.permission_callback: Any | None = None
 
     def supports_tools(self) -> bool:
         return True
@@ -1367,6 +1758,12 @@ class ACPProvider(LLMProvider):
 
     def supports_json_mode(self) -> bool:
         return False
+
+    def _capture_model(self, session_result: dict) -> None:
+        """Remember the agent's active model from a session/new response."""
+        model_id = (session_result.get("models") or {}).get("currentModelId")
+        if model_id:
+            self._model = model_id
 
     # -- MCP bridge ---------------------------------------------------------
 
@@ -1462,6 +1859,118 @@ class ACPProvider(LLMProvider):
             return content.get("text") or None
         return None
 
+    def _extract_tool_event(self, params: dict) -> dict | None:
+        """Normalize a tool_call / tool_call_update session/update notification.
+
+        Returns a dict with keys: event ("tool_call" or "tool_call_update"),
+        id, title, kind, status, raw_input, output - or None for other updates.
+        """
+        update = params.get("update", {})
+        event = update.get("sessionUpdate")
+        if event not in ("tool_call", "tool_call_update"):
+            return None
+        texts: list[str] = []
+        for item in update.get("content") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "content":
+                block = item.get("content", {})
+                if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                    texts.append(block["text"])
+            elif item.get("type") == "diff":
+                texts.append(f"[diff] {item.get('path', '')}")
+        return {
+            "event": event,
+            "id": update.get("toolCallId", ""),
+            "title": update.get("title"),
+            "kind": update.get("kind"),
+            "status": update.get("status"),
+            "raw_input": update.get("rawInput"),
+            "output": "\n".join(texts),
+        }
+
+    def _emit_tool_event(self, params: dict) -> None:
+        """Invoke tool_event_callback for tool-related session updates, if set."""
+        if self.tool_event_callback is None:
+            return
+        event = self._extract_tool_event(params)
+        if event is None:
+            return
+        try:
+            self.tool_event_callback(event)
+        except Exception:
+            log.debug("tool_event_callback raised", exc_info=True)
+
+    def _normalize_permission_request(self, params: dict) -> dict:
+        """Flatten a session/request_permission payload for permission_callback."""
+        tool_call = params.get("toolCall") or {}
+        return {
+            "title": tool_call.get("title"),
+            "kind": tool_call.get("kind"),
+            "raw_input": tool_call.get("rawInput"),
+            "options": [
+                {"id": o.get("optionId"), "name": o.get("name"), "kind": o.get("kind")}
+                for o in params.get("options") or []
+                if isinstance(o, dict)
+            ],
+        }
+
+    def _permission_outcome(self, params: dict, decision: Any) -> dict:
+        """Map an allow/allow_always/deny decision onto the offered options.
+
+        Selects the first option whose ACP kind matches the decision, falling
+        back to the plain "allow"/"reject" optionIds when the agent offered no
+        options (as the previous hard-coded auto-allow did).
+        """
+        if decision == "allow_always":
+            kinds, fallback = ("allow_always", "allow_once"), "allow"
+        elif decision in ("allow", True):
+            kinds, fallback = ("allow_once", "allow_always"), "allow"
+        else:
+            kinds, fallback = ("reject_once", "reject_always"), "reject"
+        options = [o for o in params.get("options") or [] if isinstance(o, dict)]
+        for kind in kinds:
+            for option in options:
+                if option.get("kind") == kind:
+                    return {"outcome": {"outcome": "selected", "optionId": option.get("optionId")}}
+        return {"outcome": {"outcome": "selected", "optionId": fallback}}
+
+    def _extract_usage(self, params: dict) -> dict | None:
+        """Normalize a usage_update session/update notification.
+
+        Returns a dict with any of the keys ``used`` (tokens in context),
+        ``size`` (context window) and ``cost`` ({amount, currency}) that the
+        agent reported, or None for other update types.
+        """
+        update = params.get("update", {})
+        if update.get("sessionUpdate") != "usage_update":
+            return None
+        usage = {k: update[k] for k in ("used", "size") if update.get(k) is not None}
+        cost = update.get("cost")
+        if isinstance(cost, dict) and cost.get("amount") is not None:
+            usage["cost"] = cost
+        return usage
+
+    def _build_ai_message(self, text: str, usage: dict | None) -> AIMessage:
+        """Build the final turn message, attaching agent-reported usage if any.
+
+        ACP reports context tokens in use rather than an input/output split,
+        so ``used`` maps to input_tokens and output_tokens stays 0.
+        """
+        if not usage:
+            return AIMessage(content=text)
+        used = int(usage.get("used") or 0)
+        response_metadata: dict = {}
+        if usage.get("size") is not None:
+            response_metadata["context_window"] = usage["size"]
+        if usage.get("cost") is not None:
+            response_metadata["cost"] = usage["cost"]
+        return AIMessage(
+            content=text,
+            usage_metadata={"input_tokens": used, "output_tokens": 0, "total_tokens": used},
+            response_metadata=response_metadata,
+        )
+
     # -- sync low-level -----------------------------------------------------
 
     def _sync_send(self, stdin: Any, msg: dict) -> None:
@@ -1486,9 +1995,16 @@ class ACPProvider(LLMProvider):
             return
 
         if method == "session/request_permission":
+            decision: Any = "allow"
+            if self.permission_callback is not None:
+                try:
+                    decision = self.permission_callback(self._normalize_permission_request(params))
+                except Exception:
+                    log.debug("permission_callback raised; denying", exc_info=True)
+                    decision = "deny"
             self._sync_send(stdin, {
                 "jsonrpc": "2.0", "id": req_id,
-                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}},
+                "result": self._permission_outcome(params, decision),
             })
 
         elif method == "fs/read_text_file":
@@ -1562,7 +2078,9 @@ class ACPProvider(LLMProvider):
                 "params": session_params,
             })
             session_resp = self._sync_recv(proc.stdout)
-            session_id = session_resp.get("result", {}).get("sessionId", "")
+            session_result = session_resp.get("result", {})
+            session_id = session_result.get("sessionId", "")
+            self._capture_model(session_result)
 
             # Phase 3: session/prompt
             self._sync_send(proc.stdin, {
@@ -1574,16 +2092,24 @@ class ACPProvider(LLMProvider):
             })
 
             text_parts: list[str] = []
+            usage: dict | None = None
             while True:
                 msg = self._sync_recv(proc.stdout)
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
-                    return AIMessage(content="".join(text_parts))
+                    return self._build_ai_message("".join(text_parts), usage)
                 if "id" in msg and "method" in msg:
                     self._sync_handle_agent_request(proc.stdin, msg, mcp_mode=mcp_mode)
                 elif "method" in msg and "id" not in msg:
-                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    params = msg.get("params", {})
+                    chunk = self._extract_chunk_text(params)
                     if chunk:
                         text_parts.append(chunk)
+                        continue
+                    update = self._extract_usage(params)
+                    if update is not None:
+                        usage = {**(usage or {}), **update}
+                    else:
+                        self._emit_tool_event(params)
         finally:
             try:
                 proc.stdin.close()
@@ -1640,9 +2166,18 @@ class ACPProvider(LLMProvider):
             return
 
         if method == "session/request_permission":
+            decision: Any = "allow"
+            if self.permission_callback is not None:
+                try:
+                    decision = self.permission_callback(self._normalize_permission_request(params))
+                    if inspect.isawaitable(decision):
+                        decision = await decision
+                except Exception:
+                    log.debug("permission_callback raised; denying", exc_info=True)
+                    decision = "deny"
             await self._async_send(stdin, {
                 "jsonrpc": "2.0", "id": req_id,
-                "result": {"outcome": {"outcome": "selected", "optionId": "allow"}},
+                "result": self._permission_outcome(params, decision),
             })
 
         elif method == "fs/read_text_file":
@@ -1703,7 +2238,9 @@ class ACPProvider(LLMProvider):
             "params": session_params,
         })
         session_resp = await self._async_recv(proc.stdout, timeout=30, buf=buf)
-        return session_resp.get("result", {}).get("sessionId", "")
+        session_result = session_resp.get("result", {})
+        self._capture_model(session_result)
+        return session_result.get("sessionId", "")
 
     async def achat(
         self,
@@ -1737,18 +2274,26 @@ class ACPProvider(LLMProvider):
             })
 
             text_parts: list[str] = []
+            usage: dict | None = None
             while True:
                 msg = await self._async_recv(proc.stdout, buf=buf)
                 if "id" in msg and msg.get("id") == 2 and "result" in msg:
-                    result = AIMessage(content="".join(text_parts))
+                    result = self._build_ai_message("".join(text_parts), usage)
                     log.debug("RESPONSE  acp=%s\n  content: %s", self._command[0], result.content[:2000])
                     return result
                 if "id" in msg and "method" in msg:
                     await self._async_handle_agent_request(proc.stdin, msg, mcp_mode=mcp_mode)
                 elif "method" in msg and "id" not in msg:
-                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    params = msg.get("params", {})
+                    chunk = self._extract_chunk_text(params)
                     if chunk:
                         text_parts.append(chunk)
+                        continue
+                    update = self._extract_usage(params)
+                    if update is not None:
+                        usage = {**(usage or {}), **update}
+                    else:
+                        self._emit_tool_event(params)
         finally:
             proc.stdin.close()
             await proc.wait()
@@ -1836,9 +2381,12 @@ class ACPProvider(LLMProvider):
                     else:
                         await self._async_handle_agent_request(proc.stdin, msg)
                 elif "method" in msg and "id" not in msg:
-                    chunk = self._extract_chunk_text(msg.get("params", {}))
+                    params = msg.get("params", {})
+                    chunk = self._extract_chunk_text(params)
                     if chunk:
                         yield AIMessageChunk(content=chunk)
+                    else:
+                        self._emit_tool_event(params)
         finally:
             proc.stdin.close()
             await proc.wait()
@@ -2058,6 +2606,13 @@ def get_llm_provider(
         if cfg.max_tokens: kw["max_tokens"] = cfg.max_tokens
         return MistralProvider(**kw, **extra_kw)
 
+    if vendor == "bedrock":
+        kw = {"temperature": cfg.temperature}
+        if cfg.model:      kw["model"]     = cfg.model
+        if cfg.api_key:    kw["api_key"]   = cfg.api_key
+        if cfg.max_tokens: kw["max_tokens"] = cfg.max_tokens
+        return BedrockProvider(**kw, **extra_kw)
+
     if vendor == "azure":
         kw = {"temperature": cfg.temperature}
         if cfg.model:      kw["model"]     = cfg.model
@@ -2100,7 +2655,7 @@ def get_llm_provider(
 
     raise ValueError(
         f"Unknown vendor '{vendor}'. "
-        "Supported: openai, azure, anthropic, mistral, gemini, ollama, langchain, acp"
+        "Supported: openai, azure, anthropic, bedrock, mistral, gemini, ollama, langchain, acp"
     )
 
 

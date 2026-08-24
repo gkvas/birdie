@@ -18,11 +18,13 @@ import asyncio
 import json
 import logging
 import os
+import shlex
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 
@@ -39,9 +41,10 @@ from rich.console import Console
 
 from .agent.graph import MAX_TOOL_OUTPUT_CAP
 from .agent.run import DynamicAgent
-from .core.errors import BirdieRateLimitError
+from .core.errors import BirdieProviderUnavailableError, BirdieRateLimitError
 from .core.models import Skill
 from .core.session import Session, SessionManager, UserMemory
+from .core.shell_session import peek_default_session
 
 
 PROMPT_STYLE = Style.from_dict({
@@ -52,6 +55,8 @@ PROMPT_STYLE = Style.from_dict({
 HELP_TEXT = """
 [bold cyan]Birdie CLI - available slash commands[/bold cyan]
 
+  Supported vendors: openai, anthropic, bedrock, mistral, gemini, ollama, acp, langchain
+
   [yellow]/help[/yellow]                         Show this help
   [yellow]/quit[/yellow]  [yellow]/exit[/yellow]                 Exit the session
   [yellow]/new[/yellow]                          Start a fresh conversation (new thread)
@@ -59,7 +64,7 @@ HELP_TEXT = """
   [yellow]/remember <text>[/yellow]              Save a note to long-term memory
   [yellow]/compact[/yellow]                      Force-compact conversation history into LTM now
   [yellow]/cost[/yellow]                         Show token usage and estimated cost for this session
-  [yellow]/history \[N][/yellow]                  Show the last N messages of this session (default 10)
+  [yellow]/history [N][/yellow]                  Show the last N messages of this session (default 10)
   [yellow]/info[/yellow]                         Show session info (user, session, provider)
 
   [bold]Tool commands[/bold]
@@ -102,6 +107,66 @@ HELP_TEXT = """
 _TOOL_OUTPUT_MODES = ("full", "short", "off")
 _AGENT_OUTPUT_MODES = ("full", "short", "off")
 
+# The status bar re-renders on every keystroke, so git state is cached
+# and refreshed at most once per TTL (see BirdieCLI._git_segment).
+_GIT_TTL_SECONDS = 3.0
+
+
+def _format_git_segment(porcelain: str) -> str:
+    """Format ``git status --porcelain=v2 --branch`` output for the toolbar.
+
+    Returns e.g. ``⎇ main``, ``⎇ main*`` (dirty), ``⎇ main* ↑2↓1``
+    (ahead/behind upstream), ``⎇ (3f2c1ab)`` (detached HEAD), or ``""``
+    when the output carries no branch information.
+    """
+    branch = ""
+    oid = ""
+    ahead = behind = 0
+    dirty = False
+    for line in porcelain.splitlines():
+        if line.startswith("# branch.head "):
+            branch = line[len("# branch.head "):]
+        elif line.startswith("# branch.oid "):
+            oid = line[len("# branch.oid "):]
+        elif line.startswith("# branch.ab "):
+            for part in line[len("# branch.ab "):].split():
+                if part.startswith("+"):
+                    ahead = int(part[1:])
+                elif part.startswith("-"):
+                    behind = int(part[1:])
+        elif not line.startswith("#"):
+            # Any non-header line is a changed/untracked/unmerged entry.
+            dirty = True
+    if branch == "(detached)":
+        branch = f"({oid[:7]})" if oid and oid != "(initial)" else "(detached)"
+    if not branch:
+        return ""
+    segment = f"⎇ {branch}"
+    if dirty:
+        segment += "*"
+    arrows = (f"↑{ahead}" if ahead else "") + (f"↓{behind}" if behind else "")
+    if arrows:
+        segment += f" {arrows}"
+    return segment
+
+
+def _read_git_status(cwd: str) -> str:
+    """Return the git toolbar segment for *cwd*, or ``""`` outside a repo.
+
+    Never raises: a missing git binary, a non-repo directory, or a slow
+    filesystem (1 s timeout) all degrade to an empty segment.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "--no-optional-locks", "status",
+             "--porcelain=v2", "--branch"],
+            cwd=cwd, capture_output=True, text=True, timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return _format_git_segment(proc.stdout)
 
 
 class BirdieCLI:
@@ -113,6 +178,8 @@ class BirdieCLI:
         user_id: str,
         user_memory: UserMemory,
         console: Optional[Console] = None,
+        debug: bool = False,
+        resume_flags: Optional[List[str]] = None,
     ) -> None:
         self.agent = agent
         self.session_manager = session_manager
@@ -120,10 +187,18 @@ class BirdieCLI:
         self.user_id = user_id
         self.user_memory = user_memory
         self.console = console or Console()
+        # Full tracebacks for turn errors: --debug flag or BIRDIE_DEBUG=1.
+        self._debug = (
+            debug or os.environ.get("BIRDIE_DEBUG", "") not in ("", "0")
+        )
+        # Extra flags (already shell-quoted) needed to reproduce this
+        # invocation when resuming, e.g. ["--config", "~/prov.json"].
+        self._resume_flags: List[str] = list(resume_flags or [])
 
         self._total_in: int = 0
         self._total_out: int = 0
         self._last_context: int = 0
+        self._context_window: int = 0
         self._tool_output_mode: str = "short"
         self._agent_output_mode: str = "off"
         self._tool_output_cap: int = agent._tool_output_cap
@@ -141,6 +216,8 @@ class BirdieCLI:
         self._ctrl_c_warned: bool = False
         # State for /cd Tab cycling
         self._cd_cycle: dict = {"completions": [], "index": -1, "path": None}
+        # TTL cache for the toolbar's git segment, keyed on cwd
+        self._git_cache: dict = {"cwd": None, "at": 0.0, "text": ""}
 
         kb = KeyBindings()
 
@@ -261,6 +338,42 @@ class BirdieCLI:
             return "allow"
         return "deny"
 
+    async def _approve_acp_permission(self, request: dict) -> str:
+        """Interactive gate for ACP session/request_permission requests."""
+        always_opt = next(
+            (o for o in request.get("options", []) if o.get("kind") == "allow_always"),
+            None,
+        )
+        always_key = (always_opt or {}).get("name") or request.get("title") or ""
+        if always_key and always_key in self.session.approved_acp_tools:
+            return "allow_always"
+
+        status = self._active_status
+        if status is not None:
+            status.stop()
+        try:
+            title = request.get("title") or "unknown tool"
+            raw = request.get("raw_input")
+            self.console.print(
+                f"[yellow]ACP agent requests permission:[/yellow] [bold]{title}[/bold]"
+                + (f"\n[dim]{raw}[/dim]" if raw else "")
+            )
+            answer = (await asyncio.to_thread(
+                input, "Allow? [y]es once / [a]lways this session / [N]o: "
+            )).strip().lower()
+        finally:
+            if status is not None:
+                status.start()
+
+        if answer in ("a", "always"):
+            if always_key and always_key not in self.session.approved_acp_tools:
+                self.session.approved_acp_tools.append(always_key)
+                self.session_manager.save(self.session)
+            return "allow_always"
+        if answer in ("y", "yes"):
+            return "allow"
+        return "deny"
+
     def _get_prompt(self):
         if self._ctrl_c_warned:
             return [
@@ -352,24 +465,58 @@ class BirdieCLI:
 
     # -- status toolbar -------------------------------------------------------
 
+    def _git_segment(self) -> str:
+        """Return the cached git status segment for the current directory."""
+        cwd = str(Path.cwd())
+        now = time.monotonic()
+        cache = self._git_cache
+        if cache["cwd"] != cwd or now - cache["at"] >= _GIT_TTL_SECONDS:
+            cache.update(cwd=cwd, at=now, text=_read_git_status(cwd))
+        return cache["text"]
+
     def _get_toolbar(self) -> HTML:
-        """Render the bottom status bar for prompt_toolkit."""
+        """Render the bottom status bar for prompt_toolkit.
+
+        Left side: provider, cwd, session, and token info.  Right side:
+        git status, padded flush-right when the terminal is wide enough,
+        otherwise appended as a regular segment.
+        """
         vendor = self.agent.provider.vendor_name
         model  = self.agent.provider.model_name
         ctx    = f"{self._last_context:,}" if self._last_context else "-"
+        if self._context_window and self._last_context:
+            ctx = f"{ctx}/{self._context_window:,}"
         spent  = f"↑{self._total_in:,}  ↓{self._total_out:,}"
         try:
             cwd = Path.cwd().relative_to(Path.home())
             cwd_str = f"~/{cwd}"
         except ValueError:
             cwd_str = str(Path.cwd())
-        return HTML(
-            f" <b>{vendor}</b> · {model}"
+        rest = (
+            f" · {model}"
             f"   │   {cwd_str}"
             f"   │   session: {self.session.id}"
             f"   │   ctx: {ctx} tok"
             f"   │   spent: {spent} tok"
         )
+        left_html = f" <b>{vendor}</b>{rest}"
+        git = self._git_segment()
+        if not git:
+            return HTML(left_html)
+        # Branch names may contain characters with meaning in PT's HTML.
+        git_html = (
+            git.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        )
+        try:
+            from prompt_toolkit.application import get_app
+            width = get_app().output.get_size().columns
+        except Exception:
+            width = 0
+        left_len = len(f" {vendor}{rest}")
+        pad = width - left_len - len(git) - 1
+        if pad >= 3:
+            return HTML(left_html + " " * pad + git_html + " ")
+        return HTML(f"{left_html}   │   {git_html}")
 
     # -- display helpers ------------------------------------------------------
 
@@ -392,6 +539,24 @@ class BirdieCLI:
             f"agents: [yellow]{agent_count}[/yellow]"
         )
         self.console.print("[dim]Type /help for commands, /quit to exit.[/dim]")
+
+    def _resume_command(self) -> str:
+        """Return the shell command that resumes the active session."""
+        parts = ["birdie", "--session-id", shlex.quote(self.session.id)]
+        parts.extend(self._resume_flags)
+        return " ".join(parts)
+
+    def _print_goodbye(self) -> None:
+        """Say goodbye, and show how to pick this session up again."""
+        self.console.print("[dim]Goodbye.[/dim]")
+        self.console.print("[dim]Resume this session with:[/dim]")
+        # soft_wrap keeps the command on one line so it survives a
+        # copy-paste out of the terminal.
+        self.console.print(
+            f"  [cyan]{self._resume_command()}[/cyan]",
+            highlight=False,
+            soft_wrap=True,
+        )
 
     def _show_help(self) -> None:
         """Print the slash-command reference."""
@@ -444,6 +609,13 @@ class BirdieCLI:
         model = self.agent.provider.model_name
         s_in = self.session.total_input_tokens
         s_out = self.session.total_output_tokens
+        if self.session.total_cost_usd:
+            self.console.print(
+                f"  [dim]model:[/dim]    {model}\n"
+                f"  [dim]session:[/dim]  ↑{s_in:,} in  ↓{s_out:,} out tokens\n"
+                f"  [dim]cost:[/dim]     ${self.session.total_cost_usd:.4f} (reported by agent)"
+            )
+            return
         cost = estimate_cost(model, s_in, s_out)
         cost_str = f"${cost:.4f}" if cost is not None else "unknown (no pricing data)"
         self.console.print(
@@ -470,8 +642,25 @@ class BirdieCLI:
             f"  [dim]provider:[/dim] {vendor}"
         )
 
+    def _report_turn_error(self, exc: BaseException) -> None:
+        """Log the traceback; print it only in debug mode.
+
+        A 200-line traceback for a dropped connection buries the one line
+        the user needs.  The full trace always goes to the ``birdie`` logger
+        so it is recoverable when logging is on.
+        """
+        logging.getLogger("birdie").debug("turn failed", exc_info=exc)
+        if self._debug:
+            self.console.print_exception(show_locals=False)
+        else:
+            self.console.print(
+                "[dim](run with --debug or BIRDIE_DEBUG=1 for the traceback)[/dim]"
+            )
+
     def _render_tool_output(self, name: str, content: str) -> None:
         """Render tool output according to the current _tool_output_mode."""
+        from rich.markup import escape
+
         lines = content.splitlines() or [""]
         n = len(lines)
 
@@ -490,12 +679,68 @@ class BirdieCLI:
             remaining = 0
 
         for line in display_lines:
-            self.console.print(f"[dim]   {line}[/dim]", highlight=False)
+            # escape: tool output is data, and Rich otherwise eats anything
+            # that looks like a markup tag (the "[stderr]" label, "[ok]"...).
+            self.console.print(
+                f"[dim]   {escape(line)}[/dim]", highlight=False
+            )
         if remaining > 0:
             self.console.print(
                 f"[dim]   ... {remaining} more character{'s' if remaining != 1 else ''}[/dim]"
             )
         self.console.print()
+
+    def _make_acp_tool_renderer(self, status):
+        """Build a callback that renders ACP tool_call session updates live.
+
+        ACP providers execute tools inside the agent subprocess, so the
+        graph's tools node never runs.  This callback mirrors the native
+        rendering: a bold header when a call starts, dim output when it
+        completes (respecting the /tool output mode).
+        """
+        from rich.markup import escape
+
+        titles: dict[str, str] = {}
+        announced_input: set[str] = set()
+        finished: set[str] = set()
+
+        def _render(event: dict) -> None:
+            tool_id = event.get("id", "")
+            if event["event"] == "tool_call":
+                title = event.get("title") or event.get("kind") or "tool"
+                titles[tool_id] = title
+                self.console.print(
+                    f"🐦 [bold]{escape(title)}[/bold]", highlight=False
+                )
+                status.update("[dim]running tools…[/dim]")
+
+            # The call arguments often arrive only in a later update
+            # (e.g. claude-agent-acp sends tool_call with empty rawInput).
+            raw = event.get("raw_input")
+            if isinstance(raw, dict) and raw and tool_id not in announced_input:
+                announced_input.add(tool_id)
+                cmd = raw.get("command")
+                if cmd:
+                    line = f"$ {cmd}"
+                    desc = raw.get("description")
+                    if desc:
+                        line += f"  ({desc})"
+                else:
+                    line = ", ".join(f"{k}={v!r}" for k, v in raw.items())
+                self.console.print(
+                    f"   [dim]{escape(line)}[/dim]", highlight=False
+                )
+
+            if event.get("status") in ("completed", "failed") and tool_id not in finished:
+                finished.add(tool_id)
+                if event.get("status") == "failed":
+                    self.console.print("[red]   ✗ failed[/red]")
+                output = event.get("output") or ""
+                if output:
+                    self._render_tool_output(titles.get(tool_id, "tool"), output)
+                status.update("[dim]thinking…[/dim]")
+
+        return _render
 
     # -- logging --------------------------------------------------------------
 
@@ -901,7 +1146,7 @@ class BirdieCLI:
         arg = parts[1] if len(parts) > 1 else ""
 
         if cmd in ("/quit", "/exit"):
-            self.console.print("[dim]Goodbye.[/dim]")
+            self._print_goodbye()
             sys.exit(0)
 
         elif cmd == "/help":
@@ -1004,6 +1249,14 @@ class BirdieCLI:
         status.start()
         self._active_status = status
 
+        provider = self.agent.provider
+        has_tool_events = hasattr(provider, "tool_event_callback")
+        if has_tool_events:
+            provider.tool_event_callback = self._make_acp_tool_renderer(status)
+        has_permission_gate = hasattr(provider, "permission_callback")
+        if has_permission_gate:
+            provider.permission_callback = self._approve_acp_permission
+
         try:
             async for update in self.agent.astream(
                 message,
@@ -1027,6 +1280,15 @@ class BirdieCLI:
                                     pass  # transcript already printed by the tool
                                 else:
                                     self._render_tool_output(name, str(msg.content))
+                            elif isinstance(msg, AIMessage) and msg.content:
+                                # The tools node ended the turn itself
+                                # (loop guard): show its final message.
+                                status.stop()
+                                for i, line in enumerate(str(msg.content).splitlines()):
+                                    prefix = "🐦 " if i == 0 else "   "
+                                    self.console.print(f"{prefix}{line}", highlight=False)
+                                self.console.print()
+                                printed_any = True
                         status.update("[dim]thinking…[/dim]")
 
                     elif node_name == "agent":
@@ -1039,6 +1301,12 @@ class BirdieCLI:
                                     self._total_out += um.get("output_tokens", 0)
                                     self.session.total_input_tokens += um.get("input_tokens", 0)
                                     self.session.total_output_tokens += um.get("output_tokens", 0)
+                                rm = getattr(msg, "response_metadata", None) or {}
+                                if rm.get("context_window"):
+                                    self._context_window = rm["context_window"]
+                                rm_cost = rm.get("cost")
+                                if isinstance(rm_cost, dict) and rm_cost.get("amount"):
+                                    self.session.total_cost_usd += float(rm_cost["amount"])
                                 for tc in getattr(msg, "tool_calls", []):
                                     args_str = ", ".join(
                                         f"{k}={v!r}" for k, v in tc["args"].items()
@@ -1063,6 +1331,10 @@ class BirdieCLI:
                                     self.console.print()
                                     printed_any = True
         finally:
+            if has_tool_events:
+                provider.tool_event_callback = None
+            if has_permission_gate:
+                provider.permission_callback = None
             status.stop()
             self._active_status = None
 
@@ -1075,6 +1347,93 @@ class BirdieCLI:
         self.session_manager.save(self.session)
 
     # -- main loop ------------------------------------------------------------
+
+    async def run_non_interactive(self, prompt: str) -> None:
+        """Run a single non-interactive turn and print the AI response to stdout."""
+        from langchain_core.messages import AIMessage, ToolMessage
+        
+        # Non-interactive mode: clean output to stdout, no interactive elements
+        
+        ltm = self.user_memory.as_strings()
+        
+        try:
+            # Collect all output parts (AI messages and tool calls)
+            output_parts = []
+            
+            async for update in self.agent.astream(
+                prompt,
+                thread_id=self.session.id,
+                user_id=self.user_id,
+                long_term_memory=ltm if ltm else None,
+                config={"configurable": {"tool_output_cap": self._tool_output_cap}},
+            ):
+                for node_name, node_output in update.items():
+                    msgs = node_output.get("messages", [])
+                    
+                    if node_name == "tools":
+                        for msg in msgs:
+                            if isinstance(msg, ToolMessage):
+                                name = msg.name or ""
+                                # Check if this is a sub-agent (they print their own transcript)
+                                is_agent = self.agent.agent_registry.get_agent(name) is not None
+                                if not is_agent:  # Regular skill tool - include in output
+                                    content = str(msg.content) if msg.content else ""
+                                    if content:
+                                        output_parts.append(f"🐦 {name}: {content}")
+                            elif isinstance(msg, AIMessage) and msg.content:
+                                # Turn ended by the tools node (loop guard).
+                                output_parts.append(str(msg.content))
+                    
+                    elif node_name == "agent":
+                        for msg in msgs:
+                            if isinstance(msg, AIMessage):
+                                # Update token usage tracking
+                                um = getattr(msg, "usage_metadata", None)
+                                if um:
+                                    self._last_context = um.get("input_tokens", 0)
+                                    self._total_in += um.get("input_tokens", 0)
+                                    self._total_out += um.get("output_tokens", 0)
+                                    self.session.total_input_tokens += um.get("input_tokens", 0)
+                                    self.session.total_output_tokens += um.get("output_tokens", 0)
+                                
+                                rm = getattr(msg, "response_metadata", None) or {}
+                                if rm.get("context_window"):
+                                    self._context_window = rm["context_window"]
+                                rm_cost = rm.get("cost")
+                                if isinstance(rm_cost, dict) and rm_cost.get("amount"):
+                                    self.session.total_cost_usd += float(rm_cost["amount"])
+                                
+                                # Handle tool calls
+                                for tc in getattr(msg, "tool_calls", []):
+                                    args_str = ", ".join(
+                                        f"{k}={v!r}" for k, v in tc["args"].items()
+                                    )
+                                    output_parts.append(f"🐦 {tc['name']}({args_str})")
+                                
+                                # Collect AI content
+                                content = msg.content
+                                if isinstance(content, list):
+                                    content = "\n".join(
+                                        b.get("text", "") if isinstance(b, dict) else str(b)
+                                        for b in content
+                                    )
+                                if content:
+                                    output_parts.append(str(content))
+            
+            # Print the collected output to stdout
+            if output_parts:
+                print("\n".join(output_parts))
+            else:
+                print("(no response)")
+                
+        except Exception as exc:
+            # Print errors to stderr and exit with non-zero code
+            print(f"Error: {type(exc).__name__}: {exc}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            # Update session metadata
+            self.session.touch()
+            self.session_manager.save(self.session)
 
     async def run(self) -> None:
         """Start the interactive REPL and block until the user quits."""
@@ -1091,10 +1450,11 @@ class BirdieCLI:
                 )
                 self._ctrl_c_warned = False
             except SystemExit:
-                self.console.print("[dim]Goodbye.[/dim]")
+                # Ctrl+C twice at an empty prompt.
+                self._print_goodbye()
                 return
             except EOFError:
-                self.console.print("[dim]Goodbye.[/dim]")
+                self._print_goodbye()
                 return
             except KeyboardInterrupt:
                 continue
@@ -1116,16 +1476,27 @@ class BirdieCLI:
             try:
                 await task
             except asyncio.CancelledError:
+                # Cancelling the task only detaches the coroutine; a bash
+                # tool call keeps running in a worker thread.  Kill what the
+                # shell is running so Ctrl+C really stops it.
+                _interrupt_shell()
                 self.console.print("\n[dim]Interrupted.[/dim]")
             except BirdieRateLimitError:
                 self.console.print(
                     "[yellow]Rate limit reached - please wait a moment and try again.[/yellow]"
                 )
+            except BirdieProviderUnavailableError as exc:
+                self.console.print(
+                    "[yellow]Provider unreachable - the request timed out or the "
+                    "connection dropped, even after retries. Check your network "
+                    "and try again.[/yellow]"
+                )
+                self._report_turn_error(exc)
             except Exception as exc:
                 self.console.print(
                     f"[red bold]Error:[/red bold] {type(exc).__name__}: {exc}"
                 )
-                self.console.print_exception(show_locals=False)
+                self._report_turn_error(exc)
             finally:
                 loop.remove_signal_handler(signal.SIGINT)
 
@@ -1164,6 +1535,17 @@ def main() -> None:
         default=None,
         help="Path to a JSON provider config file (overrides LLM_VENDOR / LLM_MODEL env vars)",
     )
+    parser.add_argument(
+        "-p", "--prompt",
+        metavar="PROMPT",
+        default=None,
+        help="Run non-interactively with the given prompt and print the AI response to stdout",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print full tracebacks for errors during a turn (also: BIRDIE_DEBUG=1)",
+    )
     args = parser.parse_args()
 
     user_id = (
@@ -1175,8 +1557,20 @@ def main() -> None:
     skills_dir = args.skills_dir or os.path.join(os.path.dirname(__file__), "skills")
     agents_dir = args.agents_dir or os.path.join(os.path.dirname(__file__), "agents")
     provider_config = Path(args.config) if args.config else None
+    resume_flags = _resume_flags(args)
 
-    asyncio.run(_async_main(args.session_id, user_id, skills_dir, agents_dir, provider_config))
+    try:
+        asyncio.run(
+            _async_main(args.session_id, user_id, skills_dir, agents_dir,
+                        provider_config, args.prompt, debug=args.debug,
+                        resume_flags=resume_flags)
+        )
+    except KeyboardInterrupt:
+        # Ctrl+C outside the REPL's own handling (during startup or teardown):
+        # exit quietly with the conventional 128+SIGINT status rather than
+        # dumping an asyncio shutdown traceback at the user.
+        _close_shell()
+        sys.exit(130)
 
 
 _PROVIDER_HELP = """
@@ -1187,12 +1581,13 @@ variables or a JSON config file.
 
 [bold]Option 1 - environment variables[/bold]
 
-  [cyan]export LLM_VENDOR=openai[/cyan]          # or: anthropic, mistral, gemini, azure, ollama
+  [cyan]export LLM_VENDOR=openai[/cyan]          # or: anthropic, bedrock, mistral, gemini, azure, ollama
   [cyan]export LLM_MODEL=gpt-4o[/cyan]           # optional - uses provider default if omitted
   [cyan]export OPENAI_API_KEY=sk-...[/cyan]       # vendor-specific key variable:
                                    #   OPENAI_API_KEY, ANTHROPIC_API_KEY,
                                    #   MISTRAL_API_KEY, GEMINI_API_KEY,
                                    #   AZURE_OPENAI_API_KEY
+                                   #   (bedrock uses standard AWS credentials)
   [cyan]birdie[/cyan]
 
 [bold]Option 2 - config file[/bold]
@@ -1213,6 +1608,45 @@ variables or a JSON config file.
 """
 
 
+def _resume_flags(args) -> List[str]:
+    """Flags to repeat when resuming, so the resumed session is configured
+    the same way.  Only options the user actually passed are echoed back -
+    the defaults resolve identically on the next start.
+    """
+    flags: List[str] = []
+    for name, value in (
+        ("--user", args.user),
+        ("--skills-dir", args.skills_dir),
+        ("--agents-dir", args.agents_dir),
+        ("--config", args.config),
+    ):
+        if value:
+            flags += [name, shlex.quote(str(value))]
+    if args.debug:
+        flags.append("--debug")
+    return flags
+
+
+def _interrupt_shell() -> None:
+    """Stop the command the persistent shell is running, if any."""
+    session = peek_default_session()
+    if session is not None:
+        session.interrupt()
+
+
+def _close_shell() -> None:
+    """Kill the persistent shell on the way out.
+
+    Tool calls run in the event loop's thread pool, and asyncio waits up to
+    five minutes for those threads at shutdown.  A bash call still parked in
+    one -- an interrupted turn, a long timeout -- would hold the process open
+    that whole time; killing the shell lets the thread return at once.
+    """
+    session = peek_default_session()
+    if session is not None:
+        session.close()
+
+
 def _abort(console: Console, message: str) -> None:
     console.print(message)
     sys.exit(1)
@@ -1224,6 +1658,9 @@ async def _async_main(
     skills_dir: str,
     agents_dir: Optional[str],
     provider_config,
+    prompt: Optional[str] = None,
+    debug: bool = False,
+    resume_flags: Optional[List[str]] = None,
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -1273,8 +1710,19 @@ async def _async_main(
             user_id=user_id,
             user_memory=user_memory,
             console=console,
+            debug=debug,
+            resume_flags=resume_flags,
         )
-        await cli.run()
+
+        try:
+            if prompt is not None:
+                # Non-interactive mode: run single prompt and output to stdout
+                await cli.run_non_interactive(prompt)
+            else:
+                # Interactive mode: start the REPL
+                await cli.run()
+        finally:
+            _close_shell()
 
 
 if __name__ == "__main__":

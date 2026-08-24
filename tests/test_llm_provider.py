@@ -26,7 +26,13 @@ from birdie.core.llm_provider import (
     _tools_to_anthropic,
     _anthropic_accepts_temperature,
     _is_temperature_rejection,
+    _sdk_accepts_temperature,
     AnthropicProvider,
+    BedrockProvider,
+    _lc_to_bedrock_messages,
+    _bedrock_response_to_lc,
+    _tools_to_bedrock,
+    _MAX_TOOL_CONTENT_CHARS,
     skilltool_to_normalized_def,
     get_llm_provider,
     get_llm_provider_from_json,
@@ -225,6 +231,62 @@ class TestAnthropicResponseConversion:
         assert msg.tool_calls[0]["args"] == {"city": "Graz"}
 
 
+class TestAnthropicStopReason:
+    def _response(self, content, stop_reason):
+        r = MagicMock()
+        r.content = content
+        r.stop_reason = stop_reason
+        return r
+
+    def test_stop_reason_recorded_in_metadata(self):
+        r = self._response([MagicMock(type="text", text="Hi")], "end_turn")
+        msg = _anthropic_response_to_lc(r)
+        assert msg.response_metadata["stop_reason"] == "end_turn"
+        assert msg.content == "Hi"
+
+    def test_empty_max_tokens_response_gets_visible_marker(self):
+        r = self._response([], "max_tokens")
+        msg = _anthropic_response_to_lc(r)
+        assert "Truncated" in msg.content
+        assert "max_tokens" in msg.content
+        assert msg.response_metadata["stop_reason"] == "max_tokens"
+
+    def test_partial_text_max_tokens_gets_truncation_note(self):
+        r = self._response([MagicMock(type="text", text="partial answer")], "max_tokens")
+        msg = _anthropic_response_to_lc(r)
+        assert msg.content.startswith("partial answer")
+        assert "Truncated" in msg.content
+
+    def test_tool_calls_with_max_tokens_left_untouched(self):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.id = "toolu_01"
+        block.name = "get_weather"
+        block.input = {}
+        r = self._response([block], "max_tokens")
+        msg = _anthropic_response_to_lc(r)
+        assert len(msg.tool_calls) == 1
+        assert "Truncated" not in msg.content
+
+    def test_non_string_stop_reason_ignored(self):
+        r = MagicMock()  # stop_reason is a bare MagicMock, not a str
+        r.content = [MagicMock(type="text", text="x")]
+        msg = _anthropic_response_to_lc(r)
+        assert "stop_reason" not in msg.response_metadata
+
+
+class TestAnthropicDefaultMaxTokens:
+    def test_default_leaves_room_for_thinking(self):
+        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
+            provider = AnthropicProvider(api_key="test")
+        assert provider._max_tokens == 16000
+
+    def test_explicit_max_tokens_wins(self):
+        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
+            provider = AnthropicProvider(api_key="test", max_tokens=2048)
+        assert provider._max_tokens == 2048
+
+
 # ---------------------------------------------------------------------------
 # Anthropic temperature handling
 # ---------------------------------------------------------------------------
@@ -307,6 +369,43 @@ class TestAnthropicTemperature:
         exc.status_code = 500
         assert _is_temperature_rejection(exc) is False
 
+    def test_rejection_detector_accepts_sdk_typeerror(self):
+        # anthropic>=1.0 removed `temperature` from messages.create() and
+        # raises client-side before any request is made.
+        exc = TypeError("AsyncMessages.create() got an unexpected keyword argument 'temperature'")
+        assert _is_temperature_rejection(exc) is True
+        assert _is_temperature_rejection(TypeError("missing 1 required argument")) is False
+
+    def test_sdk_without_temperature_param_is_never_sent(self):
+        def create(*, model, messages, max_tokens, system=None, tools=None):
+            return MagicMock(content=[MagicMock(type="text", text="Hello")])
+
+        client = MagicMock()
+        client.messages.create = create
+        assert _sdk_accepts_temperature(client) is False
+
+        p = _make_anthropic_provider("claude-sonnet-4-6")
+        p._send_temperature = _sdk_accepts_temperature(client)
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, None, None)
+        assert "temperature" not in kw
+
+    @pytest.mark.asyncio
+    async def test_achat_retries_without_temperature_on_typeerror(self):
+        p = _make_anthropic_provider("claude-sonnet-4-6")
+        ok = MagicMock()
+        ok.content = [MagicMock(type="text", text="Hello")]
+        p._async_client.messages.create = AsyncMock(side_effect=[
+            TypeError("AsyncMessages.create() got an unexpected keyword argument 'temperature'"),
+            ok,
+        ])
+
+        msg = await p.achat([HumanMessage(content="hi")])
+
+        assert "Hello" in msg.content
+        assert p._async_client.messages.create.call_count == 2
+        assert "temperature" not in p._async_client.messages.create.call_args_list[1].kwargs
+        assert p._send_temperature is False
+
 
 # ---------------------------------------------------------------------------
 # SkillTool → NormalizedToolDef
@@ -325,6 +424,270 @@ class TestSkillToolNormalization:
         assert normalized["description"] == "Read a file"
         assert "properties" in normalized["parameters"]
         assert normalized["entrypoint"] == "bash:cat {path}"
+
+
+# ---------------------------------------------------------------------------
+# BedrockProvider - message conversion, tool defs, response parsing
+# ---------------------------------------------------------------------------
+
+class TestBedrockMessageConversion:
+    def test_human_message(self):
+        result = _lc_to_bedrock_messages([HumanMessage(content="hi")])
+        assert result == [{"role": "user", "content": [{"text": "hi"}]}]
+
+    def test_system_message_excluded(self):
+        # SystemMessage is handled as a top-level Bedrock field, not a message
+        result = _lc_to_bedrock_messages([SystemMessage(content="sys"), HumanMessage(content="hi")])
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+
+    def test_ai_message_no_tools(self):
+        result = _lc_to_bedrock_messages([AIMessage(content="pong")])
+        assert result == [{"role": "assistant", "content": [{"text": "pong"}]}]
+
+    def test_ai_message_with_tool_calls(self):
+        msg = AIMessage(
+            content="calling tool",
+            tool_calls=[{"id": "tc1", "name": "get_weather", "args": {"city": "Graz"}, "type": "tool_call"}],
+        )
+        result = _lc_to_bedrock_messages([msg])
+        content = result[0]["content"]
+        assert any("text" in b for b in content)
+        tool_block = next(b for b in content if "toolUse" in b)
+        assert tool_block["toolUse"]["toolUseId"] == "tc1"
+        assert tool_block["toolUse"]["name"] == "get_weather"
+        assert tool_block["toolUse"]["input"] == {"city": "Graz"}
+
+    def test_ai_message_with_tool_calls_no_text_still_has_content(self):
+        msg = AIMessage(
+            content="",
+            tool_calls=[{"id": "tc1", "name": "get_weather", "args": {}, "type": "tool_call"}],
+        )
+        result = _lc_to_bedrock_messages([msg])
+        assert result[0]["content"] == [{"toolUse": {"toolUseId": "tc1", "name": "get_weather", "input": {}}}]
+
+    def test_tool_messages_batched_into_single_user_turn(self):
+        msgs = [
+            ToolMessage(content="sunny", tool_call_id="tc1"),
+            ToolMessage(content="22°C", tool_call_id="tc2"),
+        ]
+        result = _lc_to_bedrock_messages(msgs)
+        # Both ToolMessages must be merged into ONE user turn
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert len(result[0]["content"]) == 2
+        assert all("toolResult" in b for b in result[0]["content"])
+        assert result[0]["content"][0]["toolResult"]["toolUseId"] == "tc1"
+
+    def test_oversized_tool_result_truncated(self):
+        big = "x" * (_MAX_TOOL_CONTENT_CHARS + 500)
+        result = _lc_to_bedrock_messages([ToolMessage(content=big, tool_call_id="tc1")])
+        text = result[0]["content"][0]["toolResult"]["content"][0]["text"]
+        assert len(text) < len(big)
+        assert "characters truncated" in text
+
+
+class TestBedrockResponseConversion:
+    def test_text_only_response(self):
+        raw = {"output": {"message": {"content": [{"text": "Hello"}]}}}
+        msg = _bedrock_response_to_lc(raw)
+        assert isinstance(msg, AIMessage)
+        assert "Hello" in msg.content
+        assert msg.tool_calls == []
+
+    def test_tool_use_response(self):
+        raw = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"toolUse": {"toolUseId": "tu1", "name": "get_weather", "input": {"city": "Graz"}}},
+                    ],
+                },
+            },
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert len(msg.tool_calls) == 1
+        assert msg.tool_calls[0]["id"] == "tu1"
+        assert msg.tool_calls[0]["name"] == "get_weather"
+        assert msg.tool_calls[0]["args"] == {"city": "Graz"}
+
+    def test_usage_metadata_extracted(self):
+        raw = {
+            "output": {"message": {"content": [{"text": "Hi"}]}},
+            "usage": {"inputTokens": 10, "outputTokens": 5},
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert msg.usage_metadata["input_tokens"] == 10
+        assert msg.usage_metadata["output_tokens"] == 5
+        assert msg.usage_metadata["total_tokens"] == 15
+
+
+class TestBedrockStopReason:
+    def test_stop_reason_recorded_in_metadata(self):
+        raw = {
+            "output": {"message": {"content": [{"text": "Hi"}]}},
+            "stopReason": "end_turn",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert msg.response_metadata["stop_reason"] == "end_turn"
+        assert msg.content == "Hi"
+
+    def test_empty_max_tokens_response_gets_visible_marker(self):
+        raw = {"output": {"message": {"content": []}}, "stopReason": "max_tokens"}
+        msg = _bedrock_response_to_lc(raw)
+        assert "Truncated" in msg.content
+        assert "max_tokens" in msg.content
+        assert msg.response_metadata["stop_reason"] == "max_tokens"
+
+    def test_partial_text_max_tokens_gets_truncation_note(self):
+        raw = {
+            "output": {"message": {"content": [{"text": "partial answer"}]}},
+            "stopReason": "max_tokens",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert msg.content.startswith("partial answer")
+        assert "Truncated" in msg.content
+
+    def test_tool_calls_with_max_tokens_left_untouched(self):
+        raw = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"toolUse": {"toolUseId": "tu1", "name": "f", "input": {}}},
+                    ],
+                },
+            },
+            "stopReason": "max_tokens",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert len(msg.tool_calls) == 1
+        assert "Truncated" not in msg.content
+
+    def test_missing_stop_reason_ignored(self):
+        raw = {"output": {"message": {"content": [{"text": "x"}]}}}
+        msg = _bedrock_response_to_lc(raw)
+        assert "stop_reason" not in msg.response_metadata
+
+
+class TestBedrockDefaultMaxTokens:
+    def test_default_leaves_room_for_thinking(self):
+        with patch.dict("sys.modules", {"boto3": MagicMock()}):
+            provider = BedrockProvider(region_name="eu-central-1")
+        assert provider._max_tokens == 16000
+
+    def test_explicit_max_tokens_wins(self):
+        with patch.dict("sys.modules", {"boto3": MagicMock()}):
+            provider = BedrockProvider(region_name="eu-central-1", max_tokens=2048)
+        assert provider._max_tokens == 2048
+
+
+class TestBedrockToolDefConversion:
+    def test_tool_format(self, sample_tools):
+        result = _tools_to_bedrock(sample_tools)
+        spec = result["tools"][0]["toolSpec"]
+        assert spec["name"] == "get_weather"
+        assert spec["description"] == "Get current weather for a city"
+        assert spec["inputSchema"]["json"] == sample_tools[0]["parameters"]
+
+
+def _make_bedrock_provider() -> BedrockProvider:
+    """Build a BedrockProvider without touching the boto3 SDK."""
+    p = BedrockProvider.__new__(BedrockProvider)
+    p._model = "anthropic.claude-sonnet-4-20250514-v1:0"
+    p._temperature = 0.0
+    p._max_tokens = 4096
+    p._client = MagicMock()
+    return p
+
+
+class TestBedrockProvider:
+    def test_capability_flags(self):
+        p = _make_bedrock_provider()
+        assert p.supports_tools() is True
+        assert p.supports_streaming() is True
+        assert p.supports_json_mode() is False
+
+    def test_build_kwargs_basic(self):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, None, None)
+        assert kw["modelId"] == "anthropic.claude-sonnet-4-20250514-v1:0"
+        assert kw["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
+        assert kw["inferenceConfig"] == {"maxTokens": 4096, "temperature": 0.0}
+        assert "system" not in kw
+        assert "toolConfig" not in kw
+
+    def test_build_kwargs_system_prompt_param(self):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, "Be nice", None, None)
+        assert kw["system"] == [{"text": "Be nice"}]
+
+    def test_build_kwargs_system_message_fallback(self):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs(
+            [SystemMessage(content="sys"), HumanMessage(content="hi")], None, None, None, None,
+        )
+        assert kw["system"] == [{"text": "sys"}]
+        assert kw["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
+
+    def test_build_kwargs_with_tools(self, sample_tools):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs([HumanMessage(content="hi")], sample_tools, None, None, None)
+        assert kw["toolConfig"]["tools"][0]["toolSpec"]["name"] == "get_weather"
+
+    def test_build_kwargs_overrides(self):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, 0.7, 200)
+        assert kw["inferenceConfig"] == {"maxTokens": 200, "temperature": 0.7}
+
+    def test_chat_calls_converse(self):
+        p = _make_bedrock_provider()
+        p._client.converse.return_value = {"output": {"message": {"content": [{"text": "Hello"}]}}}
+        msg = p.chat([HumanMessage(content="hi")])
+        assert "Hello" in msg.content
+        p._client.converse.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_achat_calls_converse(self):
+        p = _make_bedrock_provider()
+        p._client.converse.return_value = {"output": {"message": {"content": [{"text": "Hi async"}]}}}
+        msg = await p.achat([HumanMessage(content="hi")])
+        assert "Hi async" in msg.content
+
+    def test_list_models(self):
+        p = _make_bedrock_provider()
+        ids = {m.id for m in p.list_models()}
+        assert "anthropic.claude-sonnet-4-20250514-v1:0" in ids
+        assert "amazon.nova-pro-v1:0" in ids
+        by_id = {m.id: m for m in p.list_models()}
+        assert by_id["anthropic.claude-sonnet-4-20250514-v1:0"].supports_tools is True
+
+    def test_init_requires_boto3(self):
+        with patch.dict("sys.modules", {"boto3": None}):
+            with pytest.raises(ImportError):
+                BedrockProvider(model="anthropic.claude-sonnet-4-20250514-v1:0")
+
+    def test_init_resolves_credentials_from_kwargs(self):
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            BedrockProvider(
+                model="anthropic.claude-sonnet-4-20250514-v1:0",
+                aws_access_key_id="AKIA...",
+                aws_secret_access_key="secret",
+                region_name="us-west-2",
+            )
+        mock_boto3.client.assert_called_once_with(
+            "bedrock-runtime",
+            aws_access_key_id="AKIA...",
+            aws_secret_access_key="secret",
+            region_name="us-west-2",
+        )
+
+    def test_init_env_var_region_fallback(self, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "eu-central-1")
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            BedrockProvider(model="anthropic.claude-sonnet-4-20250514-v1:0")
+        mock_boto3.client.assert_called_once_with("bedrock-runtime", region_name="eu-central-1")
 
 
 # ---------------------------------------------------------------------------
@@ -461,14 +824,14 @@ class TestAzureOpenAIProvider:
 
 class TestACPProvider:
 
-    def _make_proc(self, *response_lines):
+    def _make_proc(self, *response_lines, session_result=None):
         """Return a mock Popen whose stdout yields initialize + session/new + response lines."""
         init_resp = json.dumps({
             "jsonrpc": "2.0", "id": 0,
             "result": {"protocolVersion": 1, "agentInfo": {"name": "test-agent", "version": "1.0.0"}, "agentCapabilities": {}},
         }) + "\n"
         session_resp = json.dumps({
-            "jsonrpc": "2.0", "id": 1, "result": {"sessionId": "sess_test123"},
+            "jsonrpc": "2.0", "id": 1, "result": session_result or {"sessionId": "sess_test123"},
         }) + "\n"
         lines = [init_resp.encode(), session_resp.encode()] + [
             (json.dumps(r) + "\n").encode() for r in response_lines
@@ -497,6 +860,27 @@ class TestACPProvider:
             result = provider.chat(sample_messages)
         assert isinstance(result, AIMessage)
         assert result.content == "Hi there"
+
+    def test_chat_captures_model_name(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        session_result = {
+            "sessionId": "sess_test123",
+            "models": {"availableModels": [], "currentModelId": "claude-fable-5"},
+        }
+        mock_proc = self._make_proc(self._prompt_result(), session_result=session_result)
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            assert provider.model_name == "unknown"
+            provider.chat(sample_messages)
+        assert provider.model_name == "claude-fable-5"
+
+    def test_chat_without_model_info_keeps_unknown(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(self._prompt_result())
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.chat(sample_messages)
+        assert provider.model_name == "unknown"
 
     def test_chat_sends_correct_rpc(self, sample_messages):
         from birdie.core.llm_provider import ACPProvider
@@ -552,6 +936,378 @@ class TestACPProvider:
         assert provider._extract_chunk_text({}) is None
         params2 = {"update": {"sessionUpdate": "tool_call_update"}}
         assert provider._extract_chunk_text(params2) is None
+
+    def _tool_call_notification(self, tool_id="call_1", title="List files", status="pending", raw_input=None):
+        update = {
+            "sessionUpdate": "tool_call", "toolCallId": tool_id,
+            "title": title, "kind": "execute", "status": status,
+        }
+        if raw_input is not None:
+            update["rawInput"] = raw_input
+        return {"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "sess_test123", "update": update}}
+
+    def _tool_update_notification(self, tool_id="call_1", status="completed", output=None):
+        update = {"sessionUpdate": "tool_call_update", "toolCallId": tool_id, "status": status}
+        if output is not None:
+            update["content"] = [{"type": "content", "content": {"type": "text", "text": output}}]
+        return {"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "sess_test123", "update": update}}
+
+    def test_extract_tool_event(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        params = self._tool_call_notification(raw_input={"command": "ls -la"})["params"]
+        event = provider._extract_tool_event(params)
+        assert event["event"] == "tool_call"
+        assert event["id"] == "call_1"
+        assert event["title"] == "List files"
+        assert event["kind"] == "execute"
+        assert event["status"] == "pending"
+        assert event["raw_input"] == {"command": "ls -la"}
+        assert event["output"] == ""
+
+    def test_extract_tool_event_collects_output(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        params = self._tool_update_notification(output="file1.py\nfile2.py")["params"]
+        params["update"]["content"].append({"type": "diff", "path": "/tmp/x.py"})
+        event = provider._extract_tool_event(params)
+        assert event["event"] == "tool_call_update"
+        assert event["status"] == "completed"
+        assert event["output"] == "file1.py\nfile2.py\n[diff] /tmp/x.py"
+
+    def test_extract_tool_event_ignores_other_updates(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        chunk_params = self._chunk_notification("hi")["params"]
+        assert provider._extract_tool_event(chunk_params) is None
+        assert provider._extract_tool_event({}) is None
+
+    def test_chat_fires_tool_event_callback(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._tool_call_notification(raw_input={"command": "ls"}),
+            self._tool_update_notification(output="file1.py"),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+        events = []
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.tool_event_callback = events.append
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        assert [e["event"] for e in events] == ["tool_call", "tool_call_update"]
+        assert events[0]["title"] == "List files"
+        assert events[1]["output"] == "file1.py"
+
+    def test_chat_callback_exception_does_not_break_turn(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._tool_call_notification(),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+
+        def boom(event):
+            raise RuntimeError("render failed")
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.tool_event_callback = boom
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+
+    def _usage_notification(self, used=None, size=None, cost=None):
+        update = {"sessionUpdate": "usage_update"}
+        if used is not None:
+            update["used"] = used
+        if size is not None:
+            update["size"] = size
+        if cost is not None:
+            update["cost"] = cost
+        return {"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "sess_test123", "update": update}}
+
+    def test_extract_usage(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        params = self._usage_notification(
+            used=53_000, size=200_000, cost={"amount": 0.045, "currency": "USD"},
+        )["params"]
+        usage = provider._extract_usage(params)
+        assert usage == {"used": 53_000, "size": 200_000,
+                         "cost": {"amount": 0.045, "currency": "USD"}}
+        assert provider._extract_usage(self._chunk_notification("hi")["params"]) is None
+        assert provider._extract_usage({}) is None
+
+    def test_chat_attaches_usage_metadata(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._chunk_notification("Done"),
+            self._usage_notification(used=41_000, size=200_000),
+            self._usage_notification(used=42_000, cost={"amount": 0.05, "currency": "USD"}),
+            self._prompt_result(),
+        )
+        events = []
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.tool_event_callback = events.append
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        assert result.usage_metadata["input_tokens"] == 42_000
+        assert result.usage_metadata["output_tokens"] == 0
+        assert result.usage_metadata["total_tokens"] == 42_000
+        assert result.response_metadata["context_window"] == 200_000
+        assert result.response_metadata["cost"] == {"amount": 0.05, "currency": "USD"}
+        # usage updates must not be routed to the tool event callback
+        assert events == []
+
+    def test_chat_without_usage_has_no_usage_metadata(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(self._chunk_notification("Hi"), self._prompt_result())
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            result = provider.chat(sample_messages)
+        assert result.usage_metadata is None
+
+    @pytest.mark.asyncio
+    async def test_achat_attaches_usage_metadata(self):
+        from birdie.core.llm_provider import ACPProvider
+
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
+        }).encode() + b"\n"
+        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s1"}}).encode() + b"\n"
+        chunk_msg = json.dumps(self._chunk_notification("Done")).encode() + b"\n"
+        usage_msg = json.dumps(self._usage_notification(
+            used=12_345, size=200_000, cost={"amount": 0.01, "currency": "USD"},
+        )).encode() + b"\n"
+        final = json.dumps(self._prompt_result()).encode() + b"\n"
+
+        mock_stdin = AsyncMock()
+        mock_stdin.write = MagicMock()
+        mock_stdin.drain = AsyncMock()
+        mock_stdin.close = MagicMock()
+
+        read_lines = [init_resp, session_resp, chunk_msg, usage_msg, final]
+        read_idx = 0
+
+        async def fake_read(n=-1):
+            nonlocal read_idx
+            if read_idx < len(read_lines):
+                line = read_lines[read_idx]
+                read_idx += 1
+                return line
+            return b""
+
+        mock_stdout = AsyncMock()
+        mock_stdout.read = fake_read
+
+        mock_proc = AsyncMock()
+        mock_proc.stdin = mock_stdin
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            result = await provider.achat([HumanMessage(content="List files")])
+
+        assert result.content == "Done"
+        assert result.usage_metadata["input_tokens"] == 12_345
+        assert result.response_metadata["context_window"] == 200_000
+        assert result.response_metadata["cost"] == {"amount": 0.01, "currency": "USD"}
+
+    def _permission_request(self, req_id=10, options=None, title="Bash: ls"):
+        if options is None:
+            options = [
+                {"kind": "allow_always", "name": "Always allow Bash", "optionId": "allow_always"},
+                {"kind": "allow_once", "name": "Allow", "optionId": "allow"},
+                {"kind": "reject_once", "name": "Reject", "optionId": "reject"},
+            ]
+        return {"jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
+                "params": {"sessionId": "sess_test123",
+                           "toolCall": {"toolCallId": "call_1", "title": title,
+                                        "kind": "execute", "rawInput": {"command": "ls"}},
+                           "options": options}}
+
+    def test_normalize_permission_request(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        request = provider._normalize_permission_request(self._permission_request()["params"])
+        assert request["title"] == "Bash: ls"
+        assert request["kind"] == "execute"
+        assert request["raw_input"] == {"command": "ls"}
+        assert request["options"][0] == {
+            "id": "allow_always", "name": "Always allow Bash", "kind": "allow_always"}
+
+    def test_permission_outcome_mapping(self):
+        from birdie.core.llm_provider import ACPProvider
+        provider = ACPProvider(command="claude-agent-acp")
+        params = self._permission_request()["params"]
+        assert provider._permission_outcome(params, "allow") == {
+            "outcome": {"outcome": "selected", "optionId": "allow"}}
+        assert provider._permission_outcome(params, "allow_always")["outcome"]["optionId"] == "allow_always"
+        assert provider._permission_outcome(params, "deny")["outcome"]["optionId"] == "reject"
+        # no options offered: fall back to the legacy hard-coded ids
+        assert provider._permission_outcome({}, "allow")["outcome"]["optionId"] == "allow"
+        assert provider._permission_outcome({}, "deny")["outcome"]["optionId"] == "reject"
+
+    def _permission_response(self, mock_proc, idx=3):
+        return json.loads(mock_proc.stdin.write.call_args_list[idx][0][0].decode())
+
+    def test_chat_auto_allows_permission_without_callback(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._permission_request(),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        resp = self._permission_response(mock_proc)
+        assert resp["id"] == 10
+        assert resp["result"]["outcome"] == {"outcome": "selected", "optionId": "allow"}
+
+    def test_chat_permission_callback_denies(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._permission_request(),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+        seen = []
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.permission_callback = lambda req: (seen.append(req), "deny")[1]
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        assert seen[0]["title"] == "Bash: ls"
+        resp = self._permission_response(mock_proc)
+        assert resp["result"]["outcome"]["optionId"] == "reject"
+
+    def test_chat_permission_callback_error_fails_closed(self, sample_messages):
+        from birdie.core.llm_provider import ACPProvider
+        mock_proc = self._make_proc(
+            self._permission_request(),
+            self._chunk_notification("Done"),
+            self._prompt_result(),
+        )
+
+        def boom(req):
+            raise RuntimeError("gate crashed")
+
+        with patch("subprocess.Popen", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.permission_callback = boom
+            result = provider.chat(sample_messages)
+        assert result.content == "Done"
+        resp = self._permission_response(mock_proc)
+        assert resp["result"]["outcome"]["optionId"] == "reject"
+
+    @pytest.mark.asyncio
+    async def test_achat_awaits_async_permission_callback(self):
+        from birdie.core.llm_provider import ACPProvider
+
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
+        }).encode() + b"\n"
+        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s1"}}).encode() + b"\n"
+        perm_msg = json.dumps(self._permission_request()).encode() + b"\n"
+        chunk_msg = json.dumps(self._chunk_notification("Done")).encode() + b"\n"
+        final = json.dumps(self._prompt_result()).encode() + b"\n"
+
+        mock_stdin = AsyncMock()
+        mock_stdin.write = MagicMock()
+        mock_stdin.drain = AsyncMock()
+        mock_stdin.close = MagicMock()
+
+        read_lines = [init_resp, session_resp, perm_msg, chunk_msg, final]
+        read_idx = 0
+
+        async def fake_read(n=-1):
+            nonlocal read_idx
+            if read_idx < len(read_lines):
+                line = read_lines[read_idx]
+                read_idx += 1
+                return line
+            return b""
+
+        mock_stdout = AsyncMock()
+        mock_stdout.read = fake_read
+
+        mock_proc = AsyncMock()
+        mock_proc.stdin = mock_stdin
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        async def gate(request):
+            assert request["title"] == "Bash: ls"
+            return "allow_always"
+
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.permission_callback = gate
+            result = await provider.achat([HumanMessage(content="List files")])
+
+        assert result.content == "Done"
+        resp = json.loads(mock_stdin.write.call_args_list[3][0][0].decode())
+        assert resp["id"] == 10
+        assert resp["result"]["outcome"]["optionId"] == "allow_always"
+
+    @pytest.mark.asyncio
+    async def test_achat_fires_tool_event_callback(self):
+        from birdie.core.llm_provider import ACPProvider
+
+        init_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
+        }).encode() + b"\n"
+        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s1"}}).encode() + b"\n"
+        tool_call = json.dumps(self._tool_call_notification(raw_input={"command": "ls"})).encode() + b"\n"
+        tool_update = json.dumps(self._tool_update_notification(output="file1.py")).encode() + b"\n"
+        chunk_msg = json.dumps(self._chunk_notification("Done")).encode() + b"\n"
+        final = json.dumps(self._prompt_result()).encode() + b"\n"
+
+        mock_stdin = AsyncMock()
+        mock_stdin.write = MagicMock()
+        mock_stdin.drain = AsyncMock()
+        mock_stdin.close = MagicMock()
+
+        read_lines = [init_resp, session_resp, tool_call, tool_update, chunk_msg, final]
+        read_idx = 0
+
+        async def fake_read(n=-1):
+            nonlocal read_idx
+            if read_idx < len(read_lines):
+                line = read_lines[read_idx]
+                read_idx += 1
+                return line
+            return b""
+
+        mock_stdout = AsyncMock()
+        mock_stdout.read = fake_read
+
+        mock_proc = AsyncMock()
+        mock_proc.stdin = mock_stdin
+        mock_proc.stdout = mock_stdout
+        mock_proc.wait = AsyncMock(return_value=0)
+
+        events = []
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            provider.tool_event_callback = events.append
+            result = await provider.achat([HumanMessage(content="List files")])
+
+        assert result.content == "Done"
+        assert [e["event"] for e in events] == ["tool_call", "tool_call_update"]
+        assert events[0]["raw_input"] == {"command": "ls"}
+        assert events[1]["output"] == "file1.py"
 
     def test_chat_includes_tool_messages_in_history(self):
         from birdie.core.llm_provider import ACPProvider
@@ -704,13 +1460,15 @@ class TestACPProvider:
         assert "error" in responses[0]
         assert responses[0]["error"]["code"] == -32601
 
-    def _make_async_proc(self, *response_lines):
+    def _make_async_proc(self, *response_lines, session_result=None):
         """Build a mock async ACP subprocess whose stdout yields the given JSON lines."""
         init_resp = json.dumps({
             "jsonrpc": "2.0", "id": 0,
             "result": {"protocolVersion": 1, "agentInfo": {"name": "t", "version": "0"}, "agentCapabilities": {}},
         }).encode() + b"\n"
-        session_resp = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"sessionId": "s_async"}}).encode() + b"\n"
+        session_resp = json.dumps({
+            "jsonrpc": "2.0", "id": 1, "result": session_result or {"sessionId": "s_async"},
+        }).encode() + b"\n"
         lines = [init_resp, session_resp] + [(json.dumps(r) + "\n").encode() for r in response_lines]
         idx = 0
 
@@ -752,6 +1510,19 @@ class TestACPProvider:
         assert "-m" in entry["args"]
         assert "birdie.core.acp_mcp_server" in entry["args"]
         assert any(e["name"] == "BIRDIE_TOOLS_JSON" for e in entry["env"])
+
+    @pytest.mark.asyncio
+    async def test_achat_captures_model_name(self):
+        from birdie.core.llm_provider import ACPProvider
+        session_result = {
+            "sessionId": "s_async",
+            "models": {"availableModels": [], "currentModelId": "claude-fable-5"},
+        }
+        mock_proc = self._make_async_proc(self._prompt_result(), session_result=session_result)
+        with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+            provider = ACPProvider(command="claude-agent-acp")
+            await provider.achat([HumanMessage(content="hi")])
+        assert provider.model_name == "claude-fable-5"
 
     @pytest.mark.asyncio
     async def test_astream_chat_with_tools_rejects_terminal_create(self):
@@ -1500,6 +2271,62 @@ class TestRetryableErrors:
             pass
 
         assert _is_retryable_error(APIConnectionError("net down"))
+
+    def test_httpx_network_errors_are_retryable(self):
+        """The Mistral SDK raises raw httpx exceptions; they must be retried."""
+        import httpx
+        from birdie.agent.graph import _is_network_error, _is_retryable_error
+
+        for exc in (
+            httpx.ReadTimeout("read"), httpx.ConnectTimeout("connect"),
+            httpx.ConnectError("refused"), httpx.ReadError("reset"),
+            httpx.RemoteProtocolError("closed"),
+        ):
+            assert _is_network_error(exc), exc
+            assert _is_retryable_error(exc), exc
+
+    def test_rate_limit_is_not_a_network_error(self):
+        from birdie.agent.graph import _is_network_error
+
+        class RateLimitError(Exception):
+            status_code = 429
+
+        assert not _is_network_error(RateLimitError("slow down"))
+
+    @pytest.mark.asyncio
+    async def test_retry_exhaustion_raises_unavailable_for_network(self, monkeypatch):
+        import httpx
+        from birdie.agent import graph
+        from birdie.core.errors import (
+            BirdieProviderUnavailableError, BirdieRateLimitError, BirdieTransientError,
+        )
+
+        async def _no_sleep(_):
+            return None
+        monkeypatch.setattr(graph.asyncio, "sleep", _no_sleep)
+
+        provider = MagicMock()
+        provider.achat = AsyncMock(side_effect=httpx.ReadTimeout("slow"))
+        with pytest.raises(BirdieProviderUnavailableError) as exc:
+            await graph._achat_with_retry(provider, messages=[])
+        assert provider.achat.await_count == graph._MAX_RETRIES + 1
+        assert isinstance(exc.value, BirdieTransientError)
+        assert not isinstance(exc.value, BirdieRateLimitError)
+        assert "ReadTimeout" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_retry_recovers_after_transient_network_error(self, monkeypatch):
+        import httpx
+        from birdie.agent import graph
+
+        async def _no_sleep(_):
+            return None
+        monkeypatch.setattr(graph.asyncio, "sleep", _no_sleep)
+
+        provider = MagicMock()
+        provider.achat = AsyncMock(side_effect=[httpx.ReadTimeout("slow"), "ok"])
+        assert await graph._achat_with_retry(provider, messages=[]) == "ok"
+        assert provider.achat.await_count == 2
 
 
 class TestAnthropicPromptCaching:

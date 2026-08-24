@@ -32,7 +32,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langgraph.graph.message import add_messages
 
-from ..core.errors import BirdieRateLimitError
+from ..core.errors import BirdieProviderUnavailableError, BirdieRateLimitError
 from ..core.registry import SkillRegistry
 from ..core.adapter import skilltool_to_langchain_tool
 from ..core.policy import SkillPolicy
@@ -58,19 +58,52 @@ SKILL_MAX_LOADED = 3     # maximum simultaneously loaded freetext skills (LRU ca
 # context sent to the LLM on every subsequent turn.
 MAX_TOOL_OUTPUT_CAP = 20_000
 
+# Hard ceiling on tool calls the model may issue within a single user turn.
+# Backstop for "creative" looping that the exact-match loop guard cannot
+# catch (e.g. the same command re-issued with a different `sleep N` suffix).
+# 0 disables the budget.
+MAX_TOOL_CALLS_PER_TURN = 40
+
 _MAX_RETRIES = 3          # maximum retry attempts on transient provider errors
 _RETRY_BASE_DELAY = 5.0   # base seconds for exponential backoff when no Retry-After header
 
 
+def _is_network_error(exc: Exception) -> bool:
+    """Return True for transport-level failures: the request never got an
+    answer (connect/read timeouts, resets, dropped connections).
+
+    Vendor SDKs differ here: OpenAI/Anthropic wrap these as
+    ``APIConnectionError``/``APITimeoutError``, while the Mistral SDK lets the
+    underlying ``httpx`` exception through unwrapped.
+    """
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - httpx is a hard dependency
+        httpx = None
+    if httpx is not None and isinstance(exc, (
+        httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError,
+    )):
+        return True
+    name = type(exc).__name__
+    return any(k in name for k in (
+        "APIConnectionError", "APITimeoutError", "ConnectError",
+        "ConnectionError", "ReadError", "ReadTimeout", "ConnectTimeout",
+        "WriteTimeout", "PoolTimeout",
+    ))
+
+
 def _is_retryable_error(exc: Exception) -> bool:
-    """Return True for transient provider errors (rate limits, overload, 5xx)."""
+    """Return True for transient provider errors (rate limits, overload, 5xx,
+    and network failures)."""
+    if _is_network_error(exc):
+        return True
     status = getattr(exc, 'status_code', None)
     if status in (429, 500, 502, 503, 504, 529):
         return True
     name = type(exc).__name__
     if any(k in name for k in (
         "RateLimit", "Overloaded", "TooManyRequests",
-        "InternalServerError", "ServiceUnavailable", "APIConnectionError",
+        "InternalServerError", "ServiceUnavailable",
     )):
         return True
     msg = str(exc)
@@ -99,22 +132,31 @@ def _get_retry_after(exc: Exception) -> float | None:
 
 
 async def _achat_with_retry(provider: LLMProvider, **kwargs) -> BaseMessage:
-    """Call provider.achat with exponential back-off on transient rate-limit errors."""
+    """Call provider.achat with exponential back-off on transient provider
+    errors (rate limits, 5xx, network failures)."""
     for attempt in range(_MAX_RETRIES + 1):
         try:
             return await provider.achat(**kwargs)
         except Exception as exc:
             if not _is_retryable_error(exc):
                 raise
+            network = _is_network_error(exc)
             delay = _get_retry_after(exc) or (_RETRY_BASE_DELAY * (2 ** attempt))
             if attempt >= _MAX_RETRIES:
+                if network:
+                    raise BirdieProviderUnavailableError(
+                        f"Provider unreachable ({type(exc).__name__}: {exc}); "
+                        f"retries exhausted after {_MAX_RETRIES} attempts.",
+                        retry_after=delay,
+                    ) from exc
                 raise BirdieRateLimitError(
                     f"Provider rate limit hit; retries exhausted after {_MAX_RETRIES} attempts.",
                     retry_after=delay,
                 ) from exc
             log.warning(
-                "Provider rate-limited; retrying in %.1fs (attempt %d/%d)",
-                delay, attempt + 1, _MAX_RETRIES,
+                "Provider %s (%s); retrying in %.1fs (attempt %d/%d)",
+                "unreachable" if network else "rate-limited",
+                type(exc).__name__, delay, attempt + 1, _MAX_RETRIES,
             )
             await asyncio.sleep(delay)
     raise RuntimeError("unreachable")
@@ -293,6 +335,43 @@ def _last_input_tokens(messages: list) -> int:
             if usage:
                 return usage.get("input_tokens", 0) or 0
     return 0
+
+
+LOOP_GUARD_PREFIX = "Error: loop guard:"
+
+
+def _tool_error_content(exc: Exception) -> str:
+    """ToolNode error handler: render one tool's failure as its result."""
+    return f"Error: {exc}"
+
+
+def _guard_fired_this_turn(messages: list) -> bool:
+    """True if a loop-guard ToolMessage was already emitted since the last HumanMessage."""
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            return False
+        if isinstance(msg, ToolMessage) and str(msg.content).startswith(LOOP_GUARD_PREFIX):
+            return True
+    return False
+
+
+def _tool_calls_this_turn(messages: list) -> int:
+    """Number of tool calls issued by the model since the last HumanMessage."""
+    count = 0
+    for msg in reversed(messages):
+        if isinstance(msg, HumanMessage):
+            break
+        if isinstance(msg, AIMessage):
+            count += len(getattr(msg, "tool_calls", None) or [])
+    return count
+
+
+def _stop_turn(last_ai: AIMessage, tool_note: str, stop_text: str) -> dict:
+    """Answer every pending tool call with ``tool_note`` and end the turn with ``stop_text``."""
+    return {"messages": [
+        ToolMessage(content=tool_note, tool_call_id=t["id"], name=t["name"])
+        for t in getattr(last_ai, "tool_calls", [])
+    ] + [AIMessage(content=stop_text)]}
 
 
 def _consecutive_call_count(messages: list, name: str, args: dict) -> int:
@@ -529,6 +608,37 @@ def create_agent_graph(
         if path.is_file():
             text = path.read_text(encoding="utf-8").strip()
             return text if text else None
+        return None
+
+    def _load_project_instructions() -> str | None:
+        """Load project instructions from CLAUDE.md or AGENTS.md in the cwd.
+
+        Returns the content wrapped in a ``<system-reminder>`` block ready to
+        be prepended to the first user message, or ``None`` when neither file
+        exists (or both are empty).  ``CLAUDE.md`` wins when both are present.
+
+        These deliberately do NOT go into the system prompt: riding inside the
+        first user message keeps the system prompt free of per-project content
+        while the wrapper text recovers the instruction authority.  Because the
+        block sits at the very start of the conversation and the file rarely
+        changes mid-session, the provider prompt-cache prefix stays intact.
+        The file is re-read every turn, so edits take effect immediately.
+        """
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            path = Path(name)
+            if path.is_file():
+                text = path.read_text(encoding="utf-8").strip()
+                if text:
+                    return (
+                        "<system-reminder>\n"
+                        f"Project instructions from {path.resolve()} are shown "
+                        "below. Be sure to adhere to these instructions. "
+                        "IMPORTANT: These instructions OVERRIDE any default "
+                        "behavior and you MUST follow them exactly as "
+                        "written.\n\n"
+                        f"{text}\n"
+                        "</system-reminder>"
+                    )
         return None
 
     def _build_system_prompt(config: RunnableConfig) -> str | None:
@@ -793,6 +903,26 @@ def create_agent_graph(
         # Repair any dangling tool calls within the context window.
         clean_messages = _repair_dangling_tool_calls(context_msgs)
 
+        # Project instructions (CLAUDE.md / AGENTS.md) are merged into the
+        # first user message of the outgoing request only - never written to
+        # the checkpoint.  ACP agents (Claude Code, Gemini CLI, ...) run in
+        # the same cwd and read these files themselves, so injecting here
+        # would duplicate them.
+        project_instructions = _load_project_instructions()
+        if project_instructions and not isinstance(provider, ACPProvider):
+            for i, msg in enumerate(clean_messages):
+                if isinstance(msg, HumanMessage):
+                    if isinstance(msg.content, str):
+                        content = f"{project_instructions}\n\n{msg.content}"
+                    else:
+                        content = (
+                            [{"type": "text", "text": project_instructions}]
+                            + list(msg.content)
+                        )
+                    clean_messages = list(clean_messages)
+                    clean_messages[i] = msg.model_copy(update={"content": content})
+                    break
+
         allowed = _get_allowed(config)
         skill_tools = list(registry.list_tools(skill_names=list(allowed)))
         mcp_tools = await mcp_manager.get_tools(allowed) if mcp_manager else []
@@ -880,17 +1010,47 @@ def create_agent_graph(
         # Infinite loop guard: block any tool call that has appeared consecutively
         # more than max_tool_repetitions times with identical parameters.
         max_reps = config.get("configurable", {}).get("max_tool_repetitions", 3)
+        budget = config.get("configurable", {}).get(
+            "max_tool_calls_per_turn", MAX_TOOL_CALLS_PER_TURN)
         all_messages = list(state["messages"])
         last_ai = all_messages[-1] if all_messages else None
         if isinstance(last_ai, AIMessage):
+            # Per-turn tool-call budget (counts the calls pending right now).
+            if budget and _tool_calls_this_turn(all_messages) > budget:
+                return _stop_turn(
+                    last_ai,
+                    LOOP_GUARD_PREFIX + " tool-call budget exhausted. Turn ended.",
+                    f"Stopped: I have issued more than {budget} tool calls in "
+                    f"this turn without finishing. I am probably stuck - "
+                    f"please check the last tool results and tell me how to "
+                    f"proceed (or raise max_tool_calls_per_turn).",
+                )
             for tc in getattr(last_ai, "tool_calls", []):
                 if _consecutive_call_count(all_messages, tc["name"], tc["args"]) > max_reps:
+                    # The guard already fired once this turn and the model
+                    # is looping again: end the turn instead of handing the
+                    # model yet another chance to repeat itself.
+                    if _guard_fired_this_turn(all_messages):
+                        return _stop_turn(
+                            last_ai,
+                            LOOP_GUARD_PREFIX + " Turn ended.",
+                            f"Stopped: '{tc['name']}' keeps being called with "
+                            f"identical parameters after a loop warning. I am "
+                            f"stuck and need guidance - please check the last "
+                            f"tool results and tell me how to proceed.",
+                        )
                     return {"messages": [
                         ToolMessage(
                             content=(
-                                f"Error: '{tc['name']}' has been called more than {max_reps} "
-                                f"times consecutively with identical parameters. "
-                                f"Breaking the loop to prevent infinite repetition."
+                                f"{LOOP_GUARD_PREFIX} '{tc['name']}' has been called more than "
+                                f"{max_reps} times consecutively with identical parameters. "
+                                f"Breaking the loop to prevent infinite repetition. "
+                                f"Repeating this call will not change its result. "
+                                f"Do NOT re-create the plan or retry the same call. "
+                                f"Instead: re-read the previous result or error, run a "
+                                f"different diagnostic (e.g. list the parent directory, "
+                                f"check the file exists, print the variable), or tell "
+                                f"the user what is blocking you."
                             ),
                             tool_call_id=t["id"],
                             name=t["name"],
@@ -957,10 +1117,14 @@ def create_agent_graph(
         )
         cap = config.get("configurable", {}).get("tool_output_cap", MAX_TOOL_OUTPUT_CAP)
 
-        tool_node = ToolNode(langchain_tools)
+        # Per-call error handling: a failing tool yields an error ToolMessage
+        # for *its* call only, so sibling calls in the same batch keep their
+        # real results (and the error is not duplicated once per call).
+        tool_node = ToolNode(langchain_tools, handle_tool_errors=_tool_error_content)
         try:
             result = await tool_node.ainvoke(state, config)
         except Exception as exc:
+            # Safety net for failures outside tool execution itself.
             last = state["messages"][-1]
             return {"messages": [
                 ToolMessage(
@@ -989,6 +1153,14 @@ def create_agent_graph(
             return "tools"
         return END
 
+    def after_tools(state: AgentState) -> str:
+        # The tools node ends the turn itself (loop guard) by appending a
+        # final AIMessage; otherwise hand the tool results back to the model.
+        last = state["messages"][-1]
+        if isinstance(last, AIMessage):
+            return END
+        return "agent"
+
     workflow = StateGraph(AgentState)
     workflow.add_node("agent", call_model)
     workflow.add_node("tools", execute_tools)
@@ -999,6 +1171,10 @@ def create_agent_graph(
         should_continue,
         {"tools": "tools", END: END},
     )
-    workflow.add_edge("tools", "agent")
+    workflow.add_conditional_edges(
+        "tools",
+        after_tools,
+        {"agent": "agent", END: END},
+    )
 
     return workflow

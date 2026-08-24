@@ -8,7 +8,7 @@ bridges them to the executable LangChain tool interface expected by ToolNode.
 from langchain_core.tools import StructuredTool
 from typing import Any
 from .models import SkillTool
-from .entrypoints import resolve_entrypoint
+from .entrypoints import resolve_entrypoint, ToolTimeoutError
 
 
 def skilltool_to_langchain_tool(skill_tool: SkillTool) -> StructuredTool:
@@ -44,6 +44,11 @@ def skilltool_to_langchain_tool(skill_tool: SkillTool) -> StructuredTool:
         for attempt in range(retries + 1):
             try:
                 return resolver(skill_tool.entrypoint, **call_kwargs)
+            except ToolTimeoutError:
+                # Retrying a timeout multiplies the wait without new
+                # information; let the LLM decide (larger timeout_s or a
+                # different command).
+                raise
             except Exception as exc:
                 last_exc = exc
         raise last_exc

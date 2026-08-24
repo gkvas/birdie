@@ -1,3 +1,232 @@
+## [0.15.0] - 2026-08-24
+
+### Added
+- AWS Bedrock provider (`vendor: "bedrock"`): talks to Bedrock's
+  vendor-agnostic Converse API via `boto3`, so Anthropic, Amazon Nova,
+  Meta Llama, and Mistral models hosted on Bedrock all work through one
+  code path, including tool calling and streaming. Credentials resolve
+  via the standard AWS chain (env vars, shared config/credentials files,
+  IAM role, SSO, ...); `region_name`, `aws_access_key_id`,
+  `aws_secret_access_key`, and `aws_session_token` can also be set
+  explicitly in the provider config. Requires `pip install boto3` (or the
+  new `birdie[bedrock]` extra). Added pricing-table entries for common
+  Bedrock foundation models and documented the new vendor in
+  `doc/cli.md` and the CLI help text.
+
+### Fixed
+- The Anthropic and Bedrock providers no longer end a turn silently when
+  the model hits the `max_tokens` output limit: `stop_reason` is now
+  recorded in the message metadata and a visible `[Truncated: ...]`
+  marker is emitted instead of empty content. The default `max_tokens`
+  for both providers was raised from 4096 to 16000, because thinking
+  models count reasoning tokens against the cap - previously the whole
+  budget could be consumed by internal reasoning and the CLI printed a
+  bare `(no response)`. (#80)
+
+## [0.14.1] - 2026-08-22
+
+### Fixed
+- `anthropic>=1.0` removed `temperature`/`top_p`/`top_k` from
+  `messages.create()`, so every Anthropic request failed client-side with
+  `TypeError: AsyncMessages.create() got an unexpected keyword argument
+  'temperature'`. The provider now probes the installed SDK at startup and
+  skips `temperature` when the parameter is gone, and the SDK `TypeError`
+  is treated like an API rejection so the drop-and-retry path covers it too.
+
+## [0.14.0] - 2026-08-22
+
+### Added
+- Leaving the CLI now prints the command that resumes the session, so the
+  session ID does not have to be looked up by hand:
+
+      Goodbye.
+      Resume this session with:
+        birdie --session-id 2026-08-22_13 --config ~/.birdie/mistral.json
+
+  Shown on all three exits (Ctrl+C twice, Ctrl+D, `/quit`). Options the
+  session was started with (`--user`, `--skills-dir`, `--agents-dir`,
+  `--config`, `--debug`) are echoed back shell-quoted; defaults are left
+  off because they resolve the same way on the next start.
+
+## [0.13.3] - 2026-08-22
+
+### Fixed
+- Network failures while calling the provider (connect/read timeouts,
+  resets, dropped connections) are now retried with the same back-off as
+  rate limits. The Mistral SDK raises raw `httpx` exceptions, so a single
+  `ReadTimeout` used to abort the turn.
+- When those retries are exhausted the agent raises the new
+  `BirdieProviderUnavailableError` (both it and `BirdieRateLimitError`
+  subclass `BirdieTransientError`) and the CLI reports "Provider
+  unreachable" rather than "Rate limit reached".
+- The CLI prints turn errors as a single line instead of a full traceback.
+  The traceback is logged at DEBUG and printed only with the new `--debug`
+  flag or `BIRDIE_DEBUG=1`.
+
+## [0.13.2] - 2026-08-22
+
+### Fixed
+- `bash:` tools that exit non-zero now report the exit code and both
+  stdout and stderr (tail-capped). Only stderr was quoted before, so a
+  script that printed its diagnostics to stdout and then exited 1 left
+  the model with a bare `Command failed:`.
+- The CLI escapes tool output before rendering it. Rich treated bracketed
+  text such as the `[stderr]` label as markup and dropped the line, so the
+  terminal hid the stderr marker the model was seeing.
+
+## [0.13.1] - 2026-08-22
+
+### Fixed
+- Ctrl+C during a `bash:` tool call now stops the command. The cancelled
+  turn only detached the coroutine while the call kept running in a
+  worker thread, so the shell kept working until its timeout expired.
+- Quitting no longer hangs. A tool call still parked in the event loop's
+  thread pool held up shutdown for as long as asyncio waits for that pool
+  (300s), and a Ctrl+C out of that wait dumped an asyncio teardown
+  traceback plus a deadlocked atexit handler. The persistent shell is now
+  killed before the loop joins its threads, `ShellSession.close()` no
+  longer waits for the call lock (killing the shell is what releases it),
+  and a `KeyboardInterrupt` reaching `main()` exits quietly with status
+  130.
+
+## [0.13.0] - 2026-08-22
+
+### Added
+- Per-turn tool-call budget: `max_tool_calls_per_turn` (agent-level config
+  key, default 40, 0 disables). When the model issues more tool calls than
+  the budget within one user turn the graph ends the turn with a
+  "Stopped: ... probably stuck" message instead of re-invoking the model.
+  This backstops looping that the exact-match loop guard cannot catch, such
+  as the same command re-issued with a different `sleep N` suffix.
+
+## [0.12.0] - 2026-08-22
+
+### Added
+- Loop guard now ends the turn: the first time a tool is called more than
+  `max_tool_repetitions` times with identical parameters the model gets a
+  prescriptive warning (inspect the error, run a different diagnostic, or
+  ask the user); if the guard fires again in the same turn the graph stops
+  and returns a "Stopped: ... I am stuck" message to the user instead of
+  re-invoking the model. Previously the guard only returned an error and
+  the model could loop indefinitely.
+- `todo_create_plan` refuses a verbatim re-plan ("Plan unchanged") instead
+  of printing a fresh all-unchecked plan, a common way weak models reset
+  progress after an error.
+
+### Changed
+- `run_bash` always surfaces stderr, even on exit code 0, and labels a
+  fully silent command explicitly (`(command produced no output, exit
+  code 0)`). Pipelines such as `cat missing | grep x | head` no longer
+  return a blank result that hides the underlying error.
+- `bash:` template arguments expand `~` before quoting, so path-taking
+  tools such as `list_dir(path='~/git')` work.
+- Tool errors are handled per call (`ToolNode(handle_tool_errors=...)`):
+  one failing tool in a multi-call batch no longer overwrites the results
+  of its siblings or duplicates its error once per call.
+
+### Fixed
+- The CLI now prints messages emitted by the tools node (the loop-guard
+  stop message was shown as "(no response)").
+
+## [0.11.0] - 2026-08-22
+
+### Added
+- Persistent shell session for `bash:` entrypoints: `run_bash` now executes
+  in one long-lived shell per birdie process (Claude Code style), so working
+  directory, exported variables, functions and aliases persist from one tool
+  call to the next. Commands are framed with per-call sentinels on both
+  streams, so background jobs holding the pipes open can never block a call.
+  Windows falls back to the previous one-shot execution;
+  `BIRDIE_PERSISTENT_SHELL=0` opts out everywhere.
+
+### Changed
+- A `timeout_s` expiry now kills the shell's descendant processes
+  (background jobs included) but spares the session — exports and cwd
+  survive, and the error message says so. Only a genuinely wedged shell is
+  killed and respawned, with the error noting that state was lost. Daemons
+  that must survive a timeout should be started with
+  `setsid <cmd> >/dev/null 2>&1 &` (the Shell skill description teaches
+  this).
+- A shell that dies mid-command (`exit`, `exec`, persisted `set -e`)
+  reports its exit code plus a session-reset note and respawns
+  transparently on the next call.
+
+## [0.10.0] - 2026-08-22
+
+### Added
+- Per-tool-call timeout: every `bash:` and `http:` skill tool now advertises an
+  optional `timeout_s` parameter the LLM can set per call (clamped to 1-600 s),
+  auto-injected into the tool schema at SKILL.MD load time so all call paths
+  (ToolNode, ACP MCP server, direct resolver calls) honor it. Precedence:
+  per-call `timeout_s` > SKILL.MD `timeout:` > scheme default (120 s for bash,
+  30 s for HTTP). Timeout errors quote the partial output captured so far and
+  are never auto-retried.
+
+### Changed
+- Bash commands now default to a 120 s timeout instead of running unbounded;
+  slow commands (builds, test suites) should pass `timeout_s` explicitly.
+- On timeout the command's whole process tree is killed, not just the shell:
+  POSIX via `start_new_session` + `killpg` (TERM, then KILL), Windows via
+  `taskkill /F /T`. A descendant that escapes the kill and holds the output
+  pipe open no longer hangs the tool call.
+
+### Fixed
+- Non-UTF-8 command output (e.g. Windows-codepage tools under WSL) no longer
+  crashes the output reader and silently truncates the result; pipes decode
+  with `errors="replace"`.
+
+## [0.9.0] - 2026-08-22
+
+### Added
+- Project instructions: `CLAUDE.md` (or `AGENTS.md` as fallback) in the current
+  working directory is now picked up automatically. The content is wrapped in a
+  `<system-reminder>` block and merged into the first user message of each
+  request - the Claude Code approach - so the system prompt and the provider
+  prompt-cache prefix stay stable. Never written to the checkpoint; skipped for
+  ACP agents, which read these files themselves.
+- Non-interactive mode via `-p`/`--prompt` CLI argument: allows passing a prompt directly to birdie, which then runs once and outputs the AI response to stdout (similar to Claude Code's `-p` flag). Works with all existing CLI options like `--config`, `--user`, and `--session-id`.
+
+## [0.8.1] - 2026-08-22
+
+### Fixed
+- Documentation: Added ACP to the list of supported vendors in the CLI help text (`/help`).
+
+## [0.8.0] - 2026-08-21
+
+## [0.8.0] - 2026-08-21
+
+### Added
+- ACP tool-call streaming: `tool_call` / `tool_call_update` session updates
+  from the ACP agent subprocess are rendered live in the CLI while the turn
+  is streaming, instead of the agent's tool activity being invisible.
+- ACP usage reporting: `usage_update` notifications (context tokens used,
+  context window size, cumulative cost) are captured by `ACPProvider` and
+  attached to the returned message as `usage_metadata` /
+  `response_metadata`. The CLI status bar shows context as used/window,
+  `/cost` prefers the agent-reported cost over the pricing-table estimate,
+  and cumulative cost is persisted per session as `total_cost_usd`. As a
+  side effect, `compaction_token_threshold` now also works for ACP
+  sessions.
+- ACP permission gate: `session/request_permission` is routed through an
+  optional `permission_callback` (sync or async, returning
+  allow / allow_always / deny; errors fail closed) instead of being
+  auto-allowed. The CLI prompts interactively and persists "always"
+  approvals per session in `approved_acp_tools`, keyed by the agent's
+  allow_always option label, so they survive the per-turn subprocess
+  respawn. Library users without a callback keep the auto-allow behaviour.
+- The CLI status bar shows the current git branch and working-tree status
+  on the right.
+
+### Changed
+- Documentation synced with the current code.
+
+### Fixed
+- CLI crashed at startup while rendering the status bar.
+- The status bar displayed "unknown" instead of the ACP agent's active
+  model; it now shows the model reported by the agent session.
+- Pinned the `mcp` dependency to `<2.0` to stay compatible with the
+  current API.
+
 ## [0.7.0] - 2026-07-27
 
 ### Added
