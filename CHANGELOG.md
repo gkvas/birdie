@@ -1,3 +1,29 @@
+## [0.15.1] - 2026-08-24
+
+### Fixed
+- Sessions with Anthropic models could degenerate into identical-tool-call
+  loops (repeated `git status`-style re-verification) until the loop guard
+  killed the turn. The per-turn volatile context (loaded skills, rolling
+  summary, LTM) was appended as a trailing `HumanMessage` on every model
+  call, including mid-turn tool rounds; a fresh human-role message after
+  every tool result reads as a turn boundary to the model, which then
+  re-oriented instead of continuing its plan. The ephemeral
+  `<session_context>` message is now inserted immediately before the
+  turn's user message instead of after the conversation tail, so mid-turn
+  tool rounds stay uninterrupted. Reproduced deterministically against the
+  Anthropic API by replaying a real looping session round with and
+  without the trailing message.
+- Anthropic prompt-cache breakpoints adapted to the new placement: one on
+  the message before the ephemeral context (history prefix stays cached
+  across turns) and one on the last message (tool rounds extend the cache
+  within a turn); the volatile message itself is never a cache target.
+- `cache_read_input_tokens`/`cache_creation_input_tokens` are now folded
+  back into `usage_metadata["input_tokens"]`. Anthropic's `input_tokens`
+  excludes cached tokens, so a 200k context was reported as only the
+  uncached tail, which silently broke `compaction_token_threshold` and
+  context/cost tracking. The split is preserved under
+  `input_token_details`.
+
 ## [0.15.0] - 2026-08-24
 
 ### Added
