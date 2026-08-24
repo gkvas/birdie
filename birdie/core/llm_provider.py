@@ -108,7 +108,7 @@ class ProviderConfig(BaseModel):
         default="openai",
         description=(
             "LLM vendor identifier.  "
-            "Supported: openai | azure | anthropic | mistral | gemini | ollama | langchain | acp"
+            "Supported: openai | azure | anthropic | bedrock | mistral | gemini | ollama | langchain | acp"
         ),
     )
     model: Optional[str] = Field(
@@ -119,7 +119,9 @@ class ProviderConfig(BaseModel):
         default=None,
         description=(
             "API key.  Falls back to the vendor environment variable "
-            "(OPENAI_API_KEY, AZURE_OPENAI_API_KEY, ANTHROPIC_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY)."
+            "(OPENAI_API_KEY, AZURE_OPENAI_API_KEY, ANTHROPIC_API_KEY, MISTRAL_API_KEY, GEMINI_API_KEY). "
+            "For ``bedrock``, this maps to ``aws_access_key_id``; AWS credentials are otherwise "
+            "resolved via the standard boto3 credential chain."
         ),
     )
     base_url: Optional[str] = Field(
@@ -1223,6 +1225,338 @@ class AnthropicProvider(LLMProvider):
 
 
 # ---------------------------------------------------------------------------
+# AWS Bedrock provider (native boto3 SDK, Converse API)
+# ---------------------------------------------------------------------------
+
+def _lc_to_bedrock_messages(messages: list[BaseMessage]) -> list[dict]:
+    """
+    Convert LangChain messages to Bedrock's Converse API message format.
+
+    Key differences from OpenAI/Anthropic:
+    - SystemMessage is handled as a top-level field (extracted by caller).
+    - ToolMessages must be batched into a single "user" message as
+      ``toolResult`` content blocks.
+    - AIMessages with tool_calls emit ``toolUse`` content blocks.
+    - Every content block is ``{"text": ...}`` / ``{"toolUse": {...}}`` /
+      ``{"toolResult": {...}}`` rather than bare strings.
+    """
+    result: list[dict] = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if isinstance(msg, SystemMessage):
+            i += 1  # caller extracts this separately
+        elif isinstance(msg, HumanMessage):
+            result.append({"role": "user", "content": [{"text": str(msg.content)}]})
+            i += 1
+        elif isinstance(msg, AIMessage):
+            content: list[dict] = []
+            if msg.content:
+                content.append({"text": str(msg.content)})
+            for tc in msg.tool_calls or []:
+                content.append({
+                    "toolUse": {
+                        "toolUseId": tc["id"],
+                        "name": tc["name"],
+                        "input": tc["args"],
+                    },
+                })
+            if not content:
+                content = [{"text": ""}]
+            result.append({"role": "assistant", "content": content})
+            i += 1
+        elif isinstance(msg, ToolMessage):
+            # Batch consecutive ToolMessages into one user message
+            blocks: list[dict] = []
+            while i < len(messages) and isinstance(messages[i], ToolMessage):
+                tm = messages[i]
+                content = str(tm.content)
+                if len(content) > _MAX_TOOL_CONTENT_CHARS:
+                    dropped = len(content) - _MAX_TOOL_CONTENT_CHARS
+                    content = (
+                        content[:_MAX_TOOL_CONTENT_CHARS]
+                        + f"\n[...{dropped} characters truncated]"
+                    )
+                blocks.append({
+                    "toolResult": {
+                        "toolUseId": tm.tool_call_id,
+                        "content": [{"text": content}],
+                    },
+                })
+                i += 1
+            result.append({"role": "user", "content": blocks})
+        else:
+            i += 1
+    return result
+
+
+def _bedrock_response_to_lc(response: dict) -> AIMessage:
+    """Convert a Bedrock Converse API response dict to a LangChain AIMessage."""
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+
+    message = (response.get("output") or {}).get("message") or {}
+    for block in message.get("content") or []:
+        if "text" in block:
+            text_parts.append(block["text"])
+        elif "toolUse" in block:
+            tu = block["toolUse"]
+            tool_calls.append({
+                "id": tu.get("toolUseId", ""),
+                "name": tu.get("name", ""),
+                "args": tu.get("input") or {},
+                "type": "tool_call",
+            })
+
+    usage_metadata = None
+    usage = response.get("usage")
+    if usage:
+        inp = usage.get("inputTokens", 0) or 0
+        out = usage.get("outputTokens", 0) or 0
+        usage_metadata = {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+
+    stop_reason = response.get("stopReason")
+    response_metadata: dict = {}
+    if isinstance(stop_reason, str):
+        response_metadata["stop_reason"] = stop_reason
+
+    content = " ".join(text_parts)
+    # Surface max_tokens truncation instead of silently returning an empty
+    # message (mirrors _anthropic_response_to_lc): on thinking models the
+    # whole output budget can be consumed by internal reasoning, leaving
+    # no text and no toolUse blocks.
+    if stop_reason == "max_tokens" and not tool_calls:
+        if not content.strip():
+            content = (
+                "[Truncated: the response hit the max_tokens output limit "
+                "before producing any visible output (the budget was likely "
+                "spent on internal reasoning). Raise max_tokens in the "
+                "provider config.]"
+            )
+        else:
+            content += "\n[Truncated: the response hit the max_tokens output limit.]"
+
+    return AIMessage(
+        content=content,
+        tool_calls=tool_calls,
+        usage_metadata=usage_metadata,
+        response_metadata=response_metadata,
+    )
+
+
+def _tools_to_bedrock(tools: list[NormalizedToolDef]) -> dict:
+    return {
+        "tools": [
+            {
+                "toolSpec": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "inputSchema": {"json": t["parameters"]},
+                },
+            }
+            for t in tools
+        ]
+    }
+
+
+class BedrockProvider(LLMProvider):
+    """
+    AWS Bedrock via the official boto3 SDK, using the vendor-agnostic
+    Converse API (supports Anthropic, Meta Llama, Amazon Nova, Mistral, and
+    other Bedrock-hosted model families through a single wire format).
+
+    Install: pip install boto3
+
+    Authentication follows the standard AWS credential chain (environment
+    variables, shared config/credentials files, IAM role, SSO, ...).
+    ``api_key``/``aws_access_key_id``/``aws_secret_access_key``/
+    ``aws_session_token`` may be supplied explicitly; otherwise boto3
+    resolves credentials automatically.
+
+    ``model`` is the Bedrock model ID or inference-profile ID/ARN, e.g.
+    ``anthropic.claude-sonnet-4-20250514-v1:0`` or
+    ``us.anthropic.claude-sonnet-4-20250514-v1:0``.
+
+    ``region_name`` defaults to ``AWS_REGION`` / ``AWS_DEFAULT_REGION`` (or
+    boto3's own resolution) when omitted.
+    """
+
+    def __init__(
+        self,
+        model: str = "anthropic.claude-sonnet-4-20250514-v1:0",
+        api_key: str | None = None,
+        region_name: str | None = None,
+        aws_access_key_id: str | None = None,
+        aws_secret_access_key: str | None = None,
+        aws_session_token: str | None = None,
+        temperature: float = 0.0,
+        max_tokens: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        try:
+            import boto3
+        except ImportError as e:
+            raise ImportError("pip install boto3") from e
+
+        session_kw: dict[str, Any] = {}
+        resolved_key = aws_access_key_id or api_key or os.environ.get("AWS_ACCESS_KEY_ID")
+        resolved_secret = aws_secret_access_key or os.environ.get("AWS_SECRET_ACCESS_KEY")
+        resolved_token = aws_session_token or os.environ.get("AWS_SESSION_TOKEN")
+        if resolved_key:
+            session_kw["aws_access_key_id"] = resolved_key
+        if resolved_secret:
+            session_kw["aws_secret_access_key"] = resolved_secret
+        if resolved_token:
+            session_kw["aws_session_token"] = resolved_token
+        resolved_region = (
+            region_name
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+        )
+        if resolved_region:
+            session_kw["region_name"] = resolved_region
+
+        self._client = boto3.client("bedrock-runtime", **session_kw)
+        self._model = model
+        self._temperature = temperature
+        # 16000 leaves room for models with always-on/adaptive thinking,
+        # whose reasoning tokens count against max_tokens - a 4096 cap can
+        # be fully consumed by thinking, ending the turn with no visible
+        # output (same rationale as AnthropicProvider).
+        self._max_tokens = max_tokens or 16000
+
+    def supports_tools(self) -> bool:
+        return True
+
+    def supports_streaming(self) -> bool:
+        return True
+
+    def supports_json_mode(self) -> bool:
+        # Bedrock's Converse API has no dedicated JSON mode; callers
+        # instruct via system prompt.
+        return False
+
+    def _build_kwargs(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None,
+        system_prompt: str | None,
+        temperature: float | None,
+        max_tokens: int | None,
+    ) -> dict:
+        resolved_system = system_prompt
+        if not resolved_system:
+            system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
+            if system_msgs:
+                resolved_system = str(system_msgs[-1].content)
+
+        non_system = [m for m in messages if not isinstance(m, SystemMessage)]
+        kw: dict[str, Any] = {
+            "modelId": self._model,
+            "messages": _lc_to_bedrock_messages(non_system),
+            "inferenceConfig": {
+                "maxTokens": max_tokens if max_tokens is not None else self._max_tokens,
+                "temperature": temperature if temperature is not None else self._temperature,
+            },
+        }
+        if resolved_system:
+            kw["system"] = [{"text": resolved_system}]
+        if tools:
+            kw["toolConfig"] = _tools_to_bedrock(tools)
+        return kw
+
+    def chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        json_mode: bool = False,
+        **kwargs: Any,
+    ) -> BaseMessage:
+        kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens)
+        self._log_request(messages, tools, system_prompt)
+        response = self._client.converse(**kw)
+        result = _bedrock_response_to_lc(response)
+        self._log_response(result)
+        return result
+
+    async def achat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        json_mode: bool = False,
+        **kwargs: Any,
+    ) -> BaseMessage:
+        # boto3 has no native async client; offload the blocking call so
+        # the event loop keeps making progress.
+        kw = self._build_kwargs(messages, tools, system_prompt, temperature, max_tokens)
+        self._log_request(messages, tools, system_prompt)
+        response = await asyncio.to_thread(self._client.converse, **kw)
+        result = _bedrock_response_to_lc(response)
+        self._log_response(result)
+        return result
+
+    def stream_chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> Iterator[BaseMessage]:
+        kw = self._build_kwargs(messages, tools, system_prompt, kwargs.pop("temperature", 0.0), None)
+        response = self._client.converse_stream(**kw)
+        for event in response["stream"]:
+            delta = event.get("contentBlockDelta", {}).get("delta") if isinstance(event, dict) else None
+            if delta and "text" in delta:
+                yield AIMessageChunk(content=delta["text"])
+
+    async def astream_chat(
+        self,
+        messages: list[BaseMessage],
+        tools: list[NormalizedToolDef] | None = None,
+        system_prompt: str | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[BaseMessage]:
+        kw = self._build_kwargs(messages, tools, system_prompt, kwargs.pop("temperature", 0.0), None)
+        response = await asyncio.to_thread(self._client.converse_stream, **kw)
+        for event in response["stream"]:
+            delta = event.get("contentBlockDelta", {}).get("delta") if isinstance(event, dict) else None
+            if delta and "text" in delta:
+                yield AIMessageChunk(content=delta["text"])
+
+    def list_models(self) -> list[ModelInfo]:
+        # Cached catalog of common Bedrock foundation models (2026-07).
+        # Bedrock model availability is region- and account-dependent, so
+        # this is a representative subset rather than a live query.
+        _KNOWN = {
+            "anthropic.claude-sonnet-4-20250514-v1:0":  {"context_window": 1_000_000},
+            "anthropic.claude-opus-4-20250514-v1:0":    {"context_window": 200_000},
+            "anthropic.claude-3-5-sonnet-20241022-v2:0":{"context_window": 200_000},
+            "anthropic.claude-3-5-haiku-20241022-v1:0": {"context_window": 200_000},
+            "amazon.nova-pro-v1:0":                     {"context_window": 300_000},
+            "amazon.nova-lite-v1:0":                    {"context_window": 300_000},
+            "amazon.nova-micro-v1:0":                   {"context_window": 128_000},
+            "meta.llama3-1-70b-instruct-v1:0":          {"context_window": 128_000},
+            "mistral.mistral-large-2407-v1:0":          {"context_window": 128_000},
+        }
+        return [
+            ModelInfo(
+                id=k,
+                supports_tools=True,
+                supports_streaming=True,
+                supports_json_mode=False,
+                **v,
+            )
+            for k, v in _KNOWN.items()
+        ]
+
+
+# ---------------------------------------------------------------------------
 # LangChain adapter (wraps any BaseChatModel)
 # ---------------------------------------------------------------------------
 
@@ -2272,6 +2606,13 @@ def get_llm_provider(
         if cfg.max_tokens: kw["max_tokens"] = cfg.max_tokens
         return MistralProvider(**kw, **extra_kw)
 
+    if vendor == "bedrock":
+        kw = {"temperature": cfg.temperature}
+        if cfg.model:      kw["model"]     = cfg.model
+        if cfg.api_key:    kw["api_key"]   = cfg.api_key
+        if cfg.max_tokens: kw["max_tokens"] = cfg.max_tokens
+        return BedrockProvider(**kw, **extra_kw)
+
     if vendor == "azure":
         kw = {"temperature": cfg.temperature}
         if cfg.model:      kw["model"]     = cfg.model
@@ -2314,7 +2655,7 @@ def get_llm_provider(
 
     raise ValueError(
         f"Unknown vendor '{vendor}'. "
-        "Supported: openai, azure, anthropic, mistral, gemini, ollama, langchain, acp"
+        "Supported: openai, azure, anthropic, bedrock, mistral, gemini, ollama, langchain, acp"
     )
 
 

@@ -1,3 +1,28 @@
+## [0.15.0] - 2026-08-24
+
+### Added
+- AWS Bedrock provider (`vendor: "bedrock"`): talks to Bedrock's
+  vendor-agnostic Converse API via `boto3`, so Anthropic, Amazon Nova,
+  Meta Llama, and Mistral models hosted on Bedrock all work through one
+  code path, including tool calling and streaming. Credentials resolve
+  via the standard AWS chain (env vars, shared config/credentials files,
+  IAM role, SSO, ...); `region_name`, `aws_access_key_id`,
+  `aws_secret_access_key`, and `aws_session_token` can also be set
+  explicitly in the provider config. Requires `pip install boto3` (or the
+  new `birdie[bedrock]` extra). Added pricing-table entries for common
+  Bedrock foundation models and documented the new vendor in
+  `doc/cli.md` and the CLI help text.
+
+### Fixed
+- The Anthropic and Bedrock providers no longer end a turn silently when
+  the model hits the `max_tokens` output limit: `stop_reason` is now
+  recorded in the message metadata and a visible `[Truncated: ...]`
+  marker is emitted instead of empty content. The default `max_tokens`
+  for both providers was raised from 4096 to 16000, because thinking
+  models count reasoning tokens against the cap - previously the whole
+  budget could be consumed by internal reasoning and the CLI printed a
+  bare `(no response)`. (#80)
+
 ## [0.14.1] - 2026-08-22
 
 ### Fixed

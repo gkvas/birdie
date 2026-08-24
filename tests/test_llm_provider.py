@@ -28,6 +28,11 @@ from birdie.core.llm_provider import (
     _is_temperature_rejection,
     _sdk_accepts_temperature,
     AnthropicProvider,
+    BedrockProvider,
+    _lc_to_bedrock_messages,
+    _bedrock_response_to_lc,
+    _tools_to_bedrock,
+    _MAX_TOOL_CONTENT_CHARS,
     skilltool_to_normalized_def,
     get_llm_provider,
     get_llm_provider_from_json,
@@ -419,6 +424,270 @@ class TestSkillToolNormalization:
         assert normalized["description"] == "Read a file"
         assert "properties" in normalized["parameters"]
         assert normalized["entrypoint"] == "bash:cat {path}"
+
+
+# ---------------------------------------------------------------------------
+# BedrockProvider - message conversion, tool defs, response parsing
+# ---------------------------------------------------------------------------
+
+class TestBedrockMessageConversion:
+    def test_human_message(self):
+        result = _lc_to_bedrock_messages([HumanMessage(content="hi")])
+        assert result == [{"role": "user", "content": [{"text": "hi"}]}]
+
+    def test_system_message_excluded(self):
+        # SystemMessage is handled as a top-level Bedrock field, not a message
+        result = _lc_to_bedrock_messages([SystemMessage(content="sys"), HumanMessage(content="hi")])
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+
+    def test_ai_message_no_tools(self):
+        result = _lc_to_bedrock_messages([AIMessage(content="pong")])
+        assert result == [{"role": "assistant", "content": [{"text": "pong"}]}]
+
+    def test_ai_message_with_tool_calls(self):
+        msg = AIMessage(
+            content="calling tool",
+            tool_calls=[{"id": "tc1", "name": "get_weather", "args": {"city": "Graz"}, "type": "tool_call"}],
+        )
+        result = _lc_to_bedrock_messages([msg])
+        content = result[0]["content"]
+        assert any("text" in b for b in content)
+        tool_block = next(b for b in content if "toolUse" in b)
+        assert tool_block["toolUse"]["toolUseId"] == "tc1"
+        assert tool_block["toolUse"]["name"] == "get_weather"
+        assert tool_block["toolUse"]["input"] == {"city": "Graz"}
+
+    def test_ai_message_with_tool_calls_no_text_still_has_content(self):
+        msg = AIMessage(
+            content="",
+            tool_calls=[{"id": "tc1", "name": "get_weather", "args": {}, "type": "tool_call"}],
+        )
+        result = _lc_to_bedrock_messages([msg])
+        assert result[0]["content"] == [{"toolUse": {"toolUseId": "tc1", "name": "get_weather", "input": {}}}]
+
+    def test_tool_messages_batched_into_single_user_turn(self):
+        msgs = [
+            ToolMessage(content="sunny", tool_call_id="tc1"),
+            ToolMessage(content="22°C", tool_call_id="tc2"),
+        ]
+        result = _lc_to_bedrock_messages(msgs)
+        # Both ToolMessages must be merged into ONE user turn
+        assert len(result) == 1
+        assert result[0]["role"] == "user"
+        assert len(result[0]["content"]) == 2
+        assert all("toolResult" in b for b in result[0]["content"])
+        assert result[0]["content"][0]["toolResult"]["toolUseId"] == "tc1"
+
+    def test_oversized_tool_result_truncated(self):
+        big = "x" * (_MAX_TOOL_CONTENT_CHARS + 500)
+        result = _lc_to_bedrock_messages([ToolMessage(content=big, tool_call_id="tc1")])
+        text = result[0]["content"][0]["toolResult"]["content"][0]["text"]
+        assert len(text) < len(big)
+        assert "characters truncated" in text
+
+
+class TestBedrockResponseConversion:
+    def test_text_only_response(self):
+        raw = {"output": {"message": {"content": [{"text": "Hello"}]}}}
+        msg = _bedrock_response_to_lc(raw)
+        assert isinstance(msg, AIMessage)
+        assert "Hello" in msg.content
+        assert msg.tool_calls == []
+
+    def test_tool_use_response(self):
+        raw = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"toolUse": {"toolUseId": "tu1", "name": "get_weather", "input": {"city": "Graz"}}},
+                    ],
+                },
+            },
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert len(msg.tool_calls) == 1
+        assert msg.tool_calls[0]["id"] == "tu1"
+        assert msg.tool_calls[0]["name"] == "get_weather"
+        assert msg.tool_calls[0]["args"] == {"city": "Graz"}
+
+    def test_usage_metadata_extracted(self):
+        raw = {
+            "output": {"message": {"content": [{"text": "Hi"}]}},
+            "usage": {"inputTokens": 10, "outputTokens": 5},
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert msg.usage_metadata["input_tokens"] == 10
+        assert msg.usage_metadata["output_tokens"] == 5
+        assert msg.usage_metadata["total_tokens"] == 15
+
+
+class TestBedrockStopReason:
+    def test_stop_reason_recorded_in_metadata(self):
+        raw = {
+            "output": {"message": {"content": [{"text": "Hi"}]}},
+            "stopReason": "end_turn",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert msg.response_metadata["stop_reason"] == "end_turn"
+        assert msg.content == "Hi"
+
+    def test_empty_max_tokens_response_gets_visible_marker(self):
+        raw = {"output": {"message": {"content": []}}, "stopReason": "max_tokens"}
+        msg = _bedrock_response_to_lc(raw)
+        assert "Truncated" in msg.content
+        assert "max_tokens" in msg.content
+        assert msg.response_metadata["stop_reason"] == "max_tokens"
+
+    def test_partial_text_max_tokens_gets_truncation_note(self):
+        raw = {
+            "output": {"message": {"content": [{"text": "partial answer"}]}},
+            "stopReason": "max_tokens",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert msg.content.startswith("partial answer")
+        assert "Truncated" in msg.content
+
+    def test_tool_calls_with_max_tokens_left_untouched(self):
+        raw = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"toolUse": {"toolUseId": "tu1", "name": "f", "input": {}}},
+                    ],
+                },
+            },
+            "stopReason": "max_tokens",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert len(msg.tool_calls) == 1
+        assert "Truncated" not in msg.content
+
+    def test_missing_stop_reason_ignored(self):
+        raw = {"output": {"message": {"content": [{"text": "x"}]}}}
+        msg = _bedrock_response_to_lc(raw)
+        assert "stop_reason" not in msg.response_metadata
+
+
+class TestBedrockDefaultMaxTokens:
+    def test_default_leaves_room_for_thinking(self):
+        with patch.dict("sys.modules", {"boto3": MagicMock()}):
+            provider = BedrockProvider(region_name="eu-central-1")
+        assert provider._max_tokens == 16000
+
+    def test_explicit_max_tokens_wins(self):
+        with patch.dict("sys.modules", {"boto3": MagicMock()}):
+            provider = BedrockProvider(region_name="eu-central-1", max_tokens=2048)
+        assert provider._max_tokens == 2048
+
+
+class TestBedrockToolDefConversion:
+    def test_tool_format(self, sample_tools):
+        result = _tools_to_bedrock(sample_tools)
+        spec = result["tools"][0]["toolSpec"]
+        assert spec["name"] == "get_weather"
+        assert spec["description"] == "Get current weather for a city"
+        assert spec["inputSchema"]["json"] == sample_tools[0]["parameters"]
+
+
+def _make_bedrock_provider() -> BedrockProvider:
+    """Build a BedrockProvider without touching the boto3 SDK."""
+    p = BedrockProvider.__new__(BedrockProvider)
+    p._model = "anthropic.claude-sonnet-4-20250514-v1:0"
+    p._temperature = 0.0
+    p._max_tokens = 4096
+    p._client = MagicMock()
+    return p
+
+
+class TestBedrockProvider:
+    def test_capability_flags(self):
+        p = _make_bedrock_provider()
+        assert p.supports_tools() is True
+        assert p.supports_streaming() is True
+        assert p.supports_json_mode() is False
+
+    def test_build_kwargs_basic(self):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, None, None)
+        assert kw["modelId"] == "anthropic.claude-sonnet-4-20250514-v1:0"
+        assert kw["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
+        assert kw["inferenceConfig"] == {"maxTokens": 4096, "temperature": 0.0}
+        assert "system" not in kw
+        assert "toolConfig" not in kw
+
+    def test_build_kwargs_system_prompt_param(self):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, "Be nice", None, None)
+        assert kw["system"] == [{"text": "Be nice"}]
+
+    def test_build_kwargs_system_message_fallback(self):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs(
+            [SystemMessage(content="sys"), HumanMessage(content="hi")], None, None, None, None,
+        )
+        assert kw["system"] == [{"text": "sys"}]
+        assert kw["messages"] == [{"role": "user", "content": [{"text": "hi"}]}]
+
+    def test_build_kwargs_with_tools(self, sample_tools):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs([HumanMessage(content="hi")], sample_tools, None, None, None)
+        assert kw["toolConfig"]["tools"][0]["toolSpec"]["name"] == "get_weather"
+
+    def test_build_kwargs_overrides(self):
+        p = _make_bedrock_provider()
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, 0.7, 200)
+        assert kw["inferenceConfig"] == {"maxTokens": 200, "temperature": 0.7}
+
+    def test_chat_calls_converse(self):
+        p = _make_bedrock_provider()
+        p._client.converse.return_value = {"output": {"message": {"content": [{"text": "Hello"}]}}}
+        msg = p.chat([HumanMessage(content="hi")])
+        assert "Hello" in msg.content
+        p._client.converse.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_achat_calls_converse(self):
+        p = _make_bedrock_provider()
+        p._client.converse.return_value = {"output": {"message": {"content": [{"text": "Hi async"}]}}}
+        msg = await p.achat([HumanMessage(content="hi")])
+        assert "Hi async" in msg.content
+
+    def test_list_models(self):
+        p = _make_bedrock_provider()
+        ids = {m.id for m in p.list_models()}
+        assert "anthropic.claude-sonnet-4-20250514-v1:0" in ids
+        assert "amazon.nova-pro-v1:0" in ids
+        by_id = {m.id: m for m in p.list_models()}
+        assert by_id["anthropic.claude-sonnet-4-20250514-v1:0"].supports_tools is True
+
+    def test_init_requires_boto3(self):
+        with patch.dict("sys.modules", {"boto3": None}):
+            with pytest.raises(ImportError):
+                BedrockProvider(model="anthropic.claude-sonnet-4-20250514-v1:0")
+
+    def test_init_resolves_credentials_from_kwargs(self):
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            BedrockProvider(
+                model="anthropic.claude-sonnet-4-20250514-v1:0",
+                aws_access_key_id="AKIA...",
+                aws_secret_access_key="secret",
+                region_name="us-west-2",
+            )
+        mock_boto3.client.assert_called_once_with(
+            "bedrock-runtime",
+            aws_access_key_id="AKIA...",
+            aws_secret_access_key="secret",
+            region_name="us-west-2",
+        )
+
+    def test_init_env_var_region_fallback(self, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "eu-central-1")
+        mock_boto3 = MagicMock()
+        with patch.dict("sys.modules", {"boto3": mock_boto3}):
+            BedrockProvider(model="anthropic.claude-sonnet-4-20250514-v1:0")
+        mock_boto3.client.assert_called_once_with("bedrock-runtime", region_name="eu-central-1")
 
 
 # ---------------------------------------------------------------------------
