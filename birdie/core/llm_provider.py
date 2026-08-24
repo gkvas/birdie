@@ -887,10 +887,32 @@ def _anthropic_response_to_lc(response: Any) -> AIMessage:
         out = getattr(response.usage, "output_tokens", 0) or 0
         usage_metadata = {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
 
+    stop_reason = getattr(response, "stop_reason", None)
+    response_metadata: dict = {}
+    if isinstance(stop_reason, str):
+        response_metadata["stop_reason"] = stop_reason
+
+    content = " ".join(text_parts)
+    # Surface max_tokens truncation instead of silently returning an empty
+    # message.  On thinking models the whole output budget can be consumed
+    # by internal reasoning, leaving no text and no tool_use blocks; the
+    # turn would otherwise end with no visible output at all.
+    if stop_reason == "max_tokens" and not tool_calls:
+        if not content.strip():
+            content = (
+                "[Truncated: the response hit the max_tokens output limit "
+                "before producing any visible output (the budget was likely "
+                "spent on internal reasoning). Raise max_tokens in the "
+                "provider config.]"
+            )
+        else:
+            content += "\n[Truncated: the response hit the max_tokens output limit.]"
+
     return AIMessage(
-        content=" ".join(text_parts),
+        content=content,
         tool_calls=tool_calls,
         usage_metadata=usage_metadata,
+        response_metadata=response_metadata,
     )
 
 
@@ -1021,8 +1043,11 @@ class AnthropicProvider(LLMProvider):
         # Place cache_control breakpoints on tools, system, and the last
         # stable message block (disable with "prompt_cache": false in config).
         self._prompt_cache = prompt_cache
-        # Anthropic requires max_tokens; use 4096 as a safe default
-        self._max_tokens = max_tokens or 4096
+        # Anthropic requires max_tokens.  16000 leaves room for models with
+        # always-on/adaptive thinking (Sonnet 5, Opus 5, Fable 5, ...), whose
+        # reasoning tokens count against max_tokens - a 4096 cap can be fully
+        # consumed by thinking, ending the turn with no visible output.
+        self._max_tokens = max_tokens or 16000
 
     def supports_tools(self) -> bool:
         return True
