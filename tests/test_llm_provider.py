@@ -226,6 +226,62 @@ class TestAnthropicResponseConversion:
         assert msg.tool_calls[0]["args"] == {"city": "Graz"}
 
 
+class TestAnthropicStopReason:
+    def _response(self, content, stop_reason):
+        r = MagicMock()
+        r.content = content
+        r.stop_reason = stop_reason
+        return r
+
+    def test_stop_reason_recorded_in_metadata(self):
+        r = self._response([MagicMock(type="text", text="Hi")], "end_turn")
+        msg = _anthropic_response_to_lc(r)
+        assert msg.response_metadata["stop_reason"] == "end_turn"
+        assert msg.content == "Hi"
+
+    def test_empty_max_tokens_response_gets_visible_marker(self):
+        r = self._response([], "max_tokens")
+        msg = _anthropic_response_to_lc(r)
+        assert "Truncated" in msg.content
+        assert "max_tokens" in msg.content
+        assert msg.response_metadata["stop_reason"] == "max_tokens"
+
+    def test_partial_text_max_tokens_gets_truncation_note(self):
+        r = self._response([MagicMock(type="text", text="partial answer")], "max_tokens")
+        msg = _anthropic_response_to_lc(r)
+        assert msg.content.startswith("partial answer")
+        assert "Truncated" in msg.content
+
+    def test_tool_calls_with_max_tokens_left_untouched(self):
+        block = MagicMock()
+        block.type = "tool_use"
+        block.id = "toolu_01"
+        block.name = "get_weather"
+        block.input = {}
+        r = self._response([block], "max_tokens")
+        msg = _anthropic_response_to_lc(r)
+        assert len(msg.tool_calls) == 1
+        assert "Truncated" not in msg.content
+
+    def test_non_string_stop_reason_ignored(self):
+        r = MagicMock()  # stop_reason is a bare MagicMock, not a str
+        r.content = [MagicMock(type="text", text="x")]
+        msg = _anthropic_response_to_lc(r)
+        assert "stop_reason" not in msg.response_metadata
+
+
+class TestAnthropicDefaultMaxTokens:
+    def test_default_leaves_room_for_thinking(self):
+        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
+            provider = AnthropicProvider(api_key="test")
+        assert provider._max_tokens == 16000
+
+    def test_explicit_max_tokens_wins(self):
+        with patch.dict("sys.modules", {"anthropic": MagicMock()}):
+            provider = AnthropicProvider(api_key="test", max_tokens=2048)
+        assert provider._max_tokens == 2048
+
+
 # ---------------------------------------------------------------------------
 # Anthropic temperature handling
 # ---------------------------------------------------------------------------
