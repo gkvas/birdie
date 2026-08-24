@@ -275,6 +275,47 @@ class TestAnthropicStopReason:
         assert "stop_reason" not in msg.response_metadata
 
 
+class TestAnthropicUsageMetadata:
+    class _Usage:
+        def __init__(self, **kw):
+            self.input_tokens = kw.get("input_tokens")
+            self.output_tokens = kw.get("output_tokens")
+            self.cache_read_input_tokens = kw.get("cache_read_input_tokens")
+            self.cache_creation_input_tokens = kw.get("cache_creation_input_tokens")
+
+    def _response(self, usage):
+        r = MagicMock()
+        r.content = [MagicMock(type="text", text="Hi")]
+        r.stop_reason = "end_turn"
+        r.usage = usage
+        return r
+
+    def test_cached_tokens_folded_into_input_tokens(self):
+        """Anthropic's input_tokens excludes cached tokens; with prompt
+        caching on, the uncached tail can be a tiny fraction of the real
+        context.  The cache figures must be folded back in."""
+        usage = self._Usage(
+            input_tokens=5_173, output_tokens=100,
+            cache_read_input_tokens=190_000,
+            cache_creation_input_tokens=4_827,
+        )
+        msg = _anthropic_response_to_lc(self._response(usage))
+        assert msg.usage_metadata["input_tokens"] == 200_000
+        assert msg.usage_metadata["output_tokens"] == 100
+        assert msg.usage_metadata["total_tokens"] == 200_100
+        assert msg.usage_metadata["input_token_details"] == {
+            "cache_read": 190_000, "cache_creation": 4_827,
+        }
+
+    def test_usage_without_cache_fields_unchanged(self):
+        usage = self._Usage(input_tokens=10, output_tokens=5)
+        msg = _anthropic_response_to_lc(self._response(usage))
+        assert msg.usage_metadata["input_tokens"] == 10
+        assert msg.usage_metadata["output_tokens"] == 5
+        assert msg.usage_metadata["total_tokens"] == 15
+        assert "input_token_details" not in msg.usage_metadata
+
+
 class TestAnthropicDefaultMaxTokens:
     def test_default_leaves_room_for_thinking(self):
         with patch.dict("sys.modules", {"anthropic": MagicMock()}):
@@ -2356,6 +2397,37 @@ class TestAnthropicPromptCaching:
         assert "cache_control" not in str(msgs[-1])  # volatile tail untouched
         stable_last = msgs[-2]
         assert stable_last["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+    def test_breakpoints_around_mid_conversation_ephemeral(self):
+        """Ephemeral before the turn's user message: breakpoints land on the
+        message before it (stable across-turn prefix) and on the last
+        message (within-turn growth); the volatile message stays untouched."""
+        p = _make_anthropic_provider("claude-opus-5")
+        ephemeral = HumanMessage(
+            content="<session_context>volatile</session_context>",
+            additional_kwargs={"birdie_ephemeral": True},
+        )
+        tool_ai = AIMessage(content="", tool_calls=[
+            {"name": "run", "args": {"cmd": "ls"}, "id": "tc1"},
+        ])
+        kw = p._build_kwargs(
+            [HumanMessage(content="hi"), AIMessage(content="hello"),
+             ephemeral, HumanMessage(content="do it"),
+             tool_ai, ToolMessage(content="file.txt", tool_call_id="tc1")],
+            None, None, None, None,
+        )
+        msgs = kw["messages"]
+        # [user hi, assistant hello, user ephemeral, user do it,
+        #  assistant tool_use, user tool_result]
+        assert len(msgs) == 6
+        # Stable prefix boundary: the message before the ephemeral.
+        assert msgs[1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        # The volatile message itself is never a cache target.
+        assert "cache_control" not in str(msgs[2])
+        # Within-turn boundary: the last message (the tool result batch).
+        assert msgs[-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+        # Nothing else got a breakpoint (Anthropic allows four in total).
+        assert str(kw).count("cache_control") == 2
 
     def test_breakpoint_on_last_message_when_no_ephemeral_tail(self):
         p = _make_anthropic_provider("claude-opus-5")

@@ -865,6 +865,13 @@ def _lc_to_anthropic_messages(messages: list[BaseMessage]) -> list[dict]:
     return result
 
 
+def _usage_token_count(usage: Any, attr: str) -> int:
+    """Read an integer token count off a vendor usage object; 0 when absent
+    or not an int (the SDK reports unavailable counts as ``None``)."""
+    val = getattr(usage, attr, 0)
+    return val if isinstance(val, int) else 0
+
+
 def _anthropic_response_to_lc(response: Any) -> AIMessage:
     """Convert an Anthropic Message object to a LangChain AIMessage."""
     text_parts: list[str] = []
@@ -883,9 +890,27 @@ def _anthropic_response_to_lc(response: Any) -> AIMessage:
 
     usage_metadata = None
     if hasattr(response, "usage") and response.usage:
-        inp = getattr(response.usage, "input_tokens", 0) or 0
-        out = getattr(response.usage, "output_tokens", 0) or 0
-        usage_metadata = {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+        # Anthropic's `input_tokens` EXCLUDES cached tokens: with prompt
+        # caching on, it only counts the uncached tail of the request, so a
+        # 200k-token context can report a few thousand input tokens.  Fold
+        # the cache figures back in so `input_tokens` reflects the real
+        # context size (compaction thresholds and cost tracking depend on
+        # it); the split is preserved under `input_token_details`.
+        inp = _usage_token_count(response.usage, "input_tokens")
+        out = _usage_token_count(response.usage, "output_tokens")
+        cache_read = _usage_token_count(response.usage, "cache_read_input_tokens")
+        cache_creation = _usage_token_count(response.usage, "cache_creation_input_tokens")
+        total_in = inp + cache_read + cache_creation
+        usage_metadata = {
+            "input_tokens": total_in,
+            "output_tokens": out,
+            "total_tokens": total_in + out,
+        }
+        if cache_read or cache_creation:
+            usage_metadata["input_token_details"] = {
+                "cache_read": cache_read,
+                "cache_creation": cache_creation,
+            }
 
     stop_reason = getattr(response, "stop_reason", None)
     response_metadata: dict = {}
@@ -931,29 +956,63 @@ def _attach_message_cache_breakpoint(
     anthropic_messages: list[dict],
     lc_messages: list[BaseMessage],
 ) -> None:
-    """Attach a cache_control breakpoint to the last *stable* message block.
+    """Attach cache_control breakpoints to the *stable* message blocks.
 
     The graph delivers per-turn volatile context (loaded skills, summary,
-    LTM) as a trailing message tagged ``birdie_ephemeral``; placing the
-    breakpoint on the message before it keeps the cached prefix identical
-    across turns, so conversation history is served from cache as it grows.
+    LTM) as a message tagged ``birdie_ephemeral`` inserted before the turn's
+    user message.  Up to two breakpoints are placed (tools and system use
+    the other two of Anthropic's four):
+
+    - on the message immediately before the ephemeral one: that prefix is
+      byte-identical across turns, so the conversation history keeps being
+      served from cache even though the volatile message changes each turn;
+    - on the last message, so each tool round within a turn extends the
+      cache incrementally.
+
+    The volatile message itself never receives a breakpoint - caching it
+    would be wasted writes.  Without an ephemeral message only the
+    last-message breakpoint is set.
     """
     if not anthropic_messages:
         return
-    target_idx = len(anthropic_messages) - 1
-    if lc_messages and lc_messages[-1].additional_kwargs.get("birdie_ephemeral"):
-        target_idx -= 1
-    if target_idx < 0:
-        return
-    msg = anthropic_messages[target_idx]
-    content = msg["content"]
-    if isinstance(content, str):
-        if not content:
-            return
-        content = [{"type": "text", "text": content}]
-        msg["content"] = content
-    if content and isinstance(content[-1], dict):
-        content[-1]["cache_control"] = {"type": "ephemeral"}
+
+    def _attach(idx: int) -> None:
+        msg = anthropic_messages[idx]
+        content = msg["content"]
+        if isinstance(content, str):
+            if not content:
+                return
+            content = [{"type": "text", "text": content}]
+            msg["content"] = content
+        if content and isinstance(content[-1], dict):
+            content[-1]["cache_control"] = {"type": "ephemeral"}
+
+    # Locate the ephemeral message in the converted list by content match
+    # (conversion merges/drops messages, so lc indices do not map 1:1).
+    ephemeral_idx = None
+    ephemeral = next(
+        (m for m in lc_messages
+         if m.additional_kwargs.get("birdie_ephemeral")),
+        None,
+    )
+    if ephemeral is not None:
+        ephemeral_content = str(ephemeral.content)
+        for i, m in enumerate(anthropic_messages):
+            if m["role"] == "user" and m["content"] == ephemeral_content:
+                ephemeral_idx = i
+                break
+
+    last = len(anthropic_messages) - 1
+    targets = set()
+    if ephemeral_idx is not None and ephemeral_idx > 0:
+        targets.add(ephemeral_idx - 1)
+    if ephemeral_idx == last:
+        if last > 0:
+            targets.add(last - 1)
+    else:
+        targets.add(last)
+    for idx in targets:
+        _attach(idx)
 
 
 # Model families that removed the sampling parameters (temperature / top_p /

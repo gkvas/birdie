@@ -715,8 +715,10 @@ def create_agent_graph(
         - the rolling summary of compacted-away conversation segments,
         - long-term memory (manual entries plus retrieved compaction entries).
 
-        It is delivered as an ephemeral message appended after the real
-        conversation, so it invalidates nothing in the cached prefix.
+        It is delivered as an ephemeral message inserted before the turn's
+        user message (never after tool results - a trailing human-role
+        message mid-turn reads as a turn boundary and makes the model
+        re-orient instead of continuing, see call_model).
 
         Returns ``""`` when nothing would be included.
         """
@@ -975,15 +977,23 @@ def create_agent_graph(
         system_prompt = _build_system_prompt(config)
 
         # Volatile per-turn context (loaded skills, summary, LTM) rides as an
-        # ephemeral trailing message so the cached prefix (tools + system +
-        # conversation history) stays byte-identical across turns.  It is
-        # never written to the checkpoint.
+        # ephemeral message inserted immediately BEFORE the turn's user
+        # message.  It is never written to the checkpoint.
+        #
+        # Placement matters: appending it after the conversation tail put a
+        # fresh human-role message after every tool result, which the model
+        # reads as a turn boundary - each tool round it would re-orient
+        # (re-check state it had already verified) instead of continuing its
+        # plan, degenerating into identical-tool-call loops.  Before the
+        # user message it reads as background context, mid-turn tool rounds
+        # stay uninterrupted, and the history prefix up to the previous turn
+        # plus all rounds within the current turn still cache cleanly.
         volatile_context = _build_volatile_context(
             state, config, ltm_context=ltm_context,
             summary_override=compaction_summary or None,
         )
         if volatile_context:
-            clean_messages = clean_messages + [HumanMessage(
+            ephemeral = HumanMessage(
                 content=(
                     "<session_context>\n"
                     "Context provided by the system for this turn "
@@ -992,7 +1002,15 @@ def create_agent_graph(
                     "</session_context>"
                 ),
                 additional_kwargs={"birdie_ephemeral": True},
-            )]
+            )
+            insert_at = 0
+            for i, m in enumerate(clean_messages):
+                if isinstance(m, HumanMessage):
+                    insert_at = i
+            clean_messages = (
+                clean_messages[:insert_at] + [ephemeral]
+                + clean_messages[insert_at:]
+            )
 
         response = await _achat_with_retry(
             provider,
