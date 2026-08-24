@@ -2075,22 +2075,38 @@ class TestAcpMcpServerWithAgents:
         )
         return agentdef_to_normalized_def(agent_def)
 
+    @staticmethod
+    def _schema(tool):
+        """Tool input schema across mcp versions (1.x inputSchema, 2.x input_schema)."""
+        return getattr(tool, "inputSchema", None) or getattr(tool, "input_schema", None)
+
     async def _list_tools(self, server):
-        """Invoke the list_tools request handler directly."""
+        """Invoke the tools/list handler directly (mcp 1.x or 2.x)."""
         import mcp.types as types
-        handler = server.request_handlers[types.ListToolsRequest]
-        result = await handler(types.ListToolsRequest(method="tools/list", params=None))
-        return result.root.tools
+        if hasattr(server, "request_handlers"):  # mcp 1.x
+            handler = server.request_handlers[types.ListToolsRequest]
+            result = await handler(types.ListToolsRequest(method="tools/list", params=None))
+            return result.root.tools
+        entry = server.get_request_handler("tools/list")
+        result = await entry.handler(None, None)
+        return result.tools
 
     async def _call_tool(self, server, name, arguments):
-        """Invoke the call_tool request handler directly."""
+        """Invoke the tools/call handler directly; returns (content, is_error)."""
         import mcp.types as types
-        handler = server.request_handlers[types.CallToolRequest]
-        req = types.CallToolRequest(
-            method="tools/call",
-            params=types.CallToolRequestParams(name=name, arguments=arguments),
+        if hasattr(server, "request_handlers"):  # mcp 1.x
+            handler = server.request_handlers[types.CallToolRequest]
+            req = types.CallToolRequest(
+                method="tools/call",
+                params=types.CallToolRequestParams(name=name, arguments=arguments),
+            )
+            result = await handler(req)
+            return result.root.content, bool(result.root.isError)
+        entry = server.get_request_handler("tools/call")
+        result = await entry.handler(
+            None, types.CallToolRequestParams(name=name, arguments=arguments),
         )
-        return await handler(req)
+        return result.content, bool(result.is_error)
 
     @pytest.mark.asyncio
     async def test_list_tools_includes_agents(self):
@@ -2127,17 +2143,17 @@ class TestAcpMcpServerWithAgents:
 
         tools = await self._list_tools(server)
         agent_tool = next(t for t in tools if t.name == "Summarizer")
-        assert "text" in agent_tool.inputSchema.get("properties", {})
+        assert "text" in self._schema(agent_tool).get("properties", {})
 
     @pytest.mark.asyncio
     async def test_call_unknown_tool_returns_error_result(self):
         """The MCP framework wraps ValueError into an isError CallToolResult."""
         from birdie.core.acp_mcp_server import _build_server
         server = _build_server(tool_defs=[], agent_defs=[])
-        result = await self._call_tool(server, "nonexistent", {})
-        # MCP framework converts the ValueError into an error result
-        assert result.root.isError is True
-        assert any("Unknown tool" in c.text for c in result.root.content)
+        content, is_error = await self._call_tool(server, "nonexistent", {})
+        # The ValueError is converted into an error result
+        assert is_error is True
+        assert any("Unknown tool" in c.text for c in content)
 
     @pytest.mark.asyncio
     async def test_call_agent_tool_invokes_invoke_agent(self):
@@ -2148,14 +2164,15 @@ class TestAcpMcpServerWithAgents:
         server = _build_server(tool_defs=[], agent_defs=[agent_raw])
 
         with patch("birdie.core.acp_mcp_server._invoke_agent", new=AsyncMock(return_value="bullet summary")) as mock_invoke:
-            result = await self._call_tool(server, "Summarizer", {"text": "hello world"})
+            content, is_error = await self._call_tool(server, "Summarizer", {"text": "hello world"})
 
         mock_invoke.assert_awaited_once()
         call_args = mock_invoke.call_args
         assert call_args[0][0]["name"] == "Summarizer"
         assert call_args[0][1] == {"text": "hello world"}
         # Result should contain the mocked return value
-        assert any("bullet summary" in c.text for c in result.root.content)
+        assert is_error is False
+        assert any("bullet summary" in c.text for c in content)
 
     @pytest.mark.asyncio
     async def test_skill_tool_still_uses_entrypoint(self):
@@ -2173,7 +2190,7 @@ class TestAcpMcpServerWithAgents:
         with patch("birdie.core.acp_mcp_server.resolve_entrypoint") as mock_resolve:
             mock_fn = MagicMock(return_value="search results")
             mock_resolve.return_value = mock_fn
-            result = await self._call_tool(server, "search", {"query": "python"})
+            content, is_error = await self._call_tool(server, "search", {"query": "python"})
 
         mock_resolve.assert_called_once_with("python:birdie.skills.duckduckgo.tools.search")
         mock_fn.assert_called_once_with("python:birdie.skills.duckduckgo.tools.search", query="python")

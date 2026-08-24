@@ -14,61 +14,118 @@ Agent definitions (serialised AgentDef dicts) are read from the
 BIRDIE_AGENTS_JSON environment variable set by ACPProvider.  Each agent
 is exposed as an MCP tool whose execution spins up an ephemeral
 DynamicAgent in-process.
+
+Compatible with both mcp 1.x (decorator-based Server handlers) and
+mcp 2.x (constructor-callback handlers).
 """
 
 import asyncio
 import json
 import os
+import sys
 
-import mcp.server.stdio
-import mcp.types as types
-from mcp.server import Server
+try:
+    import mcp.server.stdio
+    import mcp.types as types
+    from mcp.server import Server
+except ImportError:  # pragma: no cover - exercised only in bare installs
+    if __name__ == "__main__":
+        print(
+            "birdie: MCP support is not installed. "
+            "Install the optional extra: pip install 'birdie-agent[mcp]'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    raise
 
 from birdie.core.entrypoints import resolve_entrypoint
 
 
+# True when running against mcp 1.x, whose Server exposes decorator-based
+# handler registration.  mcp 2.0 moved handlers to constructor callbacks.
+_MCP_V1 = hasattr(Server, "list_tools")
+
+
+def _tool_listing(tool_defs: list[dict], agent_defs: list[dict]) -> list:
+    """Build the types.Tool listing for all skill tools and agents.
+
+    ``inputSchema`` is the 1.x field name and the 2.x alias, so one spelling
+    works on both versions.
+    """
+    return [
+        types.Tool(
+            name=entry["name"],
+            description=entry["description"],
+            inputSchema=entry.get("parameters", {"type": "object", "properties": {}}),
+        )
+        for entry in [*tool_defs, *agent_defs]
+    ]
+
+
+async def _execute_tool(
+    name: str,
+    arguments: dict,
+    tool_defs: list[dict],
+    agent_defs: list[dict],
+) -> str:
+    """Run a skill tool or agent by name and return its text result."""
+    # --- skill tool path ---
+    tool = next((t for t in tool_defs if t["name"] == name), None)
+    if tool is not None:
+        entrypoint = tool["entrypoint"]
+        resolver = resolve_entrypoint(entrypoint)
+        result = await asyncio.to_thread(resolver, entrypoint, **arguments)
+        return str(result)
+
+    # --- agent tool path ---
+    agent_raw = next((a for a in agent_defs if a["name"] == name), None)
+    if agent_raw is not None:
+        return str(await _invoke_agent(agent_raw, arguments))
+
+    raise ValueError(f"Unknown tool: {name!r}")
+
+
 def _build_server(tool_defs: list[dict], agent_defs: list[dict]) -> Server:
-    server = Server("birdie-tools")
+    if _MCP_V1:
+        server = Server("birdie-tools")
 
-    @server.list_tools()
-    async def list_tools() -> list[types.Tool]:
-        tools = [
-            types.Tool(
-                name=t["name"],
-                description=t["description"],
-                inputSchema=t.get("parameters", {"type": "object", "properties": {}}),
+        @server.list_tools()
+        async def list_tools() -> list[types.Tool]:
+            return _tool_listing(tool_defs, agent_defs)
+
+        @server.call_tool()
+        async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
+            text = await _execute_tool(name, arguments or {}, tool_defs, agent_defs)
+            return [types.TextContent(type="text", text=text)]
+
+        return server
+
+    # mcp 2.x: handlers are constructor callbacks that receive a request
+    # context + params object and return result models directly.
+    async def on_list_tools(ctx, params):
+        return types.ListToolsResult(tools=_tool_listing(tool_defs, agent_defs))
+
+    async def on_call_tool(ctx, params):
+        try:
+            text = await _execute_tool(
+                params.name, params.arguments or {}, tool_defs, agent_defs,
             )
-            for t in tool_defs
-        ]
-        for a in agent_defs:
-            tools.append(
-                types.Tool(
-                    name=a["name"],
-                    description=a["description"],
-                    inputSchema=a.get("parameters", {"type": "object", "properties": {}}),
-                )
+        except Exception as exc:
+            # Mirror the 1.x framework behaviour of turning handler
+            # exceptions into an error result the model can read.
+            return types.CallToolResult(
+                content=[types.TextContent(type="text", text=str(exc))],
+                is_error=True,
             )
-        return tools
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=text)],
+        )
 
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
-        # --- skill tool path ---
-        tool = next((t for t in tool_defs if t["name"] == name), None)
-        if tool is not None:
-            entrypoint = tool["entrypoint"]
-            resolver = resolve_entrypoint(entrypoint)
-            result = await asyncio.to_thread(resolver, entrypoint, **(arguments or {}))
-            return [types.TextContent(type="text", text=str(result))]
-
-        # --- agent tool path ---
-        agent_raw = next((a for a in agent_defs if a["name"] == name), None)
-        if agent_raw is not None:
-            result = await _invoke_agent(agent_raw, arguments or {})
-            return [types.TextContent(type="text", text=str(result))]
-
-        raise ValueError(f"Unknown tool: {name!r}")
-
-    return server
+    return Server(
+        "birdie-tools",
+        on_list_tools=on_list_tools,
+        on_call_tool=on_call_tool,
+    )
 
 
 # Sub-agent instances reused across call_tool invocations (construction

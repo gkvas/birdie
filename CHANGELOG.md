@@ -14,6 +14,10 @@
   `doc/cli.md` and the CLI help text.
 
 ### Fixed
+- The documented `[mcp]` extra now actually exists in `pyproject.toml`
+  (`pip install birdie-agent[mcp]`), and birdie's own MCP servers support
+  both mcp 1.x and 2.x. The extra keeps a `mcp<2.0` ceiling until
+  langchain-mcp-adapters supports 2.0. (#54)
 - The Anthropic and Bedrock providers no longer end a turn silently when
   the model hits the `max_tokens` output limit: `stop_reason` is now
   recorded in the message metadata and a visible `[Truncated: ...]`

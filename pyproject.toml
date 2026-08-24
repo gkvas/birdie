@@ -36,8 +36,6 @@ dependencies = [
     "prompt_toolkit>=3.0",
     "mistralai>=1.0",
     "anthropic>=0.25",
-    "mcp>=1.0,<2.0",
-    "langchain-mcp-adapters>=0.1",
     "ddgs>=0.1",
 ]
 
@@ -45,6 +43,14 @@ dependencies = [
 dev = ["pytest", "pytest-asyncio"]
 gemini = []
 bedrock = ["boto3>=1.34"]
+mcp = [
+    # Birdie's own MCP servers support mcp 1.x and 2.x, but
+    # langchain-mcp-adapters (<= 0.3.1) breaks at import time under mcp 2.0
+    # despite declaring mcp>=1.24 - keep the ceiling until the adapters
+    # library actually supports 2.0, then relax both bounds together.
+    "mcp>=1.0,<2.0",
+    "langchain-mcp-adapters>=0.1,<0.4",
+]
 
 [project.scripts]
 birdie = "birdie.cli:main"
