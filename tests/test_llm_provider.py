@@ -522,6 +522,65 @@ class TestBedrockResponseConversion:
         assert msg.usage_metadata["total_tokens"] == 15
 
 
+class TestBedrockStopReason:
+    def test_stop_reason_recorded_in_metadata(self):
+        raw = {
+            "output": {"message": {"content": [{"text": "Hi"}]}},
+            "stopReason": "end_turn",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert msg.response_metadata["stop_reason"] == "end_turn"
+        assert msg.content == "Hi"
+
+    def test_empty_max_tokens_response_gets_visible_marker(self):
+        raw = {"output": {"message": {"content": []}}, "stopReason": "max_tokens"}
+        msg = _bedrock_response_to_lc(raw)
+        assert "Truncated" in msg.content
+        assert "max_tokens" in msg.content
+        assert msg.response_metadata["stop_reason"] == "max_tokens"
+
+    def test_partial_text_max_tokens_gets_truncation_note(self):
+        raw = {
+            "output": {"message": {"content": [{"text": "partial answer"}]}},
+            "stopReason": "max_tokens",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert msg.content.startswith("partial answer")
+        assert "Truncated" in msg.content
+
+    def test_tool_calls_with_max_tokens_left_untouched(self):
+        raw = {
+            "output": {
+                "message": {
+                    "content": [
+                        {"toolUse": {"toolUseId": "tu1", "name": "f", "input": {}}},
+                    ],
+                },
+            },
+            "stopReason": "max_tokens",
+        }
+        msg = _bedrock_response_to_lc(raw)
+        assert len(msg.tool_calls) == 1
+        assert "Truncated" not in msg.content
+
+    def test_missing_stop_reason_ignored(self):
+        raw = {"output": {"message": {"content": [{"text": "x"}]}}}
+        msg = _bedrock_response_to_lc(raw)
+        assert "stop_reason" not in msg.response_metadata
+
+
+class TestBedrockDefaultMaxTokens:
+    def test_default_leaves_room_for_thinking(self):
+        with patch.dict("sys.modules", {"boto3": MagicMock()}):
+            provider = BedrockProvider(region_name="eu-central-1")
+        assert provider._max_tokens == 16000
+
+    def test_explicit_max_tokens_wins(self):
+        with patch.dict("sys.modules", {"boto3": MagicMock()}):
+            provider = BedrockProvider(region_name="eu-central-1", max_tokens=2048)
+        assert provider._max_tokens == 2048
+
+
 class TestBedrockToolDefConversion:
     def test_tool_format(self, sample_tools):
         result = _tools_to_bedrock(sample_tools)

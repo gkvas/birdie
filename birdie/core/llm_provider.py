@@ -1315,10 +1315,32 @@ def _bedrock_response_to_lc(response: dict) -> AIMessage:
         out = usage.get("outputTokens", 0) or 0
         usage_metadata = {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
 
+    stop_reason = response.get("stopReason")
+    response_metadata: dict = {}
+    if isinstance(stop_reason, str):
+        response_metadata["stop_reason"] = stop_reason
+
+    content = " ".join(text_parts)
+    # Surface max_tokens truncation instead of silently returning an empty
+    # message (mirrors _anthropic_response_to_lc): on thinking models the
+    # whole output budget can be consumed by internal reasoning, leaving
+    # no text and no toolUse blocks.
+    if stop_reason == "max_tokens" and not tool_calls:
+        if not content.strip():
+            content = (
+                "[Truncated: the response hit the max_tokens output limit "
+                "before producing any visible output (the budget was likely "
+                "spent on internal reasoning). Raise max_tokens in the "
+                "provider config.]"
+            )
+        else:
+            content += "\n[Truncated: the response hit the max_tokens output limit.]"
+
     return AIMessage(
-        content=" ".join(text_parts),
+        content=content,
         tool_calls=tool_calls,
         usage_metadata=usage_metadata,
+        response_metadata=response_metadata,
     )
 
 
@@ -1397,7 +1419,11 @@ class BedrockProvider(LLMProvider):
         self._client = boto3.client("bedrock-runtime", **session_kw)
         self._model = model
         self._temperature = temperature
-        self._max_tokens = max_tokens or 4096
+        # 16000 leaves room for models with always-on/adaptive thinking,
+        # whose reasoning tokens count against max_tokens - a 4096 cap can
+        # be fully consumed by thinking, ending the turn with no visible
+        # output (same rationale as AnthropicProvider).
+        self._max_tokens = max_tokens or 16000
 
     def supports_tools(self) -> bool:
         return True

@@ -13,6 +13,16 @@
   Bedrock foundation models and documented the new vendor in
   `doc/cli.md` and the CLI help text.
 
+### Fixed
+- The Anthropic and Bedrock providers no longer end a turn silently when
+  the model hits the `max_tokens` output limit: `stop_reason` is now
+  recorded in the message metadata and a visible `[Truncated: ...]`
+  marker is emitted instead of empty content. The default `max_tokens`
+  for both providers was raised from 4096 to 16000, because thinking
+  models count reasoning tokens against the cap - previously the whole
+  budget could be consumed by internal reasoning and the CLI printed a
+  bare `(no response)`. (#80)
+
 ## [0.14.1] - 2026-08-22
 
 ### Fixed
