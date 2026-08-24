@@ -1,3 +1,18 @@
+## [0.15.0] - 2026-08-24
+
+### Added
+- AWS Bedrock provider (`vendor: "bedrock"`): talks to Bedrock's
+  vendor-agnostic Converse API via `boto3`, so Anthropic, Amazon Nova,
+  Meta Llama, and Mistral models hosted on Bedrock all work through one
+  code path, including tool calling and streaming. Credentials resolve
+  via the standard AWS chain (env vars, shared config/credentials files,
+  IAM role, SSO, ...); `region_name`, `aws_access_key_id`,
+  `aws_secret_access_key`, and `aws_session_token` can also be set
+  explicitly in the provider config. Requires `pip install boto3` (or the
+  new `birdie[bedrock]` extra). Added pricing-table entries for common
+  Bedrock foundation models and documented the new vendor in
+  `doc/cli.md` and the CLI help text.
+
 ## [0.14.1] - 2026-08-22
 
 ### Fixed

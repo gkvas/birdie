@@ -55,7 +55,7 @@ PROMPT_STYLE = Style.from_dict({
 HELP_TEXT = """
 [bold cyan]Birdie CLI - available slash commands[/bold cyan]
 
-  Supported vendors: openai, anthropic, mistral, gemini, ollama, acp, langchain
+  Supported vendors: openai, anthropic, bedrock, mistral, gemini, ollama, acp, langchain
 
   [yellow]/help[/yellow]                         Show this help
   [yellow]/quit[/yellow]  [yellow]/exit[/yellow]                 Exit the session
@@ -1581,12 +1581,13 @@ variables or a JSON config file.
 
 [bold]Option 1 - environment variables[/bold]
 
-  [cyan]export LLM_VENDOR=openai[/cyan]          # or: anthropic, mistral, gemini, azure, ollama
+  [cyan]export LLM_VENDOR=openai[/cyan]          # or: anthropic, bedrock, mistral, gemini, azure, ollama
   [cyan]export LLM_MODEL=gpt-4o[/cyan]           # optional - uses provider default if omitted
   [cyan]export OPENAI_API_KEY=sk-...[/cyan]       # vendor-specific key variable:
                                    #   OPENAI_API_KEY, ANTHROPIC_API_KEY,
                                    #   MISTRAL_API_KEY, GEMINI_API_KEY,
                                    #   AZURE_OPENAI_API_KEY
+                                   #   (bedrock uses standard AWS credentials)
   [cyan]birdie[/cyan]
 
 [bold]Option 2 - config file[/bold]

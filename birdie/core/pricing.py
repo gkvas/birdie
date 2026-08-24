@@ -32,6 +32,17 @@ _PRICES: dict[str, Tuple[float, float]] = {
     # Mistral
     "mistral-large": (2.00, 6.00),
     "mistral-small": (0.20, 0.60),
+    # AWS Bedrock (foundation-model list prices; same models hosted
+    # elsewhere may be priced under their native vendor entry above)
+    "anthropic.claude-sonnet-4-20250514-v1:0": (3.00, 15.00),
+    "anthropic.claude-opus-4-20250514-v1:0": (15.00, 75.00),
+    "anthropic.claude-3-5-sonnet": (3.00, 15.00),
+    "anthropic.claude-3-5-haiku": (0.80, 4.00),
+    "amazon.nova-pro-v1:0": (0.80, 3.20),
+    "amazon.nova-lite-v1:0": (0.06, 0.24),
+    "amazon.nova-micro-v1:0": (0.035, 0.14),
+    "meta.llama3-1-70b-instruct-v1:0": (0.72, 0.72),
+    "mistral.mistral-large-2407-v1:0": (2.00, 6.00),
 }
 
 
