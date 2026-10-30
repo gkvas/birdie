@@ -29,6 +29,7 @@ from birdie.core.llm_provider import (
     _sdk_accepts_temperature,
     AnthropicProvider,
     BedrockProvider,
+    MistralProvider,
     _lc_to_bedrock_messages,
     _bedrock_response_to_lc,
     _tools_to_bedrock,
@@ -729,6 +730,58 @@ class TestBedrockProvider:
         with patch.dict("sys.modules", {"boto3": mock_boto3}):
             BedrockProvider(model="anthropic.claude-sonnet-4-20250514-v1:0")
         mock_boto3.client.assert_called_once_with("bedrock-runtime", region_name="eu-central-1")
+
+
+# ---------------------------------------------------------------------------
+# MistralProvider - greedy-sampling top_p requirement
+# ---------------------------------------------------------------------------
+
+def _make_mistral_provider(temperature: float = 0.0, model: str = "mistral-large-latest") -> MistralProvider:
+    """Build a MistralProvider without touching the mistralai SDK."""
+    p = MistralProvider.__new__(MistralProvider)
+    p._model = model
+    p._temperature = temperature
+    p._max_tokens = None
+    p._client = MagicMock()
+    return p
+
+
+class TestMistralGreedySamplingTopP:
+    """
+    Mistral's API rejects any request with temperature=0 (greedy sampling)
+    unless top_p is pinned to exactly 1 - some models (e.g. mistral-large-4)
+    otherwise default top_p below 1 server-side, which trips a 400:
+    "top_p must be 1 when using greedy sampling."
+    """
+
+    def test_top_p_pinned_when_temperature_zero(self):
+        p = _make_mistral_provider(temperature=0.0)
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, None, None, False)
+        assert kw["temperature"] == 0.0
+        assert kw["top_p"] == 1
+
+    def test_top_p_pinned_when_override_temperature_zero(self):
+        p = _make_mistral_provider(temperature=0.7)
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, 0.0, None, False)
+        assert kw["top_p"] == 1
+
+    def test_top_p_omitted_for_nonzero_temperature(self):
+        p = _make_mistral_provider(temperature=0.7)
+        kw = p._build_kwargs([HumanMessage(content="hi")], None, None, None, None, False)
+        assert kw["temperature"] == 0.7
+        assert "top_p" not in kw
+
+    def test_chat_sends_top_p_for_greedy_model(self):
+        p = _make_mistral_provider(temperature=0.0, model="mistral-large-4")
+        ok = MagicMock()
+        ok.choices = [MagicMock(message={"content": "Hello", "tool_calls": None})]
+        ok.usage = None
+        p._client.chat.complete.return_value = ok
+
+        p.chat([HumanMessage(content="hi")])
+
+        _, kw = p._client.chat.complete.call_args
+        assert kw["top_p"] == 1
 
 
 # ---------------------------------------------------------------------------

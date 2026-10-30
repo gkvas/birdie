@@ -1,3 +1,13 @@
+## [0.15.2] - 2026-10-30
+
+### Fixed
+- Mistral requests with `temperature=0` (the default) failed with HTTP 400
+  (`top_p must be 1 when using greedy sampling`) against models such as
+  `mistral-large-4` that default `top_p` below 1 server-side. Mistral
+  treats `temperature=0` as greedy sampling and requires `top_p` to be
+  pinned to exactly 1 in that case; `MistralProvider` now sends `top_p: 1`
+  whenever the resolved temperature is 0.
+
 ## [0.15.1] - 2026-08-24
 
 ### Fixed
