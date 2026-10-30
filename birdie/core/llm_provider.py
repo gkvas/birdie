@@ -719,11 +719,19 @@ class MistralProvider(LLMProvider):
         max_tokens: int | None,
         json_mode: bool,
     ) -> dict:
+        resolved_temperature = temperature if temperature is not None else self._temperature
         kw: dict[str, Any] = {
             "model": self._model,
             "messages": _lc_to_openai_messages(messages, system_prompt),
-            "temperature": temperature if temperature is not None else self._temperature,
+            "temperature": resolved_temperature,
         }
+        # Mistral treats temperature=0 as greedy sampling and rejects any
+        # request whose top_p isn't exactly 1 in that case ("top_p must be 1
+        # when using greedy sampling"). Some models (e.g. mistral-large-4)
+        # default top_p below 1 server-side, so it must be pinned explicitly
+        # whenever we ask for greedy decoding.
+        if resolved_temperature == 0:
+            kw["top_p"] = 1
         resolved_max = max_tokens if max_tokens is not None else self._max_tokens
         if resolved_max:
             kw["max_tokens"] = resolved_max
