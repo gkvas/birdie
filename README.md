@@ -119,6 +119,7 @@ Birdie ships with the following default skills:
 | `Filesystem` | Read and write local files |
 | `ssh` | Connect to remote hosts and run commands |
 | `ToDo` | Step-by-step planning and progress tracking |
+| `Tasks` | Start and monitor detached background tasks (CI checks, builds, servers) |
 | `Weather` | Weather lookup via external API |
 | `DuckDuckGo` | Web search - no API key required |
 | `mcp_demo` | Demo MCP server (echo and reverse_string) |

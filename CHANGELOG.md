@@ -1,3 +1,18 @@
+## [0.17.0] - 2026-10-30
+
+### Added
+- New built-in `Tasks` skill for monitoring long-running work without blocking
+  the agent. `task_start` runs a shell command as a detached background task
+  (own session, stdout+stderr appended to `~/.birdie/tasks/<id>/output.log`),
+  so it is not killed by `run_bash` timeouts and survives birdie restarts.
+  `task_list`, `task_status` and `task_output` inspect tasks at any time,
+  `task_wait` is a bounded, resumable wait that never kills the task, and
+  `task_stop` terminates one. This replaces blocking polling loops (e.g.
+  watching `gh pr checks` until CI finishes) that previously had to be
+  interrupted manually. Task state lives in `~/.birdie/tasks/<id>/`
+  (`meta.json`, `output.log`, `exitcode`); override the directory with the
+  `BIRDIE_TASKS_DIR` env var.
+
 ## [0.16.0] - 2026-10-30
 
 ### Added
