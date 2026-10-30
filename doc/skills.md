@@ -201,6 +201,7 @@ All built-in skills are **disabled by default**. Enable them per session:
 | `Filesystem` | Read and write local files |
 | `ssh` | Connect to remote hosts and run commands (knowledge skill) |
 | `ToDo` | Step-by-step planning and progress tracking |
+| `Tasks` | Start and monitor detached background tasks (CI checks, builds, servers) |
 | `Weather` | Weather lookup via external API |
 | `DuckDuckGo` | Web search with no API key required |
 | `mcp_demo` | Demo MCP server (echo and reverse_string) |
