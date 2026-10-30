@@ -1,3 +1,12 @@
+## [0.16.0] - 2026-10-30
+
+### Added
+- `birdie --version` flag: prints the installed version (e.g. `birdie 0.16.0`)
+  and exits, without starting the interactive REPL. The version is read from
+  the installed `birdie-agent` package metadata (falls back to `dev` when
+  running from a source checkout that is not installed). The startup banner
+  now shares the same `_package_version()` helper.
+
 ## [0.15.2] - 2026-10-30
 
 ### Fixed
