@@ -522,11 +522,7 @@ class BirdieCLI:
 
     def _print_welcome(self) -> None:
         """Print the startup banner with loaded skills and provider info."""
-        from importlib.metadata import version, PackageNotFoundError
-        try:
-            v = version("birdie-agent")
-        except PackageNotFoundError:
-            v = "dev"
+        v = _package_version()
         skill_count = len(self.agent.registry.list_skills())
         agent_count = len(self.agent.agent_registry.list_agents())
         vendor = type(self.agent.provider).__name__.replace("Provider", "").lower()
@@ -1501,10 +1497,25 @@ class BirdieCLI:
                 loop.remove_signal_handler(signal.SIGINT)
 
 
+def _package_version() -> str:
+    """Installed birdie-agent version, or ``"dev"`` when not installed."""
+    from importlib.metadata import version, PackageNotFoundError
+    try:
+        return version("birdie-agent")
+    except PackageNotFoundError:
+        return "dev"
+
+
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Birdie interactive CLI")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"birdie {_package_version()}",
+        help="Print the birdie version and exit",
+    )
     parser.add_argument(
         "--user",
         metavar="USER_ID",

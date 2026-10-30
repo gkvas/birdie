@@ -3,12 +3,13 @@
 ## Invocation
 
 ```
-birdie [--user USER_ID] [--session-id SESSION_ID] [--skills-dir PATH]
+birdie [--version] [--user USER_ID] [--session-id SESSION_ID] [--skills-dir PATH]
        [--agents-dir PATH] [--config FILE]
 ```
 
 | Flag | Description |
 |---|---|
+| `--version` | Print the birdie version (e.g. `birdie 0.15.2`) and exit |
 | `--user USER_ID` | Filesystem namespace for sessions (defaults to `$USER`) |
 | `--session-id SESSION_ID` | Resume a specific session (e.g. `2026-04-28_1`) |
 | `--skills-dir PATH` | Replace the built-in skills directory. `~/.birdie/skills/` is always also loaded on top. |
