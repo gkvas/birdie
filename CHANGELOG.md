@@ -1,3 +1,13 @@
+## [0.17.3] - 2026-10-31
+
+### Changed
+- The per-turn tool-call budget stop message (`max_tool_calls_per_turn`, default
+  40) now reports the actual number of tool calls issued vs. the configured
+  limit and explains exactly how to raise it (`"max_tool_calls_per_turn": <N>`
+  in the provider config JSON, e.g. `~/.birdie/<vendor>.json`), instead of the
+  generic "more than N tool calls" wording. The loop-guard tool note also
+  carries the counts (`budget exhausted: 6 calls this turn (limit 5)`).
+
 ## [0.17.2] - 2026-10-31
 
 ### Fixed

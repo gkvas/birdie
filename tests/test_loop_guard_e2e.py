@@ -127,7 +127,7 @@ def test_tool_call_budget_stops_creative_loop():
     out = asyncio.run(graph.ainvoke(
         {"messages": [HumanMessage(content="go")]}, cfg))
     last = out["messages"][-1]
-    assert isinstance(last, AIMessage) and "more than 5 tool calls" in last.content
+    assert isinstance(last, AIMessage) and "exceeds the per-turn limit of 5" in last.content
     assert provider.calls == 6  # 5 allowed, the 6th is cut off
 
 

@@ -1034,14 +1034,18 @@ def create_agent_graph(
         last_ai = all_messages[-1] if all_messages else None
         if isinstance(last_ai, AIMessage):
             # Per-turn tool-call budget (counts the calls pending right now).
-            if budget and _tool_calls_this_turn(all_messages) > budget:
+            calls_this_turn = _tool_calls_this_turn(all_messages)
+            if budget and calls_this_turn > budget:
                 return _stop_turn(
                     last_ai,
-                    LOOP_GUARD_PREFIX + " tool-call budget exhausted. Turn ended.",
-                    f"Stopped: I have issued more than {budget} tool calls in "
-                    f"this turn without finishing. I am probably stuck - "
-                    f"please check the last tool results and tell me how to "
-                    f"proceed (or raise max_tool_calls_per_turn).",
+                    LOOP_GUARD_PREFIX + f" tool-call budget exhausted: {calls_this_turn} "
+                    f"calls this turn (limit {budget}). Turn ended.",
+                    f"Stopped: I issued {calls_this_turn} tool calls in this turn, which "
+                    f"exceeds the per-turn limit of {budget} (max_tool_calls_per_turn). "
+                    f"I am probably stuck - check the tool results above for repeated "
+                    f"calls or errors. To continue, tell me how to proceed, or raise the "
+                    f"limit by setting \"max_tool_calls_per_turn\": <N> in your provider "
+                    f"config JSON (e.g. ~/.birdie/<vendor>.json).",
                 )
             for tc in getattr(last_ai, "tool_calls", []):
                 if _consecutive_call_count(all_messages, tc["name"], tc["args"]) > max_reps:
