@@ -1,3 +1,14 @@
+## [0.17.1] - 2026-10-31
+
+### Fixed
+- `birdie --config <path>` now fails gracefully instead of dumping a traceback:
+  a nonexistent file exits with code 2 and a `birdie: error: config file not
+  found: ...` usage message, a directory is rejected with "not a file", and
+  `~` in the path is expanded even when the argument is quoted. Other startup
+  failures while loading the provider config (unreadable file, malformed JSON,
+  unknown vendor, missing API key, ...) now print a one-line error message;
+  pass `--debug` or set `BIRDIE_DEBUG=1` to get the full traceback.
+
 ## [0.17.0] - 2026-10-30
 
 ### Added
