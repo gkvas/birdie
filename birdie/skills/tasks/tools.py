@@ -154,6 +154,9 @@ def task_start(command: str, name: str = "", cwd: str = "", **_) -> str:
     Returns:
         A confirmation with the task id, pid and log path.
     """
+    # The StructuredTool wrapper passes None for omitted optional args.
+    name = name or ""
+    cwd = cwd or ""
     if not command or not command.strip():
         raise ValueError("command must not be empty")
     shell = shutil.which("sh") or shutil.which("bash")
@@ -213,6 +216,9 @@ def task_list(status: str = "", limit: int = 50, **_) -> str:
         limit: Maximum number of tasks to show.
         **_: Ignored extra kwargs from the StructuredTool wrapper.
     """
+    # The StructuredTool wrapper passes None for omitted optional args.
+    if limit is None:
+        limit = 50
     base = _tasks_dir()
     if not base.is_dir():
         return "No tasks yet (start one with task_start)."
@@ -301,6 +307,9 @@ def task_wait(task_id: str, timeout: float = 60, **_) -> str:
         timeout: Seconds to wait before returning (default 60, max 300).
         **_: Ignored extra kwargs from the StructuredTool wrapper.
     """
+    # The StructuredTool wrapper passes None for omitted optional args.
+    if timeout is None:
+        timeout = 60
     timeout = min(max(float(timeout), 0.0), MAX_WAIT_S)
     task_dir = _resolve_task_dir(task_id)
     deadline = time.monotonic() + timeout

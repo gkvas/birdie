@@ -1,3 +1,12 @@
+## [0.17.2] - 2026-10-31
+
+### Fixed
+- Tasks skill tools crashed with `TypeError` when the LLM called them without
+  the optional arguments (`task_list` without `limit`, `task_wait` without
+  `timeout`) because the tool wrapper passes `None` instead of the schema
+  default. The tools now fall back to their documented defaults (50 / 60s),
+  and `task_start` normalises `name`/`cwd=None` to empty strings.
+
 ## [0.17.1] - 2026-10-31
 
 ### Fixed

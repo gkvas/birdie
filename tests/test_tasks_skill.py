@@ -183,3 +183,34 @@ class TestOutput:
         out = tools.task_output(tid)
         assert "no output yet" in out
         tools.task_stop(tid)
+
+
+class TestOmittedOptionalArgs:
+    """The StructuredTool wrapper passes None for omitted optional args;
+    the tools must fall back to their documented defaults."""
+
+    def test_list_with_limit_none(self, tasks_dir):
+        tools.task_start("echo hi", name="a")
+        out = tools.task_list(status=None, limit=None)
+        assert "1 task(s)" in out
+
+    def test_wait_with_timeout_none(self, tasks_dir):
+        tools.task_start("echo hi; exit 0", name="b")
+        tid = _only_task_id(tasks_dir)
+        out = tools.task_wait(tid, timeout=None)
+        assert "finished: done rc=0" in out
+
+    def test_output_with_tail_none(self, tasks_dir):
+        tools.task_start("echo hi; exit 0", name="c")
+        tid = _only_task_id(tasks_dir)
+        tools.task_wait(tid, timeout=10)
+        out = tools.task_output(tid, tail=None)
+        assert "hi" in out
+
+    def test_start_with_name_and_cwd_none(self, tasks_dir):
+        out = tools.task_start("echo hi; exit 0", name=None, cwd=None)
+        assert "Started task" in out
+        tid = _only_task_id(tasks_dir)
+        meta = json.loads((tasks_dir / tid / "meta.json").read_text())
+        assert meta["name"] == ""
+        tools.task_wait(tid, timeout=10)
