@@ -1567,7 +1567,17 @@ def main() -> None:
     )
     skills_dir = args.skills_dir or os.path.join(os.path.dirname(__file__), "skills")
     agents_dir = args.agents_dir or os.path.join(os.path.dirname(__file__), "agents")
-    provider_config = Path(args.config) if args.config else None
+    provider_config = None
+    if args.config:
+        # Expand ~ ourselves so quoted paths ("~/.birdie/x.json") work too,
+        # and fail fast with a usage error instead of a traceback when the
+        # file does not exist.
+        config_path = Path(os.path.expanduser(args.config))
+        if not config_path.exists():
+            parser.error(f"config file not found: {args.config}")
+        if not config_path.is_file():
+            parser.error(f"config path is not a file: {args.config}")
+        provider_config = config_path
     resume_flags = _resume_flags(args)
 
     try:
@@ -1709,10 +1719,25 @@ async def _async_main(
                 provider_config, skills_dir=skills_dir, agents_dir=agents_dir,
                 agent_console=console, checkpointer=checkpointer,
             )
+        except FileNotFoundError as exc:
+            # e.g. --config pointing at a file that vanished since startup
+            _abort(console, f"[bold red]Config file not found:[/bold red] {exc.filename or provider_config}")
+        except OSError as exc:
+            # e.g. permission denied or the path is a directory
+            _abort(console, f"[bold red]Cannot read config file:[/bold red] {exc}")
         except ValueError as exc:
+            # invalid JSON or schema violations (pydantic ValidationError is a
+            # ValueError), unknown vendor, missing 'llm' for langchain, ...
             _abort(console, f"[bold red]Configuration error:[/bold red] {exc}\n\n{_PROVIDER_HELP}")
         except ImportError as exc:
             _abort(console, f"[bold red]Missing dependency:[/bold red] {exc}")
+        except Exception as exc:
+            # Anything else raised while building the agent (e.g. vendor SDK
+            # credential errors) - one clean line instead of a traceback,
+            # unless the user asked for full tracebacks.
+            if debug or os.environ.get("BIRDIE_DEBUG", "") not in ("", "0"):
+                raise
+            _abort(console, f"[bold red]Startup error:[/bold red] {exc}")
 
         cli = BirdieCLI(
             agent,
