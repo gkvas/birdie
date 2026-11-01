@@ -1,0 +1,47 @@
+name: fix-tests
+description: |
+  Run the tests; while they fail, let the agent fix the code and re-run them
+  (at most `rounds` fix attempts), then show what changed.
+  Example: /workflow run fix-tests command="python -m pytest tests/ -q"
+
+inputs:
+  command:
+    type: string
+    default: pytest -q
+    description: Test command to run
+  rounds:
+    type: integer
+    default: 3
+    description: Maximum number of fix attempts
+
+budget:
+  max_llm_calls: 10
+
+steps:
+  - id: tests
+    retry:
+      max: "{{ inputs.rounds + 1 }}"
+      until: "steps.test.ok"
+    steps:
+      - id: test
+        run: "{{ inputs.command }}"
+        timeout: 900
+        on_error: continue
+      - id: fix
+        if: "not steps.test.ok and not attempt.last"
+        prompt: |
+          The test command `{{ inputs.command }}` fails (attempt {{ attempt.number }} of {{ attempt.max }}).
+          Last lines of its output:
+
+          {{ steps.test.stdout | tail(60) }}
+          {{ steps.test.stderr | tail(20) }}
+
+          Find the root cause and fix the code. Do not weaken, skip or delete tests.
+
+  - id: diff
+    run: git diff --stat
+    on_error: continue
+
+  - echo: |
+      Tests pass after {{ steps.tests.attempts }} run(s).
+      {{ steps.diff.output }}

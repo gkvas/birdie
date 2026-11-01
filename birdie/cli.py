@@ -90,6 +90,13 @@ HELP_TEXT = """
   [yellow]/agent output short[/yellow]           Show sub-agent transcript truncated to 1000 chars
   [yellow]/agent output off[/yellow]             Hide sub-agent transcript (default)
 
+  [bold]Workflow commands[/bold]
+  [yellow]/workflow list[/yellow]                List workflows (~/.birdie/workflows/*.yaml)
+  [yellow]/workflow show <name>[/yellow]         Show a workflow's inputs and steps
+  [yellow]/workflow run <name> [k=v ...][/yellow] Run a workflow (name or path to a .yaml file)
+  [yellow]/workflow runs [N][/yellow]            List recent workflow runs
+  [yellow]/workflow resume <run-id>[/yellow]     Resume a failed or interrupted run
+
   [bold]Logging commands[/bold]
   [yellow]/log llm on[/yellow]                  Enable LLM request/response logging to ~/.birdie/llm.log
   [yellow]/log llm off[/yellow]                 Disable LLM logging
@@ -180,8 +187,11 @@ class BirdieCLI:
         console: Optional[Console] = None,
         debug: bool = False,
         resume_flags: Optional[List[str]] = None,
+        workflows_dir: Optional[str] = None,
     ) -> None:
         self.agent = agent
+        # Extra workflow search directory (--workflows-dir), searched first.
+        self.workflows_dir = workflows_dir
         self.session_manager = session_manager
         self.session = session
         self.user_id = user_id
@@ -1193,6 +1203,9 @@ class BirdieCLI:
         elif cmd == "/cd":
             self._handle_cd(arg)
 
+        elif cmd == "/workflow":
+            await self._handle_workflow(arg)
+
         elif cmd == "/clear":
             self.console.clear()
 
@@ -1200,6 +1213,10 @@ class BirdieCLI:
             self.console.print(f"[red]Unknown command:[/red] {cmd}  (type /help for list)")
 
         return True
+
+    async def _handle_workflow(self, arg: str) -> None:
+        from .cli_workflow import handle_workflow_command
+        await handle_workflow_command(self, arg)
 
     # -- streaming turn -------------------------------------------------------
 
@@ -1226,7 +1243,7 @@ class BirdieCLI:
                 for line in summary.splitlines():
                     self.console.print(f"[dim]{line}[/dim]", highlight=False)
 
-    async def _stream_turn(self, message: str) -> None:
+    async def _stream_turn(self, message: str, thread_id: Optional[str] = None) -> str:
         """Send *message* to the agent and render the streamed response.
 
         History is managed by LangGraph's checkpointer (keyed by session ID as
@@ -1235,12 +1252,18 @@ class BirdieCLI:
 
         Args:
             message: The user's input text for this turn.
+            thread_id: Thread to run on; defaults to the current session.
+                Workflow prompt steps with ``context: fresh`` pass their own.
+
+        Returns:
+            The text of the final AI message ("" if there was none).
         """
         from langchain_core.messages import AIMessage, ToolMessage
 
         ltm = self.user_memory.as_strings()
 
         printed_any = False
+        final_text = ""
         status = self.console.status("[dim]thinking…[/dim]", spinner="dots")
         status.start()
         self._active_status = status
@@ -1256,7 +1279,7 @@ class BirdieCLI:
         try:
             async for update in self.agent.astream(
                 message,
-                thread_id=self.session.id,
+                thread_id=thread_id or self.session.id,
                 user_id=self.user_id,
                 long_term_memory=ltm if ltm else None,
                 config={"configurable": {"tool_output_cap": self._tool_output_cap}},
@@ -1280,6 +1303,7 @@ class BirdieCLI:
                                 # The tools node ended the turn itself
                                 # (loop guard): show its final message.
                                 status.stop()
+                                final_text = str(msg.content)
                                 for i, line in enumerate(str(msg.content).splitlines()):
                                     prefix = "🐦 " if i == 0 else "   "
                                     self.console.print(f"{prefix}{line}", highlight=False)
@@ -1320,7 +1344,8 @@ class BirdieCLI:
                                             b.get("text", "") if isinstance(b, dict) else str(b)
                                             for b in content
                                         )
-                                    lines = str(content).splitlines()
+                                    final_text = str(content)
+                                    lines = final_text.splitlines()
                                     for i, line in enumerate(lines):
                                         prefix = "🐦 " if i == 0 else "   "
                                         self.console.print(f"{prefix}{line}", highlight=False)
@@ -1341,6 +1366,7 @@ class BirdieCLI:
         # We only need to update the lightweight session metadata.
         self.session.touch()
         self.session_manager.save(self.session)
+        return final_text
 
     # -- main loop ------------------------------------------------------------
 
@@ -1462,39 +1488,50 @@ class BirdieCLI:
             if user_input.startswith("/"):
                 if user_input.strip().lower() == "/compact":
                     await self._compact()
+                elif user_input.split()[0].lower() == "/workflow":
+                    # Workflows can run for a long time: Ctrl+C interrupts
+                    # them like a turn (the run stays resumable).
+                    parts = user_input.split(maxsplit=1)
+                    await self._run_interruptible(
+                        self._handle_workflow(parts[1] if len(parts) > 1 else "")
+                    )
                 else:
                     await self._handle_slash(user_input)
                 continue
 
-            loop = asyncio.get_running_loop()
-            task = loop.create_task(self._stream_turn(user_input))
-            loop.add_signal_handler(signal.SIGINT, task.cancel)
-            try:
-                await task
-            except asyncio.CancelledError:
-                # Cancelling the task only detaches the coroutine; a bash
-                # tool call keeps running in a worker thread.  Kill what the
-                # shell is running so Ctrl+C really stops it.
-                _interrupt_shell()
-                self.console.print("\n[dim]Interrupted.[/dim]")
-            except BirdieRateLimitError:
-                self.console.print(
-                    "[yellow]Rate limit reached - please wait a moment and try again.[/yellow]"
-                )
-            except BirdieProviderUnavailableError as exc:
-                self.console.print(
-                    "[yellow]Provider unreachable - the request timed out or the "
-                    "connection dropped, even after retries. Check your network "
-                    "and try again.[/yellow]"
-                )
-                self._report_turn_error(exc)
-            except Exception as exc:
-                self.console.print(
-                    f"[red bold]Error:[/red bold] {type(exc).__name__}: {exc}"
-                )
-                self._report_turn_error(exc)
-            finally:
-                loop.remove_signal_handler(signal.SIGINT)
+            await self._run_interruptible(self._stream_turn(user_input))
+
+    async def _run_interruptible(self, coro) -> None:
+        """Run *coro* as a task that Ctrl+C cancels, reporting turn errors."""
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(coro)
+        loop.add_signal_handler(signal.SIGINT, task.cancel)
+        try:
+            await task
+        except asyncio.CancelledError:
+            # Cancelling the task only detaches the coroutine; a bash
+            # tool call keeps running in a worker thread.  Kill what the
+            # shell is running so Ctrl+C really stops it.
+            _interrupt_shell()
+            self.console.print("\n[dim]Interrupted.[/dim]")
+        except BirdieRateLimitError:
+            self.console.print(
+                "[yellow]Rate limit reached - please wait a moment and try again.[/yellow]"
+            )
+        except BirdieProviderUnavailableError as exc:
+            self.console.print(
+                "[yellow]Provider unreachable - the request timed out or the "
+                "connection dropped, even after retries. Check your network "
+                "and try again.[/yellow]"
+            )
+            self._report_turn_error(exc)
+        except Exception as exc:
+            self.console.print(
+                f"[red bold]Error:[/red bold] {type(exc).__name__}: {exc}"
+            )
+            self._report_turn_error(exc)
+        finally:
+            loop.remove_signal_handler(signal.SIGINT)
 
 
 def _package_version() -> str:
@@ -1553,11 +1590,41 @@ def main() -> None:
         help="Run non-interactively with the given prompt and print the AI response to stdout",
     )
     parser.add_argument(
+        "--workflow",
+        metavar="NAME",
+        default=None,
+        help="Run a workflow non-interactively (name or path to a .yaml file); "
+             "progress goes to stderr, the final step's output to stdout",
+    )
+    parser.add_argument(
+        "--input",
+        metavar="KEY=VALUE",
+        action="append",
+        default=[],
+        help="Workflow input (repeatable), e.g. --input path=tests/",
+    )
+    parser.add_argument(
+        "--workflow-resume",
+        metavar="RUN_ID",
+        default=None,
+        help="Resume a failed or interrupted workflow run non-interactively",
+    )
+    parser.add_argument(
+        "--workflows-dir",
+        default=None,
+        help="Extra workflow directory, searched before ~/.birdie/workflows/ "
+             "and the bundled workflows",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print full tracebacks for errors during a turn (also: BIRDIE_DEBUG=1)",
     )
     args = parser.parse_args()
+    if args.input and not args.workflow:
+        parser.error("--input requires --workflow")
+    if sum(x is not None for x in (args.prompt, args.workflow, args.workflow_resume)) > 1:
+        parser.error("-p/--prompt, --workflow and --workflow-resume are mutually exclusive")
 
     user_id = (
         args.user
@@ -1584,7 +1651,10 @@ def main() -> None:
         asyncio.run(
             _async_main(args.session_id, user_id, skills_dir, agents_dir,
                         provider_config, args.prompt, debug=args.debug,
-                        resume_flags=resume_flags)
+                        resume_flags=resume_flags,
+                        workflow=args.workflow, workflow_inputs=args.input,
+                        workflow_resume=args.workflow_resume,
+                        workflows_dir=args.workflows_dir)
         )
     except KeyboardInterrupt:
         # Ctrl+C outside the REPL's own handling (during startup or teardown):
@@ -1639,6 +1709,7 @@ def _resume_flags(args) -> List[str]:
         ("--user", args.user),
         ("--skills-dir", args.skills_dir),
         ("--agents-dir", args.agents_dir),
+        ("--workflows-dir", getattr(args, "workflows_dir", None)),
         ("--config", args.config),
     ):
         if value:
@@ -1682,10 +1753,17 @@ async def _async_main(
     prompt: Optional[str] = None,
     debug: bool = False,
     resume_flags: Optional[List[str]] = None,
+    workflow: Optional[str] = None,
+    workflow_inputs: Optional[List[str]] = None,
+    workflow_resume: Optional[str] = None,
+    workflows_dir: Optional[str] = None,
 ) -> None:
     from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-    console = Console()
+    headless_workflow = workflow is not None or workflow_resume is not None
+    # Headless workflows render progress on stderr so stdout carries only
+    # the final output (pipeable).
+    console = Console(stderr=True) if headless_workflow else Console()
 
     # Fail fast if no vendor source is configured at all.
     if (
@@ -1748,10 +1826,17 @@ async def _async_main(
             console=console,
             debug=debug,
             resume_flags=resume_flags,
+            workflows_dir=workflows_dir,
         )
 
+        exit_code = 0
         try:
-            if prompt is not None:
+            if headless_workflow:
+                from .cli_workflow import run_workflow_headless
+                exit_code = await run_workflow_headless(
+                    cli, workflow, workflow_inputs or [], workflow_resume,
+                )
+            elif prompt is not None:
                 # Non-interactive mode: run single prompt and output to stdout
                 await cli.run_non_interactive(prompt)
             else:
@@ -1759,6 +1844,8 @@ async def _async_main(
                 await cli.run()
         finally:
             _close_shell()
+        if exit_code:
+            sys.exit(exit_code)
 
 
 if __name__ == "__main__":

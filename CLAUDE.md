@@ -6,6 +6,7 @@ Birdie is a LangGraph-based AI agent framework with a dynamic skill system. Key 
 
 - **Skills**: Markdown files (`SKILL.MD`) with YAML frontmatter. The LLM sees compact listings with `[load: <name>]` hints and calls the `get_skill` tool to fetch full skill bodies on demand (progressive loading with turn-decay eviction and LRU cap).
 - **Agents**: Configured via YAML/JSON (`AgentDef`). Agents define which skills are allowed, which LLM provider to use, and runtime settings.
+- **Workflows**: YAML files (`~/.birdie/workflows/*.yaml`) mixing deterministic steps (`run`, `tool`) with `prompt`/`agent` steps; control flow (`if`, `foreach`, `retry`, budgets) is owned by the runner. Runs persist to `~/.birdie/workflows/runs/` and are resumable.
 - **LTM**: Per-user long-term memory stored in `~/.birdie/ltm/<user_id>.json`. Compacted conversation summaries are embedded and retrieved by cosine similarity at the start of each session.
 
 Key source locations:
@@ -22,6 +23,10 @@ Key source locations:
 | `birdie/core/retrieval.py` | Hash-trick bag-of-ngrams embedder (512-dim) |
 | `birdie/core/pricing.py` | Model pricing table and cost estimation |
 | `birdie/core/llm_provider.py` | Vendor-agnostic LLM interface (OpenAI, Anthropic, Mistral) |
+| `birdie/core/workflow.py` | Workflow YAML parser/validator, `WorkflowRunner`, `RunStore` (resumable runs), hosts |
+| `birdie/core/workflow_expr.py` | Tiny safe expression language + `{{ }}` templating for workflows |
+| `birdie/cli_workflow.py` | `/workflow` slash commands and headless `--workflow` mode |
+| `birdie/workflows/` | Built-in workflow definitions (`*.yaml`) |
 | `birdie/skills/` | Built-in skill definitions |
 | `tests/` | pytest test suite |
 

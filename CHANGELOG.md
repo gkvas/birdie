@@ -1,3 +1,39 @@
+## [0.18.0] - 2026-11-01
+
+### Added
+- **Workflows**: YAML files that combine deterministic steps with LLM steps,
+  with control flow owned by the runner instead of the model. Step actions:
+  `run` (shell command in its own process group, with `cwd`/`env`/`timeout`),
+  `tool` (call a skill/MCP tool directly; permission prompts still apply),
+  `agent` (AGENT.MD sub-agent, parsed JSON in `data`), `prompt` (one agent
+  turn in the current session, or `context: fresh` for a clean thread),
+  `ask` (user input, `default` for headless), `echo`, `fail`, and `steps`
+  groups. Modifiers on any step: `if`, `foreach`/`as`, `retry`
+  (`max`/`until`/`delay`, with `attempt.*` variables) and
+  `on_error: stop|continue`. The whole file, including every expression, is
+  validated before the first step runs; unknown tools/agents are reported up
+  front.
+- Tiny, dependency-free expression language and `{{ }}` templating for
+  workflows (`birdie/core/workflow_expr.py`): literals, dotted/indexed
+  lookups, `and`/`or`/`not`, comparisons, `in`, `+`/`-` and filters such as
+  `tail(n)`, `default(v)`, `from_json` and `quote`. Lookups only reach into
+  JSON-shaped data, and an undefined name or key is an error instead of a
+  silent `null`.
+- Workflow budgets: `max_steps` (default 200, counts retries and loop
+  iterations), `max_llm_calls` and `max_cost_usd`.
+- Resumable runs: state is saved after every step to
+  `~/.birdie/workflows/runs/<run-id>.json` (`BIRDIE_WORKFLOW_RUNS_DIR`
+  overrides). Resuming skips completed steps, re-runs the failed step, and
+  restarts an unfinished `foreach`/`retry` step from its first iteration.
+  Ctrl+C marks a run `interrupted`.
+- CLI: `/workflow list|show|run|runs|resume`, plus headless
+  `birdie --workflow NAME --input k=v` / `--workflow-resume RUN_ID`
+  (progress on stderr, final output on stdout, exit code 0/1/2) and
+  `--workflows-dir`. Workflows are discovered from `--workflows-dir`,
+  `~/.birdie/workflows/` and the bundled `birdie/workflows/`, which ships a
+  `fix-tests` workflow (run tests, let the agent fix failures, re-test).
+- Documentation: `doc/workflows.md`.
+
 ## [0.17.3] - 2026-10-31
 
 ### Changed
