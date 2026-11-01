@@ -144,6 +144,32 @@ See [doc/agents.md](doc/agents.md) for the full AGENT.MD format and how to write
 
 ---
 
+## Workflows
+
+Workflows are YAML files that combine deterministic steps (shell commands, direct tool calls) with prompts and sub-agent calls. Control flow (conditions, loops, retries, budgets) is owned by the runner, not the model, and every run is persisted so it can be resumed after a failure or Ctrl+C.
+
+```yaml
+name: fix-tests
+steps:
+  - id: tests
+    retry: {max: 4, until: steps.test.ok}
+    steps:
+      - id: test
+        run: pytest -q
+        on_error: continue
+      - if: "not steps.test.ok and not attempt.last"
+        prompt: "Tests fail:\n{{ steps.test.stdout | tail(60) }}\nFix the code."
+```
+
+```
+/workflow run fix-tests                     # in the REPL
+birdie --workflow fix-tests --input command="pytest -q"   # headless
+```
+
+Drop workflows in `~/.birdie/workflows/`. See [doc/workflows.md](doc/workflows.md) for the format, the expression language, budgets and resuming.
+
+---
+
 ## Conversation memory
 
 Birdie maintains three separate memory stores that work together to give the agent context across turns and sessions.
@@ -187,6 +213,9 @@ See [doc/architecture.md](doc/architecture.md) for a detailed explanation of how
 | `/tool output short\|full\|off` | Control tool result verbosity |
 | `/skill reload` | Re-discover skills from disk |
 | `/skill new <name>` | Scaffold a new SKILL.MD |
+| `/workflow list` | List workflows |
+| `/workflow run <name> [k=v ...]` | Run a workflow |
+| `/workflow resume <run-id>` | Resume a failed or interrupted workflow run |
 | `/remember <text>` | Save a note to long-term memory |
 | `/compact` | Summarise old messages into long-term memory now |
 | `/cost` | Show token usage and estimated cost |
@@ -204,6 +233,7 @@ See [doc/architecture.md](doc/architecture.md) for a detailed explanation of how
 | [doc/cli.md](doc/cli.md) | CLI flags, provider config reference, all slash commands, key bindings |
 | [doc/skills.md](doc/skills.md) | SKILL.MD format, entrypoints, tool and knowledge skills, skill loading |
 | [doc/agents.md](doc/agents.md) | AGENT.MD format, sub-agent system, runtime controls, custom agents |
+| [doc/workflows.md](doc/workflows.md) | Workflow YAML format, step types, expressions, budgets, resuming |
 | [doc/mcp.md](doc/mcp.md) | MCP integration, declaring MCP servers, writing MCP servers |
 | [doc/memory.md](doc/memory.md) | Short-term and long-term memory stores, compaction, session files |
 | [doc/architecture.md](doc/architecture.md) | Project layout, agent loop, system prompt, providers, conversation compaction, long-term memory store, sessions |

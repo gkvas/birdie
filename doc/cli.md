@@ -4,7 +4,9 @@
 
 ```
 birdie [--version] [--user USER_ID] [--session-id SESSION_ID] [--skills-dir PATH]
-       [--agents-dir PATH] [--config FILE]
+       [--agents-dir PATH] [--config FILE] [-p PROMPT]
+       [--workflow NAME [--input KEY=VALUE ...]] [--workflow-resume RUN_ID]
+       [--workflows-dir PATH]
 ```
 
 | Flag | Description |
@@ -15,6 +17,11 @@ birdie [--version] [--user USER_ID] [--session-id SESSION_ID] [--skills-dir PATH
 | `--skills-dir PATH` | Replace the built-in skills directory. `~/.birdie/skills/` is always also loaded on top. |
 | `--agents-dir PATH` | Replace the built-in agents directory. `~/.birdie/agents/` is always also loaded on top. |
 | `--config FILE` | Path to a JSON provider config file |
+| `-p, --prompt PROMPT` | Run one prompt non-interactively and print the reply |
+| `--workflow NAME` | Run a workflow headless (name or `.yaml` path). Progress goes to stderr and the last step's output to stdout. Exit code 0 completed, 1 failed, 2 invalid. See [workflows.md](workflows.md). |
+| `--input KEY=VALUE` | Workflow input (repeatable) |
+| `--workflow-resume RUN_ID` | Resume a failed or interrupted workflow run headless |
+| `--workflows-dir PATH` | Extra workflow directory, searched before `~/.birdie/workflows/` and the bundled workflows |
 
 ---
 
@@ -199,6 +206,12 @@ These fields are extracted from the same JSON config before it is forwarded to t
 | `/session list` | List all sessions for this user |
 | `/session info` | Show session metadata (created, turns, memory, enabled skills/agents) |
 | `/new` | Alias for `/session new` |
+| **Workflows** | |
+| `/workflow list` | List workflows (`~/.birdie/workflows/`, bundled, `--workflows-dir`) |
+| `/workflow show <name>` | Show a workflow's inputs, budget and steps |
+| `/workflow run <name\|file> [k=v ...]` | Run a workflow in the current session (Ctrl+C interrupts; the run stays resumable) |
+| `/workflow runs [N]` | List recent workflow runs |
+| `/workflow resume <run-id>` | Resume a failed or interrupted run |
 | **Logging** | |
 | `/log llm on\|off` | Enable/disable LLM request/response logging to `~/.birdie/llm.log` |
 | `/log http on\|off` | Enable/disable raw HTTP body logging to `~/.birdie/http.log` |
